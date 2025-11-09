@@ -2092,6 +2092,17 @@ async function initRedis() {
       maxRetriesPerRequest: 3,
       enableReadyCheck: true,
       connectTimeout: 10000,
+
+    // TLS: ensure a proper TLS socket
+    tls: {
+      // For debugging set rejectUnauthorized: false temporarily.
+      // For production, remove this or set true and ensure hostname matches cert.
+      rejectUnauthorized: false
+    },
+    // optional ioredis settings
+    enableAutoPipelining: true,
+
+        
       retryStrategy(times) {
         if (times > 5) {
           log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
