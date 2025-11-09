@@ -2088,88 +2088,91 @@ let redisClient;
 
 async function initRedis() {
   if (process.env.REDIS_URL) {
-    // ✅ CRITICAL FIX: Parse Redis URL manually for rediss:// connections
-    // ioredis cannot handle both URL string AND tls options simultaneously
-    const redisUrl = new URL(process.env.REDIS_URL);
-    
-    // Check if this is a TLS connection
-    const isRediss = process.env.REDIS_URL.startsWith('rediss://');
-    
-    let redisOptions;
-    
-    if (isRediss) {
-      // ✅ For rediss://, parse URL manually and add TLS config
-      redisOptions = {
-        host: redisUrl.hostname,
-        port: parseInt(redisUrl.port, 10),
-        password: redisUrl.password,
-        maxRetriesPerRequest: 3,
-        enableReadyCheck: true,
-        connectTimeout: 10000,
-        enableAutoPipelining: true,
-        tls: {
-          rejectUnauthorized: false  // Required for Redis Cloud self-signed certs
-        },
-        retryStrategy(times) {
-          if (times > 5) {
-            log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
-            return null;
-          }
-          const delay = Math.min(times * 50, 2000);
-          return delay;
-        }
-      };
-      
-      log('info', '[REDIS-INIT] ✅ TLS enabled for secure connection');
-    } else {
-      // ✅ For redis://, use URL string directly
-      redisOptions = {
-        maxRetriesPerRequest: 3,
-        enableReadyCheck: true,
-        connectTimeout: 10000,
-        enableAutoPipelining: true,
-        retryStrategy(times) {
-          if (times > 5) {
-            log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
-            return null;
-          }
-          const delay = Math.min(times * 50, 2000);
-          return delay;
-        }
-      };
-    }
-
-    // Create Redis client
-    redisClient = isRediss 
-      ? new Redis(redisOptions)  // Use parsed options for rediss://
-      : new Redis(process.env.REDIS_URL, redisOptions);  // Use URL for redis://
-    
-    redisClient.on('error', (err) => {
-      log('error', '[REDIS-ERROR]', err.message);
-    });
-    
-    redisClient.on('connect', () => {
-      log('info', '[REDIS] ✅ Connected successfully');
-    });
-    
-    redisClient.on('close', () => {
-      log('warn', '[REDIS] Connection closed, falling back to in-memory cache');
-    });
-    
-    // Test connection
     try {
-      await redisClient.ping();
+      const isRediss = process.env.REDIS_URL.startsWith('rediss://');
+      
+      if (isRediss) {
+        // ✅ WORKING FIX: Parse URL manually and construct options
+        // Redis Cloud format: rediss://default:PASSWORD@HOST:PORT
+        const redisUrl = new URL(process.env.REDIS_URL);
+        
+        // Extract password (after the : in auth)
+        const password = redisUrl.password || (redisUrl.username === 'default' ? redisUrl.username : null);
+        
+        const redisOptions = {
+          host: redisUrl.hostname,
+          port: parseInt(redisUrl.port, 10),
+          password: password,
+          maxRetriesPerRequest: 3,
+          enableReadyCheck: true,
+          connectTimeout: 10000,
+          enableAutoPipelining: true,
+          tls: {},  // ✅ Empty object enables TLS without cert validation
+          retryStrategy(times) {
+            if (times > 5) {
+              log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
+              return null;
+            }
+            const delay = Math.min(times * 50, 2000);
+            return delay;
+          }
+        };
+        
+        log('info', `[REDIS-INIT] ✅ Connecting to ${redisUrl.hostname}:${redisUrl.port} with TLS`);
+        redisClient = new Redis(redisOptions);
+        
+      } else {
+        // For redis:// URLs, use URL string directly
+        redisClient = new Redis(process.env.REDIS_URL, {
+          maxRetriesPerRequest: 3,
+          enableReadyCheck: true,
+          connectTimeout: 10000,
+          enableAutoPipelining: true,
+          retryStrategy(times) {
+            if (times > 5) {
+              log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
+              return null;
+            }
+            const delay = Math.min(times * 50, 2000);
+            return delay;
+          }
+        });
+      }
+      
+      redisClient.on('error', (err) => {
+        log('error', '[REDIS-ERROR]', err.message);
+      });
+      
+      redisClient.on('connect', () => {
+        log('info', '[REDIS] ✅ Connected successfully');
+      });
+      
+      redisClient.on('ready', () => {
+        log('info', '[REDIS] ✅ Ready to accept commands');
+      });
+      
+      redisClient.on('close', () => {
+        log('warn', '[REDIS] Connection closed');
+      });
+      
+      // Test connection with timeout
+      const pingTimeout = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Connection timeout')), 5000)
+      );
+      
+      const pingTest = redisClient.ping();
+      
+      await Promise.race([pingTest, pingTimeout]);
       console.log('[REDIS-INIT] ✅ Health check passed');
+      
     } catch (err) {
-      log('warn', `[REDIS] Health check failed: ${err.message}, using in-memory cache`);
+      log('warn', `[REDIS] Connection failed: ${err.message}, using in-memory cache`);
       redisClient = null;
     }
   } else {
-    log('warn', '[REDIS] ⚠️  Not configured - using in-memory cache (NOT PRODUCTION READY)');
-    log('warn', '[REDIS] For Instagram-scale performance, install Redis and set REDIS_URL in .env');
+    log('warn', '[REDIS] ⚠️  Not configured - using in-memory cache');
   }
 }
-
 
 
 
