@@ -2191,7 +2191,17 @@ start().catch(err => { console.error('[SERVER-START-ERROR]', err); process.exit(
 
 // --- ROUTES ---
 
-app.get('/health', (req, res) => res.json({ status: 'OK', ts: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'OK', ts: new Date().toISOString()
+                                          
+  const logLine = `[${ts}] PING ${ip} url=/health query=${q} headers=${JSON.stringify(headers)}`;
+  console.log(logLine);                                          
+                                          
+                                          
+                                          
+                                          }
+                                         
+                                         
+                                         ));
 
 // ADDED: Comprehensive production health check
 app.get('/health/detailed', async (req, res) => {
