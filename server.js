@@ -9,7 +9,7 @@ console.log('  DB_NAME:', process.env.DB_NAME ? '✅ Loaded' : '❌ Missing');
 console.log('  CLUSTER_WORKERS:', process.env.CLUSTER_WORKERS || 'Not set');
 
 
-const express = require('express');
+const express = require('express')
 const { MongoClient } = require('mongodb');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
