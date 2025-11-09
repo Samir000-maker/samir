@@ -1,0 +1,29 @@
+config:
+  target: "http://192.168.50.123:2000"   # Replace with your URL or ngrok URL
+  phases:
+    - duration: 60
+      arrivalRate: 50      # warm up - 50 users/sec
+    - duration: 120
+      arrivalRate: 200     # ramp up - heavy load
+    - duration: 120
+      arrivalRate: 500     # extreme load
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "Random DB Reads"
+    weight: 50
+    flow:
+      - get:
+          url: "/api/random-read"
+      - think: 0.5
+
+  - name: "Random DB Writes"
+    weight: 50
+    flow:
+      - post:
+          url: "/api/random-write"
+          json:
+            dummy: "{{ $randomString }}"
+      - think: 0.5
