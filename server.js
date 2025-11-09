@@ -2088,21 +2088,15 @@ let redisClient;
 
 async function initRedis() {
   if (process.env.REDIS_URL) {
-    redisClient = new Redis(process.env.REDIS_URL, {
+    // Parse the Redis URL to extract connection details
+    const redisUrl = new URL(process.env.REDIS_URL);
+    
+    const redisOptions = {
       maxRetriesPerRequest: 3,
       enableReadyCheck: true,
       connectTimeout: 10000,
-
-    // TLS: ensure a proper TLS socket
-    tls: {
-      // For debugging set rejectUnauthorized: false temporarily.
-      // For production, remove this or set true and ensure hostname matches cert.
-      rejectUnauthorized: false
-    },
-    // optional ioredis settings
-    enableAutoPipelining: true,
-
-        
+      enableAutoPipelining: true,
+      
       retryStrategy(times) {
         if (times > 5) {
           log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
@@ -2111,7 +2105,19 @@ async function initRedis() {
         const delay = Math.min(times * 50, 2000);
         return delay;
       }
-    });
+    };
+
+    // ✅ CRITICAL FIX: For rediss:// URLs, configure TLS properly
+    if (process.env.REDIS_URL.startsWith('rediss://')) {
+      redisOptions.tls = {
+        rejectUnauthorized: false,  // Required for Redis Cloud self-signed certificates
+        servername: redisUrl.hostname
+      };
+      log('info', '[REDIS-INIT] ✅ TLS enabled for secure connection');
+    }
+
+    // Create Redis client
+    redisClient = new Redis(process.env.REDIS_URL, redisOptions);
     
     redisClient.on('error', (err) => {
       log('error', '[REDIS-ERROR]', err.message);
