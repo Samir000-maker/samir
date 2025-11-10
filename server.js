@@ -2520,7 +2520,9 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
         // Step 1: Get user interests from PORT 5000
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { 
+            //const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { 
+            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { 
+            
                 timeout: 2000 
             });
             if (userResponse.status === 200 && userResponse.data.success) {
