@@ -3820,8 +3820,10 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         let userInterests = [];
         const interestFetchStart = Date.now();
         try {
-            console.log(`[USER-INTERESTS-FETCH-START] Requesting from http://127.0.0.1:5000/api/users/${userId}`);
-            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, {
+            //console.log(`[USER-INTERESTS-FETCH-START] Requesting from http://127.0.0.1:5000/api/users/${userId}`);
+            console.log(`[USER-INTERESTS-FETCH-START] Requesting from https://server1-ki1x.onrender.com/api/users/${userId}`);
+            //const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, {
+            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, {
                 timeout: 3000,
                 validateStatus: function(status) {
                     return status >= 200 && status < 500;
@@ -3859,7 +3861,8 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         const [viewedPostsDocs, viewedReelsDocs, followResponse] = await Promise.all([
             db.collection('contrib_posts').find({ userId }).toArray(),
             db.collection('contrib_reels').find({ userId }).toArray(),
-            axios.get(`http://127.0.0.1:5000/api/users/${userId}/following`, { timeout: 1000, validateStatus: () => true })
+            //axios.get(`http://127.0.0.1:5000/api/users/${userId}/following`, { timeout: 1000, validateStatus: () => true })
+            axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}/following`, { timeout: 1000, validateStatus: () => true })
                 .catch(err => {
                     console.warn('[FOLLOWING-FETCH-ERROR]', err && err.message ? err.message : err);
                     return { data: { following: [] } };
@@ -4238,7 +4241,8 @@ app.post('/api/feed/optimized-reels', async (req, res) => {
         // Fetch user interests for ranking
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000 });
+            //const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000 });
+            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
             if (userResponse.status === 200 && userResponse.data.success) {
                 userInterests = userResponse.data.user.interests || [];
             }
@@ -4389,7 +4393,7 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
         // Step 1: Get user interests
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { 
+            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { 
                 timeout: 2000 
             });
             if (userResponse.status === 200 && userResponse.data.success) {
@@ -6008,7 +6012,7 @@ app.post('/api/feed/optimized-reels', async (req, res) => {
         // Fetch user interests for ranking
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000 });
+            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
             if (userResponse.status === 200 && userResponse.data.success) {
                 userInterests = userResponse.data.user.interests || [];
             }
@@ -6288,7 +6292,7 @@ app.post('/api/feed/optimized-reels', async (req, res) => {
         // Fetch user interests for ranking
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000 });
+            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
             if (userResponse.status === 200 && userResponse.data.success) {
                 userInterests = userResponse.data.user.interests || [];
             }
@@ -6785,7 +6789,7 @@ app.post('/api/feed/optimized-posts', async (req, res) => {
         // Fetch user interests (best-effort)
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000, validateStatus: s => s >= 200 && s < 500 });
+            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000, validateStatus: s => s >= 200 && s < 500 });
             if (userResponse.status === 200 && userResponse.data && userResponse.data.success && userResponse.data.user) {
                 userInterests = userResponse.data.user.interests || [];
             }
