@@ -4232,7 +4232,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
 
 app.post('/api/feed/optimized-reels', async (req, res) => {
     const startTime = Date.now();
-    const { userId, slotId, excludedReelIds = [], limit = 6 } = req.body;
+    const { userId, slotId, excludedReelIds = [], limit = 250 } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
     
     try {
@@ -5995,7 +5995,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
  */
 app.post('/api/feed/optimized-reels', async (req, res) => {
     const startTime = Date.now();
-    const { userId, slotId, excludedReelIds = [], limit = 6 } = req.body;
+    const { userId, slotId, excludedReelIds = [], limit = 250 } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
     
     try {
@@ -6275,7 +6275,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
 
 app.post('/api/feed/optimized-reels', async (req, res) => {
     const startTime = Date.now();
-    const { userId, slotId, excludedReelIds = [], limit = 6 } = req.body;
+    const { userId, slotId, excludedReelIds = [], limit = 250 } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
     
     try {
@@ -6603,7 +6603,7 @@ app.post('/api/user-status/:userId', async (req, res) => {
  */
 app.post('/api/feed/mixed-optimized', async (req, res) => {
     const startTime = Date.now();
-    const { userId, limit = 6 } = req.body;
+    const { userId, limit = 250 } = req.body;
     
     try {
         console.log(`[post_algorithm] [MIXED-FEED-START] userId=${userId} | target=${limit}`);
@@ -6773,7 +6773,7 @@ function calculatePreviousSlot(currentSlotId) {
 
 app.post('/api/feed/optimized-posts', async (req, res) => {
     const startTime = Date.now();
-    const { userId, slotId, excludedPostIds = [], limit = 6 } = req.body;
+    const { userId, slotId, excludedPostIds = [], limit = 250 } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
 
     try {
@@ -6830,7 +6830,7 @@ app.post('/api/feed/optimized-posts', async (req, res) => {
                 }
             },
             { $sort: { compositeScore: -1 } },
-            { $limit: parseInt(limit, 10) || 6 },
+            { $limit: parseInt(limit, 10) || 250 },
             {
                 $project: {
                     postId: '$postList.postId',
