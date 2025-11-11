@@ -1144,7 +1144,7 @@ constructor(db) { this.db = db; }
 
 
 // Add this new method to DatabaseManager class
-async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = 6) {
+async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = 250) {
     const start = Date.now();
     const isReel = contentType === 'reels';
     const collection = isReel ? 'reels' : 'posts';
@@ -1447,7 +1447,7 @@ console.log(`[DB-READ] latest_${collection} | Total Reads: ${dbOpCounters.reads}
 return latestSlot;
 }
 
-async getOptimizedFeed(userId, contentType, minContentRequired = 6) {
+async getOptimizedFeed(userId, contentType, minContentRequired = 250) {
 const start = Date.now();
 const isReel = contentType === 'reels';
 const collection = isReel ? 'reels' : 'posts';
@@ -1691,7 +1691,7 @@ content.push(...filteredContent);
 }
 
 const finalResult = {
-content: content.slice(0, Math.max(minContentRequired, 6)),
+content: content.slice(0, Math.max(minContentRequired, 250)),
 latestDocumentId: currentLatest,
 normalDocumentId: currentNormal,
 isNewUser: false,
@@ -1762,7 +1762,7 @@ return item.postId &&
 item.imageUrl &&
 item.username &&
 index < minContentRequired * 2;
-}).slice(0, Math.max(minContentRequired, 6));
+}).slice(0, Math.max(minContentRequired, 250));
 
 console.log(`[FILTERED-RESULT] ${userId} - ${contentType}: ${filteredContent.length} items | Total Reads: ${dbOpCounters.reads}`);
 
@@ -2506,13 +2506,13 @@ app.post('/api/sync/metrics', async (req, res) => {
 // Personalized reels feed with interest-based ranking
 app.post('/api/feed/reels-personalized', async (req, res) => {
     try {
-        const { userId, limit = 6, offset = 0 } = req.body;
+        const { userId, limit = 260, offset = 0 } = req.body;
         
         if (!userId || userId === 'undefined' || userId === 'null') {
             return res.status(400).json({ success: false, error: 'Valid userId required' });
         }
 
-        const limitNum = parseInt(limit, 10) || 6;
+        const limitNum = parseInt(limit, 10) || 250;
         const offsetNum = parseInt(offset, 10) || 0;
 
         log('info', `[REELS-PERSONALIZED-START] userId=${userId}, limit=${limitNum}, offset=${offsetNum}`);
