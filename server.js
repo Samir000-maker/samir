@@ -6609,7 +6609,7 @@ app.post('/api/feed/mixed-optimized', async (req, res) => {
         console.log(`[post_algorithm] [MIXED-FEED-START] userId=${userId} | target=${limit}`);
         
         const mixedContent = [];
-        const TARGET_CONTENT = Math.max(limit, 6);
+        const TARGET_CONTENT = Math.max(limit, 250);
         
         // Phase 1: Latest Reels
         console.log(`[post_algorithm] [PHASE-1] Fetching latest reels`);
