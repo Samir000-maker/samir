@@ -5952,7 +5952,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
         if (contribDoc && contribDoc.ids) {
             const count = contribDoc.ids.length;
             
-            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/6 | duration=${duration}ms`);
+            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/250 | duration=${duration}ms`);
             
             return res.json({
                 success: true,
@@ -6236,7 +6236,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
         if (contribDoc && contribDoc.ids) {
             const count = contribDoc.ids.length;
             
-            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/6 | duration=${duration}ms`);
+            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/250 | duration=${duration}ms`);
             
             return res.json({
                 success: true,
@@ -6513,7 +6513,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
         if (contribDoc && contribDoc.ids) {
             const count = contribDoc.ids.length;
             
-            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/6 | duration=${duration}ms`);
+            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/250 | duration=${duration}ms`);
             
             return res.json({
                 success: true,
