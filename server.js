@@ -38,7 +38,8 @@ const cache = {
 };
 
 const processedRequests = new Map();
-
+const REQUEST_DEDUP_MAP = new Map();
+const REQUEST_TIMEOUT_MS = 30000;
 
 const compression = require('compression');
 const { promisify } = require('util');
@@ -60,22 +61,22 @@ const CACHE_TTL_MEDIUM = 60000;  // 1 minute
 const CACHE_TTL_LONG = 300000;   // 5 minutes 
 
 
-setInterval(() => {
-    const now = Date.now();
-    const expiryTime = 60000; // 60 seconds
-    let cleanedCount = 0;
+// setInterval(() => {
+//     const now = Date.now();
+//     const expiryTime = 60000; // 60 seconds
+//     let cleanedCount = 0;
     
-    for (const [requestId, timestamp] of processedRequests.entries()) {
-        if (now - timestamp > expiryTime) {
-            processedRequests.delete(requestId);
-            cleanedCount++;
-        }
-    }
+//     for (const [requestId, timestamp] of processedRequests.entries()) {
+//         if (now - timestamp > expiryTime) {
+//             processedRequests.delete(requestId);
+//             cleanedCount++;
+//         }
+//     }
     
-    if (cleanedCount > 0) {
-        console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entries | Active: ${processedRequests.size}`);
-    }
-}, 60000);
+//     if (cleanedCount > 0) {
+//         console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entries | Active: ${processedRequests.size}`);
+//     }
+// }, 60000);
 
 
 const getOrCreateRequest = (key, requestFactory) => {
@@ -107,6 +108,72 @@ const getOrCreateRequest = (key, requestFactory) => {
 
   return promise;
 };
+
+
+function atomicRequestDedup(keyGenerator) {
+    return async (req, res, next) => {
+        const key = keyGenerator(req);
+        const now = Date.now();
+        
+        // Check for in-flight request
+        const existing = REQUEST_DEDUP_MAP.get(key);
+        
+        if (existing && (now - existing.timestamp < REQUEST_TIMEOUT_MS)) {
+            console.log(`[DEDUP-HIT] ${key} | age=${now - existing.timestamp}ms`);
+            
+            try {
+                const result = await existing.promise;
+                return res.json({ ...result, deduped: true });
+            } catch (err) {
+                REQUEST_DEDUP_MAP.delete(key);
+            }
+        }
+        
+        // Create new tracked request
+        let resolver, rejecter;
+        const promise = new Promise((resolve, reject) => {
+            resolver = resolve;
+            rejecter = reject;
+        });
+        
+        REQUEST_DEDUP_MAP.set(key, {
+            promise,
+            timestamp: now,
+            resolver,
+            rejecter
+        });
+        
+        // Intercept response
+        const originalJson = res.json.bind(res);
+        res.json = function(data) {
+            resolver(data);
+            
+            // Cleanup after 5 seconds (allows short-term reuse)
+            setTimeout(() => {
+                REQUEST_DEDUP_MAP.delete(key);
+            }, 5000);
+            
+            return originalJson(data);
+        };
+        
+        // Error handling
+        res.on('error', (err) => {
+            rejecter(err);
+            REQUEST_DEDUP_MAP.delete(key);
+        });
+        
+        // Timeout safety
+        setTimeout(() => {
+            if (REQUEST_DEDUP_MAP.has(key)) {
+                rejecter(new Error('Timeout'));
+                REQUEST_DEDUP_MAP.delete(key);
+            }
+        }, REQUEST_TIMEOUT_MS);
+        
+        next();
+    };
+}
+
 
 // CRITICAL: Enhanced logging with collection scan detection
 function logDbOp(op, col, query = {}, result = null, time = 0, options = {}) {
@@ -1138,22 +1205,36 @@ async function ensurePostIdUniqueness() {
 
 setInterval(() => {
     const now = Date.now();
-    for (const [key, data] of activeRequests.entries()) {
-        if (now - data.timestamp > REQUEST_DEDUP_TTL_MS) {
-            activeRequests.delete(key);
+    let cleaned = 0;
+    
+    // Cleanup 1: Request dedup map
+    for (const [key, data] of REQUEST_DEDUP_MAP.entries()) {
+        if (now - data.timestamp > 60000) {
+            REQUEST_DEDUP_MAP.delete(key);
+            cleaned++;
         }
     }
-}, 10000);
-
-
-setInterval(() => {
-    const now = Date.now();
+    
+    // Cleanup 2: User rate limits
     for (const [userId, data] of userRequestCounts.entries()) {
         if (now >= data.resetTime) {
             userRequestCounts.delete(userId);
+            cleaned++;
         }
     }
-}, 10000);
+    
+    // Cleanup 3: Processed requests
+    for (const [requestId, timestamp] of processedRequests.entries()) {
+        if (now - timestamp > 60000) {
+            processedRequests.delete(requestId);
+            cleaned++;
+        }
+    }
+    
+    if (cleaned > 0) {
+        console.log(`[CLEANUP] Removed ${cleaned} expired entries`);
+    }
+}, 30000); // Run every 30 seconds
 
 
 class DatabaseManager {
@@ -2733,49 +2814,84 @@ function deduplicateRequest(keyGenerator) {
     return async (req, res, next) => {
         const requestKey = keyGenerator(req);
         
-        // Check if identical request is already in-flight
-        if (activeRequests.has(requestKey)) {
-            const { promise, timestamp } = activeRequests.get(requestKey);
-            const age = Date.now() - timestamp;
+        // ✅ ATOMIC CHECK-AND-SET using Map operations
+        const existing = activeRequests.get(requestKey);
+        
+        if (existing) {
+            const age = Date.now() - existing.timestamp;
             
-            console.log(`[REQUEST-DEDUP-HIT] Blocked duplicate: ${requestKey} | age=${age}ms`);
-            
-            try {
-                // Wait for the in-flight request to complete and return same result
-                const cachedResult = await promise;
-                return res.json(cachedResult);
-            } catch (error) {
-                // If in-flight request failed, allow retry
+            // If request is stale (>30 seconds), allow retry
+            if (age > 30000) {
                 activeRequests.delete(requestKey);
-                return next();
+                console.log(`[REQUEST-DEDUP-STALE] ${requestKey} aged ${age}ms - allowing retry`);
+            } else {
+                console.log(`[REQUEST-DEDUP-BLOCK] ${requestKey} in-flight (${age}ms) - returning cached`);
+                
+                try {
+                    const cachedResult = await existing.promise;
+                    return res.json({ ...cachedResult, servedFromDedup: true });
+                } catch (error) {
+                    activeRequests.delete(requestKey);
+                    // Fall through to allow retry
+                }
             }
         }
         
-        // Create promise for this request
+        // ✅ CRITICAL FIX: Create placeholder BEFORE calling next()
+        const placeholder = {
+            promise: null,
+            timestamp: Date.now(),
+            resolved: false
+        };
+        
+        activeRequests.set(requestKey, placeholder);
+        
+        // Create promise that captures response
         const responsePromise = new Promise((resolve, reject) => {
-            // Capture original res.json
             const originalJson = res.json.bind(res);
+            const originalSend = res.send.bind(res);
             
+            // Override res.json
             res.json = function(data) {
-                resolve(data); // Cache result
-                activeRequests.delete(requestKey); // Cleanup
+                if (!placeholder.resolved) {
+                    placeholder.resolved = true;
+                    resolve(data);
+                }
+                
+                // Cleanup after 5 seconds
+                setTimeout(() => {
+                    activeRequests.delete(requestKey);
+                }, 5000);
+                
                 return originalJson(data);
             };
             
-            // Also handle errors
-            res.on('finish', () => {
-                if (!res.headersSent) {
+            // Override res.send (for error responses)
+            res.send = function(data) {
+                if (!placeholder.resolved) {
+                    placeholder.resolved = true;
+                    reject(new Error('Request failed'));
+                }
+                
+                setTimeout(() => {
+                    activeRequests.delete(requestKey);
+                }, 5000);
+                
+                return originalSend(data);
+            };
+            
+            // Timeout handler
+            setTimeout(() => {
+                if (!placeholder.resolved) {
+                    reject(new Error('Request timeout'));
                     activeRequests.delete(requestKey);
                 }
-            });
+            }, 30000);
         });
         
-        activeRequests.set(requestKey, {
-            promise: responsePromise,
-            timestamp: Date.now()
-        });
+        // Update placeholder with real promise
+        placeholder.promise = responsePromise;
         
-        console.log(`[REQUEST-DEDUP-NEW] Registered: ${requestKey}`);
         next();
     };
 }
@@ -3202,7 +3318,15 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
     }
 });
 
-app.post('/api/contributed-views/batch-optimized', async (req, res) => {
+app.post('/api/contributed-views/batch-optimized',
+    rateLimitByUser(3), // ✅ Max 3 per 10 seconds
+    atomicRequestDedup((req) => {
+        const { userId, posts = [], reels = [] } = req.body;
+        const postsHash = posts.slice(0, 10).sort().join(',').substring(0, 50);
+        const reelsHash = reels.slice(0, 10).sort().join(',').substring(0, 50);
+        return `batch-views:${userId}:${postsHash}:${reelsHash}`;
+    }),
+    async (req, res) => {
   const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
   const startTime = Date.now();
 
