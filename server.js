@@ -6857,6 +6857,48 @@ app.post('/api/feed/mixed-optimized', async (req, res) => {
     }
 });
 
+
+function rateLimitByUser(maxRequestsPer10Sec = 20) {
+    return (req, res, next) => {
+        const userId = req.params.userId || req.body.userId;
+        
+        if (!userId) {
+            return next(); // Skip if no userId
+        }
+        
+        const now = Date.now();
+        const userData = userRequestCounts.get(userId) || { 
+            count: 0, 
+            resetTime: now + 10000 
+        };
+        
+        // Reset if window expired
+        if (now >= userData.resetTime) {
+            userData.count = 0;
+            userData.resetTime = now + 10000;
+        }
+        
+        userData.count++;
+        userRequestCounts.set(userId, userData);
+        
+        if (userData.count > maxRequestsPer10Sec) {
+            const resetIn = Math.ceil((userData.resetTime - now) / 1000);
+            
+            console.warn(`[RATE-LIMIT-EXCEEDED] userId=${userId.substring(0, 8)} | count=${userData.count}/${maxRequestsPer10Sec} | reset in ${resetIn}s`);
+            
+            return res.status(429).json({
+                success: false,
+                error: 'Too many requests',
+                retryAfter: resetIn
+            });
+        }
+        
+        next();
+    };
+}
+
+
+
 /**
  * Helper: Send mixed content response with metadata
  */
