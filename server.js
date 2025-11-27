@@ -24,6 +24,9 @@ const activeRequestsWithTimestamp = new Map();
 const REQUEST_DEDUP_TTL = 5000; // 5 seconds
 const requestDeduplication = new Map();
 const DEDUP_WINDOW = 5000; // 5 seconds
+
+const REQUEST_DEDUP_TTL_MS = 5000; // 5 seconds
+const userRequestCounts = new Map();
 // Global counters and cache
 const dbOpCounters = { reads: 0, writes: 0, updates: 0, inserts: 0, deletes: 0, queries: 0, aggregations: 0 };
 //const cache = { latestSlots: new Map(), userStatus: new Map(), maxIndexes: new Map(), ttl: 30 };
@@ -1115,21 +1118,42 @@ async function ensurePostIdUniqueness() {
 
 
 // Add this after initMongo() function
+// setInterval(() => {
+//   const now = Date.now();
+//   let cleanedCount = 0;
+  
+//   for (const [reqKey, reqData] of activeRequestsWithTimestamp.entries()) {
+//     if (now - reqData.timestamp > REQUEST_DEDUP_TTL) {
+//       activeRequestsWithTimestamp.delete(reqKey);
+//       cleanedCount++;
+//     }
+//   }
+  
+//   if (cleanedCount > 0) {
+//     console.log(`[REQUEST-CLEANUP] Removed ${cleanedCount} expired requests | Active: ${activeRequestsWithTimestamp.size}`);
+//   }
+// }, 10000); // Cleanup every 10 seconds
+
+
+
 setInterval(() => {
-  const now = Date.now();
-  let cleanedCount = 0;
-  
-  for (const [reqKey, reqData] of activeRequestsWithTimestamp.entries()) {
-    if (now - reqData.timestamp > REQUEST_DEDUP_TTL) {
-      activeRequestsWithTimestamp.delete(reqKey);
-      cleanedCount++;
+    const now = Date.now();
+    for (const [key, data] of activeRequests.entries()) {
+        if (now - data.timestamp > REQUEST_DEDUP_TTL_MS) {
+            activeRequests.delete(key);
+        }
     }
-  }
-  
-  if (cleanedCount > 0) {
-    console.log(`[REQUEST-CLEANUP] Removed ${cleanedCount} expired requests | Active: ${activeRequestsWithTimestamp.size}`);
-  }
-}, 10000); // Cleanup every 10 seconds
+}, 10000);
+
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [userId, data] of userRequestCounts.entries()) {
+        if (now >= data.resetTime) {
+            userRequestCounts.delete(userId);
+        }
+    }
+}, 10000);
 
 
 class DatabaseManager {
@@ -2398,7 +2422,14 @@ app.get('/api/retention/check/:userId/:postId', async (req, res) => {
 
 
 // ✅ CRITICAL: Bulk like state restoration endpoint (uses covering index)
-app.post('/api/interactions/restore-like-states', async (req, res) => {
+app.post('/api/interactions/restore-like-states',
+    deduplicateRequest((req) => {
+        const { userId, postIds } = req.body;
+        // Use first 5 postIds as hash to differentiate batches
+        const idsHash = postIds.slice(0, 5).join(',');
+        return `restore-likes:${userId}:${idsHash}`;
+    }),
+    async (req, res) => {
     try {
         const { userId, postIds } = req.body;
         
@@ -2694,6 +2725,62 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
         });
     }
 });
+
+
+
+
+function deduplicateRequest(keyGenerator) {
+    return async (req, res, next) => {
+        const requestKey = keyGenerator(req);
+        
+        // Check if identical request is already in-flight
+        if (activeRequests.has(requestKey)) {
+            const { promise, timestamp } = activeRequests.get(requestKey);
+            const age = Date.now() - timestamp;
+            
+            console.log(`[REQUEST-DEDUP-HIT] Blocked duplicate: ${requestKey} | age=${age}ms`);
+            
+            try {
+                // Wait for the in-flight request to complete and return same result
+                const cachedResult = await promise;
+                return res.json(cachedResult);
+            } catch (error) {
+                // If in-flight request failed, allow retry
+                activeRequests.delete(requestKey);
+                return next();
+            }
+        }
+        
+        // Create promise for this request
+        const responsePromise = new Promise((resolve, reject) => {
+            // Capture original res.json
+            const originalJson = res.json.bind(res);
+            
+            res.json = function(data) {
+                resolve(data); // Cache result
+                activeRequests.delete(requestKey); // Cleanup
+                return originalJson(data);
+            };
+            
+            // Also handle errors
+            res.on('finish', () => {
+                if (!res.headersSent) {
+                    activeRequests.delete(requestKey);
+                }
+            });
+        });
+        
+        activeRequests.set(requestKey, {
+            promise: responsePromise,
+            timestamp: Date.now()
+        });
+        
+        console.log(`[REQUEST-DEDUP-NEW] Registered: ${requestKey}`);
+        next();
+    };
+}
+
+
 
 
 // Calculate ranking score based on Instagram's algorithm
@@ -5727,7 +5814,14 @@ app.post('/api/random-write', async (req, res) => {
  * For NEW users: Auto-detects latest reel/post documents and creates user_status
  * READ COUNT: 1-3 (user_status + optional reels/posts collection check for new users)
  */
-app.get('/api/user-status/:userId', async (req, res) => {
+app.get('/api/user-status/:userId',
+
+
+    rateLimitByUser(5),
+    deduplicateRequest((req) => {
+        return `user-status:${req.params.userId}`;
+    }),
+    async (req, res) => {
     const startTime = Date.now();
     const { userId } = req.params;
     
@@ -5948,7 +6042,15 @@ app.get('/api/user-status/:userId', async (req, res) => {
  * Returns ids array and count from contrib_posts or contrib_reels
  * READ COUNT: 1 (single document read by _id = slotId)
  */
-app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
+app.get('/api/contrib-check/:userId/:slotId/:type', 
+    // ✅ ADD deduplication middleware
+    rateLimitByUser(15), // Max 15 per 10 seconds
+    
+    deduplicateRequest((req) => {
+        const { userId, slotId, type } = req.params;
+        return `contrib-check:${userId}:${slotId}:${type}`;
+    }),
+    async (req, res) => {
     const startTime = Date.now();
     const { userId, slotId, type } = req.params;
     
@@ -6014,7 +6116,18 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
  * Fetches reels content from specific slot with ranking algorithm
  * READ COUNT: 1 (aggregation on reels collection filtered by slotId)
  */
-app.post('/api/feed/optimized-reels', async (req, res) => {
+app.post('/api/feed/optimized-reels',
+    // ✅ ADD deduplication middleware
+    rateLimitByUser(10),
+    deduplicateRequest((req) => {
+        const { userId, slotId, excludedReelIds = [] } = req.body;
+        // Include hash of excluded IDs to differentiate pagination
+        const excludedHash = excludedReelIds.length > 0 
+            ? excludedReelIds.slice(0, 10).join(',').substring(0, 50)
+            : 'none';
+        return `optimized-reels:${userId}:${slotId}:${excludedHash}`;
+    }),
+    async (req, res) => {
     const startTime = Date.now();
     const { userId, slotId, excludedReelIds = [], limit = 250 } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
@@ -6796,7 +6909,18 @@ app.get('/ping', (req, res) => {
   res.status(200).send('pong');
 });
 
-app.post('/api/feed/optimized-posts', async (req, res) => {
+app.post('/api/feed/optimized-posts',
+
+    rateLimitByUser(10),
+
+    deduplicateRequest((req) => {
+        const { userId, slotId, excludedPostIds = [] } = req.body;
+        const excludedHash = excludedPostIds.length > 0 
+            ? excludedPostIds.slice(0, 10).join(',').substring(0, 50)
+            : 'none';
+        return `optimized-posts:${userId}:${slotId}:${excludedHash}`;
+    }),
+    async (req, res) => {
     const startTime = Date.now();
     const { userId, slotId, excludedPostIds = [], limit = 250 } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
