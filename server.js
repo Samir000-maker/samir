@@ -24,9 +24,6 @@ const activeRequestsWithTimestamp = new Map();
 const REQUEST_DEDUP_TTL = 5000; // 5 seconds
 const requestDeduplication = new Map();
 const DEDUP_WINDOW = 5000; // 5 seconds
-
-const REQUEST_DEDUP_TTL_MS = 5000; // 5 seconds
-const userRequestCounts = new Map();
 // Global counters and cache
 const dbOpCounters = { reads: 0, writes: 0, updates: 0, inserts: 0, deletes: 0, queries: 0, aggregations: 0 };
 //const cache = { latestSlots: new Map(), userStatus: new Map(), maxIndexes: new Map(), ttl: 30 };
@@ -38,17 +35,16 @@ const cache = {
 };
 
 const processedRequests = new Map();
-const REQUEST_DEDUP_MAP = new Map();
-const REQUEST_TIMEOUT_MS = 30000;
+
 
 const compression = require('compression');
 const { promisify } = require('util');
 
 
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
-const MAX_CONTENT_PER_SLOT = 250;        // Maximum content items per document before creating new slot
-const DEFAULT_CONTENT_BATCH_SIZE = 250;   // Default number of items to return per request
-const MIN_CONTENT_FOR_FEED = 250;         // Minimum content required for feed requests
+const MAX_CONTENT_PER_SLOT = 4;        // Maximum content items per document before creating new slot
+const DEFAULT_CONTENT_BATCH_SIZE = 4;   // Default number of items to return per request
+const MIN_CONTENT_FOR_FEED = 4;         // Minimum content required for feed requests
 // ============================================================================
 
 console.log('[CONFIG] System Configuration:');
@@ -61,22 +57,22 @@ const CACHE_TTL_MEDIUM = 60000;  // 1 minute
 const CACHE_TTL_LONG = 300000;   // 5 minutes 
 
 
-// setInterval(() => {
-//     const now = Date.now();
-//     const expiryTime = 60000; // 60 seconds
-//     let cleanedCount = 0;
+setInterval(() => {
+    const now = Date.now();
+    const expiryTime = 60000; // 60 seconds
+    let cleanedCount = 0;
     
-//     for (const [requestId, timestamp] of processedRequests.entries()) {
-//         if (now - timestamp > expiryTime) {
-//             processedRequests.delete(requestId);
-//             cleanedCount++;
-//         }
-//     }
+    for (const [requestId, timestamp] of processedRequests.entries()) {
+        if (now - timestamp > expiryTime) {
+            processedRequests.delete(requestId);
+            cleanedCount++;
+        }
+    }
     
-//     if (cleanedCount > 0) {
-//         console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entries | Active: ${processedRequests.size}`);
-//     }
-// }, 60000);
+    if (cleanedCount > 0) {
+        console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entries | Active: ${processedRequests.size}`);
+    }
+}, 60000);
 
 
 const getOrCreateRequest = (key, requestFactory) => {
@@ -108,72 +104,6 @@ const getOrCreateRequest = (key, requestFactory) => {
 
   return promise;
 };
-
-
-function atomicRequestDedup(keyGenerator) {
-    return async (req, res, next) => {
-        const key = keyGenerator(req);
-        const now = Date.now();
-        
-        // Check for in-flight request
-        const existing = REQUEST_DEDUP_MAP.get(key);
-        
-        if (existing && (now - existing.timestamp < REQUEST_TIMEOUT_MS)) {
-            console.log(`[DEDUP-HIT] ${key} | age=${now - existing.timestamp}ms`);
-            
-            try {
-                const result = await existing.promise;
-                return res.json({ ...result, deduped: true });
-            } catch (err) {
-                REQUEST_DEDUP_MAP.delete(key);
-            }
-        }
-        
-        // Create new tracked request
-        let resolver, rejecter;
-        const promise = new Promise((resolve, reject) => {
-            resolver = resolve;
-            rejecter = reject;
-        });
-        
-        REQUEST_DEDUP_MAP.set(key, {
-            promise,
-            timestamp: now,
-            resolver,
-            rejecter
-        });
-        
-        // Intercept response
-        const originalJson = res.json.bind(res);
-        res.json = function(data) {
-            resolver(data);
-            
-            // Cleanup after 5 seconds (allows short-term reuse)
-            setTimeout(() => {
-                REQUEST_DEDUP_MAP.delete(key);
-            }, 5000);
-            
-            return originalJson(data);
-        };
-        
-        // Error handling
-        res.on('error', (err) => {
-            rejecter(err);
-            REQUEST_DEDUP_MAP.delete(key);
-        });
-        
-        // Timeout safety
-        setTimeout(() => {
-            if (REQUEST_DEDUP_MAP.has(key)) {
-                rejecter(new Error('Timeout'));
-                REQUEST_DEDUP_MAP.delete(key);
-            }
-        }, REQUEST_TIMEOUT_MS);
-        
-        next();
-    };
-}
-
 
 // CRITICAL: Enhanced logging with collection scan detection
 function logDbOp(op, col, query = {}, result = null, time = 0, options = {}) {
@@ -1185,56 +1115,21 @@ async function ensurePostIdUniqueness() {
 
 
 // Add this after initMongo() function
-// setInterval(() => {
-//   const now = Date.now();
-//   let cleanedCount = 0;
-  
-//   for (const [reqKey, reqData] of activeRequestsWithTimestamp.entries()) {
-//     if (now - reqData.timestamp > REQUEST_DEDUP_TTL) {
-//       activeRequestsWithTimestamp.delete(reqKey);
-//       cleanedCount++;
-//     }
-//   }
-  
-//   if (cleanedCount > 0) {
-//     console.log(`[REQUEST-CLEANUP] Removed ${cleanedCount} expired requests | Active: ${activeRequestsWithTimestamp.size}`);
-//   }
-// }, 10000); // Cleanup every 10 seconds
-
-
-
 setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    
-    // Cleanup 1: Request dedup map
-    for (const [key, data] of REQUEST_DEDUP_MAP.entries()) {
-        if (now - data.timestamp > 60000) {
-            REQUEST_DEDUP_MAP.delete(key);
-            cleaned++;
-        }
+  const now = Date.now();
+  let cleanedCount = 0;
+  
+  for (const [reqKey, reqData] of activeRequestsWithTimestamp.entries()) {
+    if (now - reqData.timestamp > REQUEST_DEDUP_TTL) {
+      activeRequestsWithTimestamp.delete(reqKey);
+      cleanedCount++;
     }
-    
-    // Cleanup 2: User rate limits
-    for (const [userId, data] of userRequestCounts.entries()) {
-        if (now >= data.resetTime) {
-            userRequestCounts.delete(userId);
-            cleaned++;
-        }
-    }
-    
-    // Cleanup 3: Processed requests
-    for (const [requestId, timestamp] of processedRequests.entries()) {
-        if (now - timestamp > 60000) {
-            processedRequests.delete(requestId);
-            cleaned++;
-        }
-    }
-    
-    if (cleaned > 0) {
-        console.log(`[CLEANUP] Removed ${cleaned} expired entries`);
-    }
-}, 30000); // Run every 30 seconds
+  }
+  
+  if (cleanedCount > 0) {
+    console.log(`[REQUEST-CLEANUP] Removed ${cleanedCount} expired requests | Active: ${activeRequestsWithTimestamp.size}`);
+  }
+}, 10000); // Cleanup every 10 seconds
 
 
 class DatabaseManager {
@@ -1249,7 +1144,7 @@ constructor(db) { this.db = db; }
 
 
 // Add this new method to DatabaseManager class
-async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = 250) {
+async getOptimizedFeedFixedReads(userId, contentType,minContentRequired = MIN_CONTENT_FOR_FEED) {
     const start = Date.now();
     const isReel = contentType === 'reels';
     const collection = isReel ? 'reels' : 'posts';
@@ -1552,7 +1447,7 @@ console.log(`[DB-READ] latest_${collection} | Total Reads: ${dbOpCounters.reads}
 return latestSlot;
 }
 
-async getOptimizedFeed(userId, contentType, minContentRequired = 250) {
+async getOptimizedFeed(userId, contentType, minContentRequired = MIN_CONTENT_FOR_FEED) {
 const start = Date.now();
 const isReel = contentType === 'reels';
 const collection = isReel ? 'reels' : 'posts';
@@ -1666,7 +1561,7 @@ await this.updateUserStatus(userId, {
 });
 
 return {
-content: qualityContent.slice(0, Math.max(minContentRequired, 8)),
+content: qualityContent.slice(0, Math.max(minContentRequired, MIN_CONTENT_FOR_FEED)),
 latestDocumentId: latestSlot._id,
 normalDocumentId: normalDocId,
 isNewUser: true
@@ -1796,7 +1691,7 @@ content.push(...filteredContent);
 }
 
 const finalResult = {
-content: content.slice(0, Math.max(minContentRequired, 250)),
+content: content.slice(0, Math.max(minContentRequired, MIN_CONTENT_FOR_FEED)),
 latestDocumentId: currentLatest,
 normalDocumentId: currentNormal,
 isNewUser: false,
@@ -1867,7 +1762,7 @@ return item.postId &&
 item.imageUrl &&
 item.username &&
 index < minContentRequired * 2;
-}).slice(0, Math.max(minContentRequired, 250));
+}).slice(0, Math.max(minContentRequired, 6));
 
 console.log(`[FILTERED-RESULT] ${userId} - ${contentType}: ${filteredContent.length} items | Total Reads: ${dbOpCounters.reads}`);
 
@@ -2193,91 +2088,47 @@ let redisClient;
 
 async function initRedis() {
   if (process.env.REDIS_URL) {
-    try {
-      const isRediss = process.env.REDIS_URL.startsWith('rediss://');
-      
-      if (isRediss) {
-        // ✅ WORKING FIX: Parse URL manually and construct options
-        // Redis Cloud format: rediss://default:PASSWORD@HOST:PORT
-        const redisUrl = new URL(process.env.REDIS_URL);
-        
-        // Extract password (after the : in auth)
-        const password = redisUrl.password || (redisUrl.username === 'default' ? redisUrl.username : null);
-        
-        const redisOptions = {
-          host: redisUrl.hostname,
-          port: parseInt(redisUrl.port, 10),
-          password: password,
-          maxRetriesPerRequest: 3,
-          enableReadyCheck: true,
-          connectTimeout: 10000,
-          enableAutoPipelining: true,
-          tls: {},  // ✅ Empty object enables TLS without cert validation
-          retryStrategy(times) {
-            if (times > 5) {
-              log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
-              return null;
-            }
-            const delay = Math.min(times * 50, 2000);
-            return delay;
-          }
-        };
-        
-        log('info', `[REDIS-INIT] ✅ Connecting to ${redisUrl.hostname}:${redisUrl.port} with TLS`);
-        redisClient = new Redis(redisOptions);
-        
-      } else {
-        // For redis:// URLs, use URL string directly
-        redisClient = new Redis(process.env.REDIS_URL, {
-          maxRetriesPerRequest: 3,
-          enableReadyCheck: true,
-          connectTimeout: 10000,
-          enableAutoPipelining: true,
-          retryStrategy(times) {
-            if (times > 5) {
-              log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
-              return null;
-            }
-            const delay = Math.min(times * 50, 2000);
-            return delay;
-          }
-        });
+    redisClient = new Redis(process.env.REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      enableReadyCheck: true,
+      connectTimeout: 10000,
+      retryStrategy(times) {
+        if (times > 5) {
+          log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
+          return null; // Stop retrying
+        }
+        const delay = Math.min(times * 50, 2000);
+        return delay;
       }
-      
-      redisClient.on('error', (err) => {
-        log('error', '[REDIS-ERROR]', err.message);
-      });
-      
-      redisClient.on('connect', () => {
-        log('info', '[REDIS] ✅ Connected successfully');
-      });
-      
-      redisClient.on('ready', () => {
-        log('info', '[REDIS] ✅ Ready to accept commands');
-      });
-      
-      redisClient.on('close', () => {
-        log('warn', '[REDIS] Connection closed');
-      });
-      
-      // Test connection with timeout
-      const pingTimeout = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Connection timeout')), 5000)
-      );
-      
-      const pingTest = redisClient.ping();
-      
-      await Promise.race([pingTest, pingTimeout]);
+    });
+    
+    redisClient.on('error', (err) => {
+      log('error', '[REDIS-ERROR]', err.message);
+      // Don't crash the server, just log the error
+    });
+    
+    redisClient.on('connect', () => {
+      log('info', '[REDIS] ✅ Connected successfully');
+    });
+    
+    redisClient.on('close', () => {
+      log('warn', '[REDIS] Connection closed, falling back to in-memory cache');
+    });
+    
+    // Test connection
+    try {
+      await redisClient.ping();
       console.log('[REDIS-INIT] ✅ Health check passed');
-      
     } catch (err) {
-      log('warn', `[REDIS] Connection failed: ${err.message}, using in-memory cache`);
-      redisClient = null;
+      log('warn', `[REDIS] Health check failed: ${err.message}, using in-memory cache`);
+      redisClient = null; // Fall back to in-memory
     }
   } else {
-    log('warn', '[REDIS] ⚠️  Not configured - using in-memory cache');
+    log('warn', '[REDIS] ⚠️  Not configured - using in-memory cache (NOT PRODUCTION READY)');
+    log('warn', '[REDIS] For Instagram-scale performance, install Redis and set REDIS_URL in .env');
   }
 }
+
 
 
 
@@ -2296,39 +2147,7 @@ start().catch(err => { console.error('[SERVER-START-ERROR]', err); process.exit(
 
 // --- ROUTES ---
 
-app.get('/health', (req, res) => {
-  const ts = new Date().toISOString();
-  const ip = req.ip;
-  const q = JSON.stringify(req.query);
-  const headers = req.headers;
-
-  const logLine = `[${ts}] PING ${ip} url=/health query=${q} headers=${JSON.stringify(headers)}`;
-  console.log(logLine);
-
-  res.json({ status: 'OK', ts });
-
-
- const healthData = {
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    memory: {
-      used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-      total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
-      unit: 'MB'
-    },
-    server: {
-      name: 'Your Server Name', // Change this for each server
-      nodeVersion: process.version,
-      platform: process.platform
-    }
-  };
-  
-  // Return 200 OK with health data
-  res.status(200).json(healthData);
-    
-});
-
+app.get('/health', (req, res) => res.json({ status: 'OK', ts: new Date().toISOString() }));
 
 // ADDED: Comprehensive production health check
 app.get('/health/detailed', async (req, res) => {
@@ -2503,14 +2322,7 @@ app.get('/api/retention/check/:userId/:postId', async (req, res) => {
 
 
 // ✅ CRITICAL: Bulk like state restoration endpoint (uses covering index)
-app.post('/api/interactions/restore-like-states',
-    deduplicateRequest((req) => {
-        const { userId, postIds } = req.body;
-        // Use first 5 postIds as hash to differentiate batches
-        const idsHash = postIds.slice(0, 5).join(',');
-        return `restore-likes:${userId}:${idsHash}`;
-    }),
-    async (req, res) => {
+app.post('/api/interactions/restore-like-states', async (req, res) => {
     try {
         const { userId, postIds } = req.body;
         
@@ -2639,13 +2451,13 @@ app.post('/api/sync/metrics', async (req, res) => {
 // Personalized reels feed with interest-based ranking
 app.post('/api/feed/reels-personalized', async (req, res) => {
     try {
-        const { userId, limit = 260, offset = 0 } = req.body;
+        const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, offset = 0 } = req.body;
         
         if (!userId || userId === 'undefined' || userId === 'null') {
             return res.status(400).json({ success: false, error: 'Valid userId required' });
         }
 
-        const limitNum = parseInt(limit, 10) || 250;
+        const limitNum = parseInt(limit, 10) || DEFAULT_CONTENT_BATCH_SIZE;
         const offsetNum = parseInt(offset, 10) || 0;
 
         log('info', `[REELS-PERSONALIZED-START] userId=${userId}, limit=${limitNum}, offset=${offsetNum}`);
@@ -2653,9 +2465,7 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
         // Step 1: Get user interests from PORT 5000
         let userInterests = [];
         try {
-            //const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { 
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { 
-            
+            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { 
                 timeout: 2000 
             });
             if (userResponse.status === 200 && userResponse.data.success) {
@@ -2806,97 +2616,6 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
         });
     }
 });
-
-
-
-
-function deduplicateRequest(keyGenerator) {
-    return async (req, res, next) => {
-        const requestKey = keyGenerator(req);
-        
-        // ✅ ATOMIC CHECK-AND-SET using Map operations
-        const existing = activeRequests.get(requestKey);
-        
-        if (existing) {
-            const age = Date.now() - existing.timestamp;
-            
-            // If request is stale (>30 seconds), allow retry
-            if (age > 30000) {
-                activeRequests.delete(requestKey);
-                console.log(`[REQUEST-DEDUP-STALE] ${requestKey} aged ${age}ms - allowing retry`);
-            } else {
-                console.log(`[REQUEST-DEDUP-BLOCK] ${requestKey} in-flight (${age}ms) - returning cached`);
-                
-                try {
-                    const cachedResult = await existing.promise;
-                    return res.json({ ...cachedResult, servedFromDedup: true });
-                } catch (error) {
-                    activeRequests.delete(requestKey);
-                    // Fall through to allow retry
-                }
-            }
-        }
-        
-        // ✅ CRITICAL FIX: Create placeholder BEFORE calling next()
-        const placeholder = {
-            promise: null,
-            timestamp: Date.now(),
-            resolved: false
-        };
-        
-        activeRequests.set(requestKey, placeholder);
-        
-        // Create promise that captures response
-        const responsePromise = new Promise((resolve, reject) => {
-            const originalJson = res.json.bind(res);
-            const originalSend = res.send.bind(res);
-            
-            // Override res.json
-            res.json = function(data) {
-                if (!placeholder.resolved) {
-                    placeholder.resolved = true;
-                    resolve(data);
-                }
-                
-                // Cleanup after 5 seconds
-                setTimeout(() => {
-                    activeRequests.delete(requestKey);
-                }, 5000);
-                
-                return originalJson(data);
-            };
-            
-            // Override res.send (for error responses)
-            res.send = function(data) {
-                if (!placeholder.resolved) {
-                    placeholder.resolved = true;
-                    reject(new Error('Request failed'));
-                }
-                
-                setTimeout(() => {
-                    activeRequests.delete(requestKey);
-                }, 5000);
-                
-                return originalSend(data);
-            };
-            
-            // Timeout handler
-            setTimeout(() => {
-                if (!placeholder.resolved) {
-                    reject(new Error('Request timeout'));
-                    activeRequests.delete(requestKey);
-                }
-            }, 30000);
-        });
-        
-        // Update placeholder with real promise
-        placeholder.promise = responsePromise;
-        
-        next();
-    };
-}
-
-
 
 
 // Calculate ranking score based on Instagram's algorithm
@@ -3318,15 +3037,7 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
     }
 });
 
-app.post('/api/contributed-views/batch-optimized',
-    rateLimitByUser(3), // ✅ Max 3 per 10 seconds
-    atomicRequestDedup((req) => {
-        const { userId, posts = [], reels = [] } = req.body;
-        const postsHash = posts.slice(0, 10).sort().join(',').substring(0, 50);
-        const reelsHash = reels.slice(0, 10).sort().join(',').substring(0, 50);
-        return `batch-views:${userId}:${postsHash}:${reelsHash}`;
-    }),
-    async (req, res) => {
+app.post('/api/contributed-views/batch-optimized', async (req, res) => {
   const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
   const startTime = Date.now();
 
@@ -4052,10 +3763,8 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         let userInterests = [];
         const interestFetchStart = Date.now();
         try {
-            //console.log(`[USER-INTERESTS-FETCH-START] Requesting from http://127.0.0.1:5000/api/users/${userId}`);
-            console.log(`[USER-INTERESTS-FETCH-START] Requesting from https://server1-ki1x.onrender.com/api/users/${userId}`);
-            //const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, {
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, {
+            console.log(`[USER-INTERESTS-FETCH-START] Requesting from http://127.0.0.1:5000/api/users/${userId}`);
+            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, {
                 timeout: 3000,
                 validateStatus: function(status) {
                     return status >= 200 && status < 500;
@@ -4093,8 +3802,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         const [viewedPostsDocs, viewedReelsDocs, followResponse] = await Promise.all([
             db.collection('contrib_posts').find({ userId }).toArray(),
             db.collection('contrib_reels').find({ userId }).toArray(),
-            //axios.get(`http://127.0.0.1:5000/api/users/${userId}/following`, { timeout: 1000, validateStatus: () => true })
-            axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}/following`, { timeout: 1000, validateStatus: () => true })
+            axios.get(`http://127.0.0.1:5000/api/users/${userId}/following`, { timeout: 1000, validateStatus: () => true })
                 .catch(err => {
                     console.warn('[FOLLOWING-FETCH-ERROR]', err && err.message ? err.message : err);
                     return { data: { following: [] } };
@@ -4464,7 +4172,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
 
 app.post('/api/feed/optimized-reels', async (req, res) => {
     const startTime = Date.now();
-    const { userId, slotId, excludedReelIds = [], limit = 250 } = req.body;
+    const { userId, slotId, excludedReelIds = [], limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
     
     try {
@@ -4473,8 +4181,7 @@ app.post('/api/feed/optimized-reels', async (req, res) => {
         // Fetch user interests for ranking
         let userInterests = [];
         try {
-            //const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000 });
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
+            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000 });
             if (userResponse.status === 200 && userResponse.data.success) {
                 userInterests = userResponse.data.user.interests || [];
             }
@@ -4625,7 +4332,7 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
         // Step 1: Get user interests
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { 
+            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { 
                 timeout: 2000 
             });
             if (userResponse.status === 200 && userResponse.data.success) {
@@ -5938,14 +5645,7 @@ app.post('/api/random-write', async (req, res) => {
  * For NEW users: Auto-detects latest reel/post documents and creates user_status
  * READ COUNT: 1-3 (user_status + optional reels/posts collection check for new users)
  */
-app.get('/api/user-status/:userId',
-
-
-    rateLimitByUser(5),
-    deduplicateRequest((req) => {
-        return `user-status:${req.params.userId}`;
-    }),
-    async (req, res) => {
+app.get('/api/user-status/:userId', async (req, res) => {
     const startTime = Date.now();
     const { userId } = req.params;
     
@@ -6166,15 +5866,7 @@ app.get('/api/user-status/:userId',
  * Returns ids array and count from contrib_posts or contrib_reels
  * READ COUNT: 1 (single document read by _id = slotId)
  */
-app.get('/api/contrib-check/:userId/:slotId/:type', 
-    // ✅ ADD deduplication middleware
-    rateLimitByUser(15), // Max 15 per 10 seconds
-    
-    deduplicateRequest((req) => {
-        const { userId, slotId, type } = req.params;
-        return `contrib-check:${userId}:${slotId}:${type}`;
-    }),
-    async (req, res) => {
+app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
     const startTime = Date.now();
     const { userId, slotId, type } = req.params;
     
@@ -6199,7 +5891,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type',
         if (contribDoc && contribDoc.ids) {
             const count = contribDoc.ids.length;
             
-            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/250 | duration=${duration}ms`);
+            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/6 | duration=${duration}ms`);
             
             return res.json({
                 success: true,
@@ -6240,20 +5932,9 @@ app.get('/api/contrib-check/:userId/:slotId/:type',
  * Fetches reels content from specific slot with ranking algorithm
  * READ COUNT: 1 (aggregation on reels collection filtered by slotId)
  */
-app.post('/api/feed/optimized-reels',
-    // ✅ ADD deduplication middleware
-    rateLimitByUser(10),
-    deduplicateRequest((req) => {
-        const { userId, slotId, excludedReelIds = [] } = req.body;
-        // Include hash of excluded IDs to differentiate pagination
-        const excludedHash = excludedReelIds.length > 0 
-            ? excludedReelIds.slice(0, 10).join(',').substring(0, 50)
-            : 'none';
-        return `optimized-reels:${userId}:${slotId}:${excludedHash}`;
-    }),
-    async (req, res) => {
+app.post('/api/feed/optimized-reels', async (req, res) => {
     const startTime = Date.now();
-    const { userId, slotId, excludedReelIds = [], limit = 250 } = req.body;
+    const { userId, slotId, excludedReelIds = [], limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
     
     try {
@@ -6270,7 +5951,7 @@ app.post('/api/feed/optimized-reels',
         // Fetch user interests for ranking
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
+            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000 });
             if (userResponse.status === 200 && userResponse.data.success) {
                 userInterests = userResponse.data.user.interests || [];
             }
@@ -6494,7 +6175,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
         if (contribDoc && contribDoc.ids) {
             const count = contribDoc.ids.length;
             
-            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/250 | duration=${duration}ms`);
+            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/6 | duration=${duration}ms`);
             
             return res.json({
                 success: true,
@@ -6533,7 +6214,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
 
 app.post('/api/feed/optimized-reels', async (req, res) => {
     const startTime = Date.now();
-    const { userId, slotId, excludedReelIds = [], limit = 250 } = req.body;
+    const { userId, slotId, excludedReelIds = [], limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
     
     try {
@@ -6550,7 +6231,7 @@ app.post('/api/feed/optimized-reels', async (req, res) => {
         // Fetch user interests for ranking
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
+            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000 });
             if (userResponse.status === 200 && userResponse.data.success) {
                 userInterests = userResponse.data.user.interests || [];
             }
@@ -6771,7 +6452,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
         if (contribDoc && contribDoc.ids) {
             const count = contribDoc.ids.length;
             
-            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/250 | duration=${duration}ms`);
+            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/6 | duration=${duration}ms`);
             
             return res.json({
                 success: true,
@@ -6861,13 +6542,13 @@ app.post('/api/user-status/:userId', async (req, res) => {
  */
 app.post('/api/feed/mixed-optimized', async (req, res) => {
     const startTime = Date.now();
-    const { userId, limit = 250 } = req.body;
+    const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
+
+try {
+    console.log(`[post_algorithm] [MIXED-FEED-START] userId=${userId} | target=${limit}`);
     
-    try {
-        console.log(`[post_algorithm] [MIXED-FEED-START] userId=${userId} | target=${limit}`);
-        
-        const mixedContent = [];
-        const TARGET_CONTENT = Math.max(limit, 250);
+    const mixedContent = [];
+    const TARGET_CONTENT = Math.max(limit, DEFAULT_CONTENT_BATCH_SIZE);
         
         // Phase 1: Latest Reels
         console.log(`[post_algorithm] [PHASE-1] Fetching latest reels`);
@@ -6981,48 +6662,6 @@ app.post('/api/feed/mixed-optimized', async (req, res) => {
     }
 });
 
-
-function rateLimitByUser(maxRequestsPer10Sec = 20) {
-    return (req, res, next) => {
-        const userId = req.params.userId || req.body.userId;
-        
-        if (!userId) {
-            return next(); // Skip if no userId
-        }
-        
-        const now = Date.now();
-        const userData = userRequestCounts.get(userId) || { 
-            count: 0, 
-            resetTime: now + 10000 
-        };
-        
-        // Reset if window expired
-        if (now >= userData.resetTime) {
-            userData.count = 0;
-            userData.resetTime = now + 10000;
-        }
-        
-        userData.count++;
-        userRequestCounts.set(userId, userData);
-        
-        if (userData.count > maxRequestsPer10Sec) {
-            const resetIn = Math.ceil((userData.resetTime - now) / 1000);
-            
-            console.warn(`[RATE-LIMIT-EXCEEDED] userId=${userId.substring(0, 8)} | count=${userData.count}/${maxRequestsPer10Sec} | reset in ${resetIn}s`);
-            
-            return res.status(429).json({
-                success: false,
-                error: 'Too many requests',
-                retryAfter: resetIn
-            });
-        }
-        
-        next();
-    };
-}
-
-
-
 /**
  * Helper: Send mixed content response with metadata
  */
@@ -7071,24 +6710,9 @@ function calculatePreviousSlot(currentSlotId) {
 
 
 
-app.get('/ping', (req, res) => {
-  res.status(200).send('pong');
-});
-
-app.post('/api/feed/optimized-posts',
-
-    rateLimitByUser(10),
-
-    deduplicateRequest((req) => {
-        const { userId, slotId, excludedPostIds = [] } = req.body;
-        const excludedHash = excludedPostIds.length > 0 
-            ? excludedPostIds.slice(0, 10).join(',').substring(0, 50)
-            : 'none';
-        return `optimized-posts:${userId}:${slotId}:${excludedHash}`;
-    }),
-    async (req, res) => {
+app.post('/api/feed/optimized-posts', async (req, res) => {
     const startTime = Date.now();
-    const { userId, slotId, excludedPostIds = [], limit = 250 } = req.body;
+    const { userId, slotId, excludedPostIds = [], limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
     const readNum = req.headers['x-read-number'] || '?';
 
     try {
@@ -7104,7 +6728,7 @@ app.post('/api/feed/optimized-posts',
         // Fetch user interests (best-effort)
         let userInterests = [];
         try {
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000, validateStatus: s => s >= 200 && s < 500 });
+            const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { timeout: 1000, validateStatus: s => s >= 200 && s < 500 });
             if (userResponse.status === 200 && userResponse.data && userResponse.data.success && userResponse.data.user) {
                 userInterests = userResponse.data.user.interests || [];
             }
@@ -7145,7 +6769,7 @@ app.post('/api/feed/optimized-posts',
                 }
             },
             { $sort: { compositeScore: -1 } },
-            { $limit: parseInt(limit, 10) || 250 },
+            { $limit: parseInt(limit, 10) || DEFAULT_CONTENT_BATCH_SIZE },
             {
                 $project: {
                     postId: '$postList.postId',
