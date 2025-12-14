@@ -2147,6 +2147,87 @@ start().catch(err => { console.error('[SERVER-START-ERROR]', err); process.exit(
 
 // --- ROUTES ---
 
+// Add to your routes file
+router.get('/posts/single-reel/:postId', async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { viewerId } = req.query;
+
+    console.log(`[SINGLE-REEL-REQUEST] postId=${postId.substring(0, 8)} | viewerId=${viewerId?.substring(0, 8)}`);
+
+    if (!postId || postId.trim().length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid postId' 
+      });
+    }
+
+    // Search across all reel documents (reel_0, reel_1, etc.)
+    const reelDocs = await db.collection('reels').find({}).toArray();
+    
+    let foundReel = null;
+    let sourceDocument = null;
+
+    for (const doc of reelDocs) {
+      if (doc.reelsList && Array.isArray(doc.reelsList)) {
+        const reel = doc.reelsList.find(r => r.postId === postId);
+        
+        if (reel) {
+          foundReel = reel;
+          sourceDocument = doc._id;
+          break;
+        }
+      }
+    }
+
+    if (!foundReel) {
+      console.log(`[SINGLE-REEL-NOT-FOUND] postId=${postId.substring(0, 8)}`);
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Reel not found' 
+      });
+    }
+
+    // Add sourceDocument to response
+    foundReel.sourceDocument = sourceDocument;
+    foundReel.isReel = true;
+
+    // If viewerId provided, check like state
+    if (viewerId) {
+      try {
+        const interaction = await db.collection('interactions')
+          .findOne({ userId: viewerId });
+        
+        if (interaction && interaction.likes && interaction.likes[sourceDocument]) {
+          const likedReels = interaction.likes[sourceDocument].reels || [];
+          foundReel.isLiked = likedReels.includes(postId);
+        }
+      } catch (err) {
+        console.log('[LIKE-STATE-CHECK-ERROR]', err.message);
+      }
+    }
+
+    console.log(`[SINGLE-REEL-SUCCESS] ✅ postId=${postId.substring(0, 8)} | source=${sourceDocument}`);
+
+    res.json({
+      success: true,
+      reel: foundReel,
+      sourceDocument: sourceDocument
+    });
+
+  } catch (error) {
+    console.error('[SINGLE-REEL-ERROR]', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Server error: ' + error.message 
+    });
+  }
+});
+
+
+
+
+
 app.get('/health', (req, res) => res.json({ status: 'OK', ts: new Date().toISOString() }));
 
 // ADDED: Comprehensive production health check
