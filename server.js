@@ -27,7 +27,7 @@ const DEDUP_WINDOW = 5000; // 5 seconds
 // Global counters and cache
 const dbOpCounters = { reads: 0, writes: 0, updates: 0, inserts: 0, deletes: 0, queries: 0, aggregations: 0 };
 //const cache = { latestSlots: new Map(), userStatus: new Map(), maxIndexes: new Map(), ttl: 30 };
-
+const singleReelRoutes = require('./routes/singleReel.routes');
 const router = express.Router();
 
 const cache = { 
@@ -260,6 +260,9 @@ app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => { console.log(`[HTTP] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`); next(); });
 app.use('/api', rateLimit({ windowMs: 1000, max: 1000, standardHeaders: true, legacyHeaders: false }));
 
+app.use(express.json());
+app.use('/api', singleReelRoutes);
+module.exports = app;
 
 // Replace existing middleware section
 app.use(cors());
@@ -2226,8 +2229,7 @@ router.get('/posts/single-reel/:postId', async (req, res) => {
     });
   }
 });
-
-
+module.exports = router;
 
 
 
