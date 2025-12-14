@@ -261,8 +261,6 @@ app.use((req, res, next) => { console.log(`[HTTP] ${new Date().toISOString()} ${
 app.use('/api', rateLimit({ windowMs: 1000, max: 1000, standardHeaders: true, legacyHeaders: false }));
 
 app.use(express.json());
-app.use('/api', singleReelRoutes);
-module.exports = app;
 
 // Replace existing middleware section
 app.use(cors());
