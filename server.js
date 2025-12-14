@@ -2150,6 +2150,46 @@ start().catch(err => { console.error('[SERVER-START-ERROR]', err); process.exit(
 
 // --- ROUTES ---
 
+// GET /api/debug/db-check
+// Diagnostic endpoint to check database connection and Reels collection
+app.get('/api/debug/db-check', async (req, res) => {
+    try {
+        const database = req.app.locals.db || global.db || db;
+        
+        if (!database) {
+            return res.json({
+                success: false,
+                error: 'Database not connected'
+            });
+        }
+
+        // Get Reels collection stats
+        const reelDocs = await database.collection('Reels').find({}).limit(5).toArray();
+        const firstDoc = reelDocs[0];
+        
+        const stats = {
+            success: true,
+            databaseConnected: true,
+            reelsDocumentsFound: reelDocs.length,
+            sampleDocument: firstDoc ? {
+                _id: firstDoc._id,
+                hasReelsList: !!firstDoc.reelsList,
+                reelsCount: firstDoc.reelsList ? firstDoc.reelsList.length : 0,
+                sampleReelIds: firstDoc.reelsList ? 
+                    firstDoc.reelsList.slice(0, 3).map(r => r.postId) : []
+            } : null
+        };
+
+        res.json(stats);
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            stack: error.stack
+        });
+    }
+});
+
 // GET /api/posts/single-reel/:postId
 // Fetch a single reel by postId for deep navigation from ChatActivity
 // GET /api/posts/single-reel/:postId
