@@ -2150,84 +2150,129 @@ start().catch(err => { console.error('[SERVER-START-ERROR]', err); process.exit(
 
 // --- ROUTES ---
 
-// Add to your routes file
-router.get('/posts/single-reel/:postId', async (req, res) => {
-  try {
+// GET /api/posts/single-reel/:postId
+// Fetch a single reel by postId for deep navigation from ChatActivity
+app.get('/api/posts/single-reel/:postId', async (req, res) => {
+    const startTime = Date.now();
     const { postId } = req.params;
-    const { viewerId } = req.query;
+    const { userId } = req.query;
 
-    console.log(`[SINGLE-REEL-REQUEST] postId=${postId.substring(0, 8)} | viewerId=${viewerId?.substring(0, 8)}`);
+    console.log(`[SINGLE-REEL-REQUEST] postId=${postId.substring(0, 8)} | userId=${userId ? userId.substring(0, 8) : 'none'}`);
 
-    if (!postId || postId.trim().length === 0) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Invalid postId' 
-      });
-    }
-
-    // Search across all reel documents (reel_0, reel_1, etc.)
-    const reelDocs = await db.collection('reels').find({}).toArray();
-    
-    let foundReel = null;
-    let sourceDocument = null;
-
-    for (const doc of reelDocs) {
-      if (doc.reelsList && Array.isArray(doc.reelsList)) {
-        const reel = doc.reelsList.find(r => r.postId === postId);
-        
-        if (reel) {
-          foundReel = reel;
-          sourceDocument = doc._id;
-          break;
+    try {
+        if (!postId || postId.trim() === '') {
+            return res.status(400).json({
+                success: false,
+                error: 'postId is required'
+            });
         }
-      }
-    }
 
-    if (!foundReel) {
-      console.log(`[SINGLE-REEL-NOT-FOUND] postId=${postId.substring(0, 8)}`);
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Reel not found' 
-      });
-    }
+        let foundReel = null;
+        let sourceDocument = null;
 
-    // Add sourceDocument to response
-    foundReel.sourceDocument = sourceDocument;
-    foundReel.isReel = true;
-
-    // If viewerId provided, check like state
-    if (viewerId) {
-      try {
-        const interaction = await db.collection('interactions')
-          .findOne({ userId: viewerId });
+        // Search in Reels collection - documents have structure: { _id: "reel_0", reelsList: [...] }
+        const reelDocs = await db.collection('Reels').find({}).toArray();
         
-        if (interaction && interaction.likes && interaction.likes[sourceDocument]) {
-          const likedReels = interaction.likes[sourceDocument].reels || [];
-          foundReel.isLiked = likedReels.includes(postId);
+        console.log(`[SINGLE-REEL-SEARCH] Searching ${reelDocs.length} reel documents`);
+        
+        for (const doc of reelDocs) {
+            if (doc.reelsList && Array.isArray(doc.reelsList)) {
+                const reel = doc.reelsList.find(r => r.postId === postId);
+                if (reel) {
+                    foundReel = reel;
+                    sourceDocument = doc._id; // e.g., "reel_0"
+                    console.log(`[SINGLE-REEL-FOUND] ✅ In document: ${doc._id} (${doc.reelsList.length} reels)`);
+                    break;
+                }
+            }
         }
-      } catch (err) {
-        console.log('[LIKE-STATE-CHECK-ERROR]', err.message);
-      }
+
+        // If not found in Reels, try Posts collection (might have same structure)
+        if (!foundReel) {
+            try {
+                const postDocs = await db.collection('Posts').find({}).toArray();
+                console.log(`[SINGLE-REEL-SEARCH-POSTS] Searching ${postDocs.length} post documents`);
+                
+                for (const doc of postDocs) {
+                    // Posts might have postsList or reelsList
+                    const list = doc.postsList || doc.reelsList;
+                    
+                    if (list && Array.isArray(list)) {
+                        const post = list.find(p => 
+                            p.postId === postId && 
+                            p.imageUrl && 
+                            /\.(mp4|webm|mov)$/i.test(p.imageUrl)
+                        );
+                        
+                        if (post) {
+                            foundReel = post;
+                            sourceDocument = doc._id;
+                            console.log(`[SINGLE-REEL-FOUND-IN-POSTS] ✅ In document: ${doc._id}`);
+                            break;
+                        }
+                    }
+                }
+            } catch (postsError) {
+                console.log('[SINGLE-REEL-POSTS-ERROR] Posts collection not found or error:', postsError.message);
+            }
+        }
+
+        if (!foundReel) {
+            console.log(`[SINGLE-REEL-NOT-FOUND] ❌ postId=${postId.substring(0, 8)} not found in any document`);
+            return res.status(404).json({
+                success: false,
+                error: 'Reel not found'
+            });
+        }
+
+        // Format the reel data to match client expectations
+        const formattedReel = {
+            postId: foundReel.postId,
+            userId: foundReel.userId,
+            username: foundReel.username || 'Unknown User',
+            caption: foundReel.caption || '',
+            description: foundReel.description || '',
+            category: foundReel.category || '',
+            hashtag: foundReel.hashtag || '',
+            imageUrl: foundReel.imageUrl, // Video URL
+            profilePicUrl: foundReel.profile_picture_url || foundReel.profilePicUrl || '',
+            likeCount: foundReel.likeCount || 0,
+            commentCount: foundReel.commentCount || 0,
+            timestamp: foundReel.timestamp || foundReel.serverTimestamp || Date.now(),
+            sourceDocument: sourceDocument,
+            isReel: true,
+            ratio: '9:16',
+            // Include additional fields if they exist
+            viewCount: foundReel.viewCount || foundReel.viewcount || 0,
+            retention: foundReel.retention || 0,
+            multiple_posts: foundReel.multiple_posts || false,
+            media_count: foundReel.media_count || 1
+        };
+
+        const duration = Date.now() - startTime;
+
+        console.log(`[SINGLE-REEL-SUCCESS] ✅ postId=${postId.substring(0, 8)} | doc=${sourceDocument} | videoUrl=${formattedReel.imageUrl ? 'EXISTS' : 'NULL'} | duration=${duration}ms`);
+
+        res.json({
+            success: true,
+            reel: formattedReel,
+            duration: duration,
+            metadata: {
+                sourceDocument: sourceDocument,
+                username: formattedReel.username,
+                hasVideo: !!formattedReel.imageUrl
+            }
+        });
+
+    } catch (error) {
+        console.error('[SINGLE-REEL-ERROR] ❌', error);
+        res.status(500).json({
+            success: false,
+            error: 'Server error fetching reel',
+            message: error.message
+        });
     }
-
-    console.log(`[SINGLE-REEL-SUCCESS] ✅ postId=${postId.substring(0, 8)} | source=${sourceDocument}`);
-
-    res.json({
-      success: true,
-      reel: foundReel,
-      sourceDocument: sourceDocument
-    });
-
-  } catch (error) {
-    console.error('[SINGLE-REEL-ERROR]', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Server error: ' + error.message 
-    });
-  }
 });
-module.exports = app;
-
 
 
 app.get('/health', (req, res) => res.json({ status: 'OK', ts: new Date().toISOString() }));
