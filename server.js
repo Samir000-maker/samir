@@ -2227,7 +2227,7 @@ router.get('/posts/single-reel/:postId', async (req, res) => {
     });
   }
 });
-module.exports = router;
+module.exports = app;
 
 
 
