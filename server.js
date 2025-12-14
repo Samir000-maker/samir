@@ -28,7 +28,6 @@ const DEDUP_WINDOW = 5000; // 5 seconds
 const dbOpCounters = { reads: 0, writes: 0, updates: 0, inserts: 0, deletes: 0, queries: 0, aggregations: 0 };
 //const cache = { latestSlots: new Map(), userStatus: new Map(), maxIndexes: new Map(), ttl: 30 };
 
-const express = require('express');
 const router = express.Router();
 
 const cache = { 
