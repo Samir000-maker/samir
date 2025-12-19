@@ -2582,7 +2582,7 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
 
         log('info', `[REELS-PERSONALIZED-START] userId=${userId}, limit=${limitNum}, offset=${offsetNum}`);
 
-        // Step 1: Get user interests from PORT 5000
+        // Step 1: Get user interests
         let userInterests = [];
         try {
             const userResponse = await axios.get(`http://127.0.0.1:5000/api/users/${userId}`, { 
@@ -2596,7 +2596,7 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
             log('warn', `[USER-INTERESTS-SKIP] ${e.message} - proceeding without interests`);
         }
 
-        // Step 2: Get viewed reels to exclude
+        // Step 2: Get viewed reels
         const viewedReelsDoc = await db.collection('contrib_reels').findOne(
             { userId }, 
             { projection: { ids: 1 } }
@@ -2604,7 +2604,29 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
         const viewedReelIds = viewedReelsDoc?.ids || [];
         log('info', `[VIEWED-FILTER] Excluding ${viewedReelIds.length} viewed reels`);
 
-        // Step 3: Build aggregation pipeline with interest-based ranking
+        // **CRITICAL: First pass to get max values for normalization**
+        const maxValuesQuery = [
+            { $match: { 'reelsList': { $exists: true, $ne: [] } } },
+            { $unwind: '$reelsList' },
+            { $match: { 'reelsList.postId': { $nin: viewedReelIds } }},
+            {
+                $group: {
+                    _id: null,
+                    maxLikes: { $max: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } } },
+                    maxComments: { $max: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } } },
+                    maxViews: { $max: { $toInt: { $ifNull: ['$reelsList.viewCount', 0] } } }
+                }
+            }
+        ];
+
+        const maxValues = await db.collection('reels').aggregate(maxValuesQuery).toArray();
+        const maxLikes = maxValues[0]?.maxLikes || 1;
+        const maxComments = maxValues[0]?.maxComments || 1;
+        const maxViews = maxValues[0]?.maxViews || 1;
+
+        log('info', `[NORMALIZATION-VALUES] maxLikes=${maxLikes}, maxComments=${maxComments}, maxViews=${maxViews}`);
+
+        // Step 3: Build Instagram-style weighted scoring pipeline
         const pipeline = [
             { $match: { 'reelsList': { $exists: true, $ne: [] } } },
             { $unwind: '$reelsList' },
@@ -2615,7 +2637,13 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
             },
             {
                 $addFields: {
-                    // Calculate interest match score (0-100)
+                    // Base metrics (converted to numbers)
+                    retentionNum: { $toDouble: { $ifNull: ['$reelsList.retention', 0] } },
+                    likeCountNum: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } },
+                    commentCountNum: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } },
+                    viewCountNum: { $toInt: { $ifNull: ['$reelsList.viewCount', 0] } },
+                    
+                    // Interest match score (0, 50, or 100)
                     interestScore: {
                         $cond: {
                             if: { 
@@ -2633,27 +2661,57 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
                                 }
                             }
                         }
-                    },
-                    retentionNum: { $toDouble: { $ifNull: ['$reelsList.retention', 0] } },
-                    likeCountNum: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } },
-                    commentCountNum: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } },
-                    viewCountNum: { $toInt: { $ifNull: ['$reelsList.viewCount', 0] } }
+                    }
                 }
             },
             {
+                $addFields: {
+                    // **INSTAGRAM-STYLE NORMALIZATION (0-100 scale)**
+                    normalizedLikes: {
+                        $multiply: [
+                            { $divide: ['$likeCountNum', maxLikes] },
+                            100
+                        ]
+                    },
+                    normalizedComments: {
+                        $multiply: [
+                            { $divide: ['$commentCountNum', maxComments] },
+                            100
+                        ]
+                    },
+                    normalizedViews: {
+                        $multiply: [
+                            { $divide: ['$viewCountNum', maxViews] },
+                            100
+                        ]
+                    }
+                }
+            },
+            {
+                $addFields: {
+                    // **INSTAGRAM-STYLE WEIGHTED COMPOSITE SCORE**
+                    // Retention: 50%, Likes: 25%, Comments: 12%, Interest: 10%, Views: 3%
+                    compositeScore: {
+                        $add: [
+                            { $multiply: ['$retentionNum', 0.50] },           // 50% weight
+                            { $multiply: ['$normalizedLikes', 0.25] },        // 25% weight
+                            { $multiply: ['$normalizedComments', 0.12] },     // 12% weight
+                            { $multiply: ['$interestScore', 0.10] },          // 10% weight
+                            { $multiply: ['$normalizedViews', 0.03] }         // 3% weight
+                        ]
+                    }
+                }
+            },
+            {
+                // **CRITICAL: Sort by composite score (Instagram algorithm)**
                 $sort: {
-                    retentionNum: -1,
-                    interestScore: -1,
-                    likeCountNum: -1,
-                    commentCountNum: -1,
-                    viewCountNum: -1
+                    compositeScore: -1  // Highest score first
                 }
             },
             { $skip: offsetNum },
             { $limit: limitNum * 2 },
             {
                 $project: {
-                    // ✅ FIXED: Changed from $postList to $reelsList
                     postId: '$reelsList.postId',
                     userId: '$reelsList.userId',
                     username: '$reelsList.username',
@@ -2664,6 +2722,7 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
                             else: '$reelsList.imageUrl'
                         }
                     },
+                    videoUrl: '$reelsList.videoUrl',
                     caption: '$reelsList.caption',
                     description: '$reelsList.description',
                     category: '$reelsList.category',
@@ -2674,9 +2733,9 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
                     viewCount: '$viewCountNum',
                     retention: '$retentionNum',
                     interestScore: '$interestScore',
+                    compositeScore: '$compositeScore',  // Include for debugging
                     sourceDocument: '$_id',
-                    isReel: { $literal: true },
-                    ratio: { $ifNull: ['$reelsList.ratio', '9:16'] }
+                    isReel: { $literal: true }
                 }
             }
         ];
@@ -2687,32 +2746,32 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
 
         log('info', `[AGGREGATION-COMPLETE] ${reels.length} reels in ${aggTime}ms`);
 
-        // Step 4: Client-side deduplication
+        // Step 4: Client-side deduplication + enhanced logging
         const seenIds = new Set();
         const uniqueReels = [];
         
         for (const reel of reels) {
-            // ✅ ADDED: Null safety check before substring
-            if (!reel.postId) {
-                log('warn', `[REEL-SKIP] Missing postId in reel`);
-                continue;
-            }
-            
             if (!seenIds.has(reel.postId)) {
                 seenIds.add(reel.postId);
-                uniqueReels.push(reel);
                 
+                // **ENHANCED DEBUG: Log Instagram-style ranking**
                 log('info', `[REEL-RANKED] ${reel.postId.substring(0, 8)} | ` +
-                    `retention=${reel.retention?.toFixed(1) || 0}% | ` +
-                    `interest=${reel.interestScore || 0} | ` +
-                    `category=${reel.category || 'none'} | ` +
-                    `likes=${reel.likeCount || 0}`);
+                    `SCORE=${reel.compositeScore.toFixed(2)} | ` +
+                    `retention=${reel.retention.toFixed(1)}% (${(reel.retention * 0.50).toFixed(1)}) | ` +
+                    `likes=${reel.likeCount} (${(reel.likeCount/maxLikes*100*0.25).toFixed(1)}) | ` +
+                    `comments=${reel.commentCount} (${(reel.commentCount/maxComments*100*0.12).toFixed(1)}) | ` +
+                    `interest=${reel.interestScore} (${(reel.interestScore * 0.10).toFixed(1)}) | ` +
+                    `views=${reel.viewCount} (${(reel.viewCount/maxViews*100*0.03).toFixed(1)}) | ` +
+                    `category=${reel.category || 'none'}`);
+                
+                uniqueReels.push(reel);
                 
                 if (uniqueReels.length >= limitNum) break;
             }
         }
 
         log('info', `[REELS-PERSONALIZED-COMPLETE] Returning ${uniqueReels.length}/${reels.length} unique reels`);
+        log('info', `[ALGORITHM-WEIGHTS] Retention=50%, Likes=25%, Comments=12%, Interest=10%, Views=3%`);
 
         return res.json({
             success: true,
@@ -2723,7 +2782,19 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
                 userInterests: userInterests,
                 viewedReelsFiltered: viewedReelIds.length,
                 aggregationTimeMs: aggTime,
-                offset: offsetNum
+                offset: offsetNum,
+                normalization: {
+                    maxLikes,
+                    maxComments,
+                    maxViews
+                },
+                algorithmWeights: {
+                    retention: 50,
+                    likes: 25,
+                    comments: 12,
+                    interest: 10,
+                    views: 3
+                }
             }
         });
 
