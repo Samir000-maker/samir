@@ -44,9 +44,9 @@ const { promisify } = require('util');
 
 
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
-const MAX_CONTENT_PER_SLOT = 4;        // Maximum content items per document before creating new slot
-const DEFAULT_CONTENT_BATCH_SIZE = 4;   // Default number of items to return per request
-const MIN_CONTENT_FOR_FEED = 4;         // Minimum content required for feed requests
+const MAX_CONTENT_PER_SLOT = 40;        // Maximum content items per document before creating new slot
+const DEFAULT_CONTENT_BATCH_SIZE = 40;   // Default number of items to return per request
+const MIN_CONTENT_FOR_FEED = 40;         // Minimum content required for feed requests
 // ============================================================================
 
 console.log('[CONFIG] System Configuration:');
