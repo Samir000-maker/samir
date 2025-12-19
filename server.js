@@ -3349,63 +3349,79 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       console.log(`[postId_debug] [REEL-GROUP] ${docId}: ${ids.length} reels`);
     }
 
-    // ✅ Process posts (route each to its correct document)
-    const postResults = [];
-    
-    for (const [docId, postIds] of postsByDocument.entries()) {
-      console.log(`[postId_debug] [SAVING-POSTS] ${postIds.length} posts to document ${docId}`);
-      
-      const contribPostsCollection = db.collection('contrib_posts');
-      
-      const result = await contribPostsCollection.updateOne(
-        { _id: docId, userId },
-        {
-          $addToSet: { ids: { $each: postIds } },
-          $setOnInsert: { userId, createdAt: new Date() },
-          $set: { updatedAt: new Date() }
-        },
-        { upsert: true }
-      );
-      
-      postResults.push({
-        documentId: docId,
-        count: postIds.length,
-        matched: result.matchedCount,
-        modified: result.modifiedCount,
-        upserted: result.upsertedCount
-      });
-      
-      console.log(`[postId_debug] [POSTS-SAVED] ${docId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
-    }
+// ✅ Process posts (route each to its correct document)
+const postResults = [];
 
-    // ✅ Process reels (route each to its correct document)
-    const reelResults = [];
-    
-    for (const [docId, reelIds] of reelsByDocument.entries()) {
-      console.log(`[postId_debug] [SAVING-REELS] ${reelIds.length} reels to document ${docId}`);
-      
-      const contribReelsCollection = db.collection('contrib_reels');
-      
-      const result = await contribReelsCollection.updateOne(
-        { _id: docId, userId },
-        {
-          $addToSet: { ids: { $each: reelIds } },
-          $setOnInsert: { userId, createdAt: new Date() },
-          $set: { updatedAt: new Date() }
-        },
-        { upsert: true }
-      );
-      
-      reelResults.push({
-        documentId: docId,
-        count: reelIds.length,
-        matched: result.matchedCount,
-        modified: result.modifiedCount,
-        upserted: result.upsertedCount
-      });
-      
-      console.log(`[postId_debug] [REELS-SAVED] ${docId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
-    }
+for (const [docId, postIds] of postsByDocument.entries()) {
+  console.log(`[postId_debug] [SAVING-POSTS] ${postIds.length} posts to document ${docId}`);
+  
+  const contribPostsCollection = db.collection('contrib_posts');
+  
+  // ✅ FIXED: Use userId_docId as _id to prevent conflicts
+  const uniqueDocId = `${userId}_${docId}`;
+  
+  const result = await contribPostsCollection.updateOne(
+    { _id: uniqueDocId }, // Changed from { _id: docId, userId }
+    {
+      $addToSet: { ids: { $each: postIds } },
+      $setOnInsert: { 
+        userId, 
+        slotId: docId, // Store original slot ID for reference
+        createdAt: new Date() 
+      },
+      $set: { updatedAt: new Date() }
+    },
+    { upsert: true }
+  );
+  
+  postResults.push({
+    documentId: uniqueDocId,
+    originalSlotId: docId,
+    count: postIds.length,
+    matched: result.matchedCount,
+    modified: result.modifiedCount,
+    upserted: result.upsertedCount
+  });
+  
+  console.log(`[postId_debug] [POSTS-SAVED] ${uniqueDocId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
+}
+
+// ✅ Process reels (route each to its correct document)
+const reelResults = [];
+
+for (const [docId, reelIds] of reelsByDocument.entries()) {
+  console.log(`[postId_debug] [SAVING-REELS] ${reelIds.length} reels to document ${docId}`);
+  
+  const contribReelsCollection = db.collection('contrib_reels');
+  
+  // ✅ FIXED: Use userId_docId as _id to prevent conflicts
+  const uniqueDocId = `${userId}_${docId}`;
+  
+  const result = await contribReelsCollection.updateOne(
+    { _id: uniqueDocId }, // Changed from { _id: docId, userId }
+    {
+      $addToSet: { ids: { $each: reelIds } },
+      $setOnInsert: { 
+        userId, 
+        slotId: docId, // Store original slot ID for reference
+        createdAt: new Date() 
+      },
+      $set: { updatedAt: new Date() }
+    },
+    { upsert: true }
+  );
+  
+  reelResults.push({
+    documentId: uniqueDocId,
+    originalSlotId: docId,
+    count: reelIds.length,
+    matched: result.matchedCount,
+    modified: result.modifiedCount,
+    upserted: result.upsertedCount
+  });
+  
+  console.log(`[postId_debug] [REELS-SAVED] ${uniqueDocId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
+}
 
     const duration = Date.now() - startTime;
     
@@ -5737,10 +5753,12 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
     try {
         console.log(`[post_algorithm] [READ-${readNum}-START] ${collectionName} lookup for slotId=${slotId} | userId=${userId}`);
         
-        // ✅ CRITICAL: Read ONLY the specific document by _id = slotId AND userId
+        // ✅ FIXED: Use userId_slotId as _id
+        const uniqueDocId = `${userId}_${slotId}`;
+        
         const contribDoc = await db.collection(collectionName).findOne(
-            { _id: slotId, userId: userId },
-            { projection: { ids: 1, _id: 1 } }
+            { _id: uniqueDocId }, // Changed from { _id: slotId, userId: userId }
+            { projection: { ids: 1, _id: 1, slotId: 1 } }
         );
         
         const duration = Date.now() - startTime;
@@ -5761,7 +5779,6 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
         } else {
             console.log(`[post_algorithm] [READ-${readNum}-NOT-FOUND] ${collectionName} slotId=${slotId} doesn't exist for userId=${userId}`);
             
-            // Document doesn't exist - return empty (this is NORMAL for new users)
             return res.json({
                 success: true,
                 slotId: slotId,
