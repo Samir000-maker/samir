@@ -3162,9 +3162,7 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
             try {
                 const dbReadsBefore = dbOpCounters.reads;
                 
-                const feedData = await dbManager.
-                
-                (userId, contentType, parseInt(minContent));
+                const feedData = await dbManager.getOptimizedFeedFixedReads(userId, contentType, parseInt(minContent));
                 const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
                 
                 console.log(`[FEED-DB-QUERY] ${requestKey} | DB reads: ${dbReadsUsed} | Items: ${feedData.content?.length || 0}`);
