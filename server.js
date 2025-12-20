@@ -2197,6 +2197,152 @@ app.get('/api/interactions/like-count', async (req, res) => {
     }
 });
 
+
+
+// ✅ Receive and sync likes from PORT 4000 (source of truth)
+app.post('/api/interactions/sync-from-port4000', async (req, res) => {
+    try {
+        const { likes, timestamp } = req.body;
+
+        if (!Array.isArray(likes)) {
+            return res.status(400).json({ error: 'likes array required' });
+        }
+
+        console.log(`[SYNC-FROM-4000] Received ${likes.length} likes from PORT 4000`);
+
+        const startTime = Date.now();
+        let added = 0;
+        let removed = 0;
+        let errors = 0;
+
+        // Get all existing likes from PORT 2000
+        const existingLikes = await db.collection('contributionToLike')
+            .find({})
+            .project({ userId: 1, postId: 1, _id: 1 })
+            .toArray();
+
+        console.log(`[SYNC-FROM-4000] Current PORT 2000 has ${existingLikes.length} likes`);
+
+        // Create sets for comparison
+        const port4000Set = new Set(
+            likes.map(like => `${like.userId}_${like.postId}`)
+        );
+        const port2000Map = new Map(
+            existingLikes.map(like => [`${like.userId}_${like.postId}`, like._id])
+        );
+
+        // Find likes to ADD (in PORT 4000 but not in PORT 2000)
+        const likesToAdd = likes.filter(like => 
+            !port2000Map.has(`${like.userId}_${like.postId}`)
+        );
+
+        // Find likes to REMOVE (in PORT 2000 but not in PORT 4000)
+        const likesToRemove = existingLikes.filter(like => 
+            !port4000Set.has(`${like.userId}_${like.postId}`)
+        );
+
+        console.log(`[SYNC-FROM-4000] To add: ${likesToAdd.length}, To remove: ${likesToRemove.length}`);
+
+        // ADD missing likes to PORT 2000
+        if (likesToAdd.length > 0) {
+            const bulkOps = likesToAdd.map(like => ({
+                insertOne: {
+                    document: {
+                        _id: `${like.userId}_${like.postId}`,
+                        userId: like.userId,
+                        postId: like.postId,
+                        likedAt: new Date(),
+                        syncedFrom: 'PORT_4000',
+                        sessionDate: new Date().toISOString().split('T')[0]
+                    }
+                }
+            }));
+
+            try {
+                const result = await db.collection('contributionToLike').bulkWrite(bulkOps, { ordered: false });
+                added = result.insertedCount || 0;
+            } catch (error) {
+                // Count successful inserts even if some fail
+                if (error.writeErrors) {
+                    added = likesToAdd.length - error.writeErrors.length;
+                    errors = error.writeErrors.length;
+                }
+                console.error('[SYNC-ADD-ERROR]', error.message);
+            }
+        }
+
+        // REMOVE extra likes from PORT 2000
+        if (likesToRemove.length > 0) {
+            const idsToRemove = likesToRemove.map(like => like._id);
+
+            try {
+                const result = await db.collection('contributionToLike').deleteMany({
+                    _id: { $in: idsToRemove }
+                });
+                removed = result.deletedCount || 0;
+            } catch (error) {
+                errors++;
+                console.error('[SYNC-REMOVE-ERROR]', error.message);
+            }
+        }
+
+        // Update reel_stats like counts
+        if (added > 0 || removed > 0) {
+            console.log('[SYNC-FROM-4000] Updating reel_stats...');
+            
+            // Get all unique postIds that were affected
+            const affectedPostIds = new Set([
+                ...likesToAdd.map(l => l.postId),
+                ...likesToRemove.map(l => l.postId)
+            ]);
+
+            for (const postId of affectedPostIds) {
+                try {
+                    // Count actual likes for this post
+                    const actualLikeCount = await db.collection('contributionToLike')
+                        .countDocuments({ postId });
+
+                    // Update reel_stats
+                    await db.collection('reel_stats').updateOne(
+                        { _id: postId },
+                        { 
+                            $set: { 
+                                likeCount: actualLikeCount,
+                                lastUpdated: new Date()
+                            }
+                        },
+                        { upsert: true }
+                    );
+                } catch (error) {
+                    console.error(`[SYNC-STATS-ERROR] ${postId}:`, error.message);
+                }
+            }
+        }
+
+        const duration = Date.now() - startTime;
+        console.log(`[SYNC-FROM-4000-COMPLETE] Added: ${added}, Removed: ${removed}, Errors: ${errors}, Duration: ${duration}ms`);
+
+        res.json({
+            success: true,
+            added,
+            removed,
+            errors,
+            duration,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('[SYNC-FROM-4000-ERROR]', error);
+        res.status(500).json({ 
+            success: false,
+            error: error.message 
+        });
+    }
+});
+
+
+
+
 // Sync likes from PORT 4000
 app.post('/api/interactions/sync-likes-from-port4000', async (req, res) => {
     try {
