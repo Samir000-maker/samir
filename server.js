@@ -2152,6 +2152,137 @@ app.get('/api/debug/db-check', async (req, res) => {
     }
 });
 
+
+
+
+// Export all likes for sync
+app.get('/api/interactions/export-all-likes', async (req, res) => {
+    try {
+        console.log('[EXPORT-LIKES] Exporting all likes for sync...');
+
+        const likes = await db.collection('contributionToLike')
+            .find({})
+            .project({ userId: 1, postId: 1, _id: 0 })
+            .toArray();
+
+        console.log(`[EXPORT-LIKES] Exported ${likes.length} likes`);
+
+        res.json({
+            success: true,
+            likes,
+            count: likes.length,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('[EXPORT-LIKES-ERROR]', error);
+        res.status(500).json({ error: 'Failed to export likes' });
+    }
+});
+
+// Get like count
+app.get('/api/interactions/like-count', async (req, res) => {
+    try {
+        const count = await db.collection('contributionToLike').countDocuments({});
+        
+        res.json({
+            success: true,
+            count,
+            collection: 'contributionToLike'
+        });
+
+    } catch (error) {
+        console.error('[LIKE-COUNT-ERROR]', error);
+        res.status(500).json({ error: 'Failed to get count' });
+    }
+});
+
+// Sync likes from PORT 4000
+app.post('/api/interactions/sync-likes-from-port4000', async (req, res) => {
+    try {
+        const { likes, timestamp } = req.body;
+
+        if (!Array.isArray(likes)) {
+            return res.status(400).json({ error: 'likes array required' });
+        }
+
+        console.log(`[SYNC-FROM-4000] Received ${likes.length} likes from PORT 4000`);
+
+        let added = 0;
+        let removed = 0;
+        let errors = 0;
+
+        // Get all existing likes from PORT 2000
+        const existingLikes = await db.collection('contributionToLike')
+            .find({})
+            .project({ userId: 1, postId: 1, _id: 1 })
+            .toArray();
+
+        // Create sets for comparison
+        const port4000Set = new Set(
+            likes.map(like => `${like.userId}_${like.postId}`)
+        );
+        const port2000Set = new Set(
+            existingLikes.map(like => `${like.userId}_${like.postId}`)
+        );
+
+        // Add missing likes to PORT 2000
+        const likesToAdd = likes.filter(like => 
+            !port2000Set.has(`${like.userId}_${like.postId}`)
+        );
+
+        for (const like of likesToAdd) {
+            try {
+                await db.collection('contributionToLike').insertOne({
+                    _id: `${like.userId}_${like.postId}`,
+                    userId: like.userId,
+                    postId: like.postId,
+                    likedAt: new Date(),
+                    syncedFrom: 'PORT_4000',
+                    sessionDate: new Date().toISOString().split('T')[0]
+                });
+                added++;
+            } catch (error) {
+                if (error.code !== 11000) {
+                    errors++;
+                }
+            }
+        }
+
+        // Remove extra likes from PORT 2000
+        const likesToRemove = existingLikes.filter(like => 
+            !port4000Set.has(`${like.userId}_${like.postId}`)
+        );
+
+        for (const like of likesToRemove) {
+            try {
+                await db.collection('contributionToLike').deleteOne({
+                    _id: like._id
+                });
+                removed++;
+            } catch (error) {
+                errors++;
+            }
+        }
+
+        console.log(`[SYNC-FROM-4000-COMPLETE] Added: ${added}, Removed: ${removed}, Errors: ${errors}`);
+
+        res.json({
+            success: true,
+            added,
+            removed,
+            errors,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('[SYNC-FROM-4000-ERROR]', error);
+        res.status(500).json({ error: 'Sync failed' });
+    }
+});
+
+
+
 app.get('/api/posts/single-reel/:postId', async (req, res) => {
     const startTime = Date.now();
     const { postId } = req.params;
