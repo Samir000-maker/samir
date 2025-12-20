@@ -2988,25 +2988,23 @@ app.post('/api/sync/metrics-from-mongodb', async (req, res) => {
 
 
 
-// Replace existing /api/interactions/check-likes endpoint
-
-// Replace existing /api/interactions/check-likes
 app.post('/api/interactions/check-likes', async (req, res) => {
     try {
         const { userId, postIds } = req.body;
-        
+
         if (!userId || !Array.isArray(postIds)) {
             return res.status(400).json({ error: 'userId and postIds array required' });
         }
-
         if (postIds.length > 100) {
             return res.status(400).json({ error: 'Maximum 100 postIds per request' });
         }
 
+        console.log(`[CHECK-LIKES] Checking ${postIds.length} posts for user ${userId}`);
+
         // Check cache first for all posts
         const cacheResults = {};
         const uncachedIds = [];
-        
+
         postIds.forEach(postId => {
             const cacheKey = `like_${userId}_${postId}`;
             const cached = getCache(cacheKey);
@@ -3018,7 +3016,7 @@ app.post('/api/interactions/check-likes', async (req, res) => {
         });
 
         if (uncachedIds.length === 0) {
-            log('info', `[LIKE-CHECK-CACHE] All ${postIds.length} from cache`);
+            console.log(`[LIKE-CHECK-CACHE] All ${postIds.length} from cache`);
             return res.json({
                 success: true,
                 likes: cacheResults,
@@ -3026,28 +3024,29 @@ app.post('/api/interactions/check-likes', async (req, res) => {
             });
         }
 
-        const dbReadsBefore = dbOpCounters.reads;
-
-        // Single query for contributions - FIXED
-        const contributionStart = Date.now();
+        // ✅ CRITICAL FIX: Query contributionToLike collection
         const contributionLikes = await db.collection('contributionToLike').find({
             userId: userId,
             postId: { $in: uncachedIds }
         }).project({ postId: 1 }).toArray();
-        logDbOp('find', 'contributionToLike', { userId, count: uncachedIds.length }, contributionLikes, Date.now() - contributionStart);
+
+        console.log(`[CHECK-LIKES-DB] Found ${contributionLikes.length} likes for user ${userId}`);
 
         const likedSet = new Set(contributionLikes.map(doc => doc.postId));
 
-        // Build final result
+        // Build final result - ✅ FIXED: Return boolean, not object
         const finalResult = { ...cacheResults };
         uncachedIds.forEach(postId => {
             const isLiked = likedSet.has(postId);
-            finalResult[postId] = { isLiked };
+            finalResult[postId] = { isLiked: isLiked }; // ✅ MUST be boolean
+            
             // Cache for 1 hour
             setCache(`like_${userId}_${postId}`, isLiked, 3600000);
         });
 
-        const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
+        const dbReadsUsed = uncachedIds.length > 0 ? 1 : 0;
+
+        console.log(`[CHECK-LIKES-RESULT] Returning ${Object.keys(finalResult).length} results`);
 
         return res.json({
             success: true,
@@ -3060,7 +3059,7 @@ app.post('/api/interactions/check-likes', async (req, res) => {
         });
 
     } catch (error) {
-        log('error', '[BATCH-LIKE-ERROR]', error);
+        console.error('[BATCH-LIKE-ERROR]', error);
         return res.status(500).json({ error: 'Failed to check likes' });
     }
 });
