@@ -2785,11 +2785,27 @@ app.post('/api/sync/metrics', async (req, res) => {
         if (!postId || !metrics) {
             return res.status(400).json({ error: 'postId and metrics required' });
         }
-
+        
         console.log(`[SYNC-METRICS] Updating ${postId} - isReel: ${isReel}`);
         
         const collection = isReel ? 'reels' : 'posts';
         const arrayField = isReel ? 'reelsList' : 'postList';
+        
+        // Check if already synced recently (within last 5 seconds to prevent duplicate syncs)
+        const recentSync = await db.collection('sync_log').findOne({
+            postId: postId,
+            syncedAt: { $gte: new Date(Date.now() - 5000) }
+        });
+        
+        if (recentSync) {
+            console.log(`[SYNC-SKIP] ${postId} already synced recently`);
+            return res.json({
+                success: true,
+                message: 'Already synced recently',
+                postId,
+                skipped: true
+            });
+        }
         
         // Update in the main collection documents
         const updateResult = await db.collection(collection).updateOne(
@@ -2804,7 +2820,7 @@ app.post('/api/sync/metrics', async (req, res) => {
                 }
             }
         );
-
+        
         if (updateResult.matchedCount === 0) {
             console.warn(`[SYNC-NOT-FOUND] ${postId} not found in ${collection} collection`);
             
@@ -2830,14 +2846,25 @@ app.post('/api/sync/metrics', async (req, res) => {
         } else {
             console.log(`[SYNC-SUCCESS] Updated ${postId} in ${collection}`);
         }
-
+        
+        // Log successful sync to prevent duplicates
+        await db.collection('sync_log').insertOne({
+            postId: postId,
+            syncedAt: new Date(),
+            metrics: metrics
+        });
+        
+        // Clean up old sync logs (older than 1 minute)
+        await db.collection('sync_log').deleteMany({
+            syncedAt: { $lt: new Date(Date.now() - 60000) }
+        });
+        
         res.json({
             success: true,
             message: 'Metrics synced successfully',
             postId,
             metrics
         });
-
     } catch (error) {
         console.error('[SYNC-ERROR]', error);
         res.status(500).json({ error: 'Failed to sync metrics' });
