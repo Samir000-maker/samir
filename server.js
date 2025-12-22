@@ -2727,46 +2727,43 @@ app.post('/api/interactions/restore-like-states', async (req, res) => {
         if (!userId || !Array.isArray(postIds) || postIds.length === 0) {
             return res.status(400).json({ error: 'userId and postIds array required' });
         }
-
         if (postIds.length > 500) {
             return res.status(400).json({ error: 'Maximum 500 postIds per request' });
         }
-
+        
         console.log(`[RESTORE-LIKE-STATES] User: ${userId} | Checking ${postIds.length} posts`);
-
         const start = Date.now();
-
-        // ✅ CRITICAL: Use compound index (userId + postId) for O(1) lookups
+        
+        // ✅ FIX: Only get postIds that ARE liked
         const likedPosts = await db.collection('contributionToLike')
             .find({
                 userId: userId,
                 postId: { $in: postIds }
             })
-            .project({ postId: 1, _id: 0 }) // Only return postId
+            .project({ postId: 1, _id: 0 })
             .toArray();
-
+        
         const queryTime = Date.now() - start;
         
         const likedPostIds = new Set(likedPosts.map(doc => doc.postId));
         
-        // Build response map
+        // ✅ CRITICAL FIX: Return boolean values, not empty objects
         const likeStates = {};
         postIds.forEach(postId => {
-            likeStates[postId] = likedPostIds.has(postId);
+            likeStates[postId] = likedPostIds.has(postId); // true/false, NOT {}
         });
-
+        
         console.log(`[RESTORE-LIKE-STATES-SUCCESS] Found ${likedPostIds.size}/${postIds.length} liked posts in ${queryTime}ms`);
-
+        
         return res.json({
             success: true,
-            likeStates,
+            likeStates,  // Now contains {postId: true/false}
             optimization: {
                 postsChecked: postIds.length,
                 likedCount: likedPostIds.size,
                 queryTimeMs: queryTime
             }
         });
-
     } catch (error) {
         console.error('[RESTORE-LIKE-STATES-ERROR]', error);
         return res.status(500).json({ 
