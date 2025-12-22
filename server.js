@@ -379,43 +379,6 @@ const log = (level, ...args) => {
 };
 
 
-// ---------- createContributionLikeIndexes (replace the existing function) ----------
-async function createContributionLikeIndexes() {
-  try {
-    // Ensure collection exists (do NOT attempt to create an _id index with unique:true)
-    await db.collection('contributionToLike').findOne({});
-
-    // Ultra-fast compound indexes for common query patterns.
-    // Keep these tuned for fast reads — names help with debugging.
-    await db.collection('contributionToLike').createIndex(
-      { userId: 1, postId: 1, createdAt: -1 },
-      { name: 'user_post_createdAt_idx' }
-    );
-
-    await db.collection('contributionToLike').createIndex(
-      { postId: 1, userId: 1 },
-      { name: 'post_user_idx' }
-    );
-
-    // If you query by userId alone frequently, keep this single-field index
-    await db.collection('contributionToLike').createIndex(
-      { userId: 1 },
-      { name: 'userId_idx' }
-    );
-
-    // If you query recent likes by time often, keep a descending createdAt index
-    await db.collection('contributionToLike').createIndex(
-      { createdAt: -1 },
-      { name: 'createdAt_desc_idx' }
-    );
-
-    log('info', '[CONTRIBUTION-LIKE-INDEXES] Created successfully');
-  } catch (error) {
-    log('error', '[CONTRIBUTION-LIKE-INDEX-ERROR]', error);
-  }
-}
-
-
 async function createUltraFastRetentionIndexes() {
     try {
         // Remove the unique constraint on _id index (it's automatically unique)
@@ -700,7 +663,6 @@ setInterval(async () => {
 
 
 await createUltraFastRetentionIndexes();
-await createContributionLikeIndexes();
 
 
 
@@ -1041,12 +1003,6 @@ async function enableSharding() {
         key: { userId: 1, date: -1 },
         unique: false 
       },
-      // Shard like tracking
-      { 
-        collection: 'contributionToLike', 
-        key: { userId: 'hashed' },
-        unique: false 
-      }
     ];
     
     for (const config of shardConfigs) {
@@ -2154,281 +2110,6 @@ app.get('/api/debug/db-check', async (req, res) => {
 
 
 
-
-// Export all likes for sync
-app.get('/api/interactions/export-all-likes', async (req, res) => {
-    try {
-        console.log('[EXPORT-LIKES] Exporting all likes for sync...');
-
-        const likes = await db.collection('contributionToLike')
-            .find({})
-            .project({ userId: 1, postId: 1, _id: 0 })
-            .toArray();
-
-        console.log(`[EXPORT-LIKES] Exported ${likes.length} likes`);
-
-        res.json({
-            success: true,
-            likes,
-            count: likes.length,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('[EXPORT-LIKES-ERROR]', error);
-        res.status(500).json({ error: 'Failed to export likes' });
-    }
-});
-
-// Get like count
-app.get('/api/interactions/like-count', async (req, res) => {
-    try {
-        const count = await db.collection('contributionToLike').countDocuments({});
-        
-        res.json({
-            success: true,
-            count,
-            collection: 'contributionToLike'
-        });
-
-    } catch (error) {
-        console.error('[LIKE-COUNT-ERROR]', error);
-        res.status(500).json({ error: 'Failed to get count' });
-    }
-});
-
-
-
-// ✅ Receive and sync likes from PORT 4000 (source of truth)
-app.post('/api/interactions/sync-from-port4000', async (req, res) => {
-    try {
-        const { likes, timestamp } = req.body;
-
-        if (!Array.isArray(likes)) {
-            return res.status(400).json({ error: 'likes array required' });
-        }
-
-        console.log(`[SYNC-FROM-4000] Received ${likes.length} likes from PORT 4000`);
-
-        const startTime = Date.now();
-        let added = 0;
-        let removed = 0;
-        let errors = 0;
-
-        // Get all existing likes from PORT 2000
-        const existingLikes = await db.collection('contributionToLike')
-            .find({})
-            .project({ userId: 1, postId: 1, _id: 1 })
-            .toArray();
-
-        console.log(`[SYNC-FROM-4000] Current PORT 2000 has ${existingLikes.length} likes`);
-
-        // Create sets for comparison
-        const port4000Set = new Set(
-            likes.map(like => `${like.userId}_${like.postId}`)
-        );
-        const port2000Map = new Map(
-            existingLikes.map(like => [`${like.userId}_${like.postId}`, like._id])
-        );
-
-        // Find likes to ADD (in PORT 4000 but not in PORT 2000)
-        const likesToAdd = likes.filter(like => 
-            !port2000Map.has(`${like.userId}_${like.postId}`)
-        );
-
-        // Find likes to REMOVE (in PORT 2000 but not in PORT 4000)
-        const likesToRemove = existingLikes.filter(like => 
-            !port4000Set.has(`${like.userId}_${like.postId}`)
-        );
-
-        console.log(`[SYNC-FROM-4000] To add: ${likesToAdd.length}, To remove: ${likesToRemove.length}`);
-
-        // ADD missing likes to PORT 2000
-        if (likesToAdd.length > 0) {
-            const bulkOps = likesToAdd.map(like => ({
-                insertOne: {
-                    document: {
-                        _id: `${like.userId}_${like.postId}`,
-                        userId: like.userId,
-                        postId: like.postId,
-                        likedAt: new Date(),
-                        syncedFrom: 'PORT_4000',
-                        sessionDate: new Date().toISOString().split('T')[0]
-                    }
-                }
-            }));
-
-            try {
-                const result = await db.collection('contributionToLike').bulkWrite(bulkOps, { ordered: false });
-                added = result.insertedCount || 0;
-            } catch (error) {
-                // Count successful inserts even if some fail
-                if (error.writeErrors) {
-                    added = likesToAdd.length - error.writeErrors.length;
-                    errors = error.writeErrors.length;
-                }
-                console.error('[SYNC-ADD-ERROR]', error.message);
-            }
-        }
-
-        // REMOVE extra likes from PORT 2000
-        if (likesToRemove.length > 0) {
-            const idsToRemove = likesToRemove.map(like => like._id);
-
-            try {
-                const result = await db.collection('contributionToLike').deleteMany({
-                    _id: { $in: idsToRemove }
-                });
-                removed = result.deletedCount || 0;
-            } catch (error) {
-                errors++;
-                console.error('[SYNC-REMOVE-ERROR]', error.message);
-            }
-        }
-
-        // Update reel_stats like counts
-        if (added > 0 || removed > 0) {
-            console.log('[SYNC-FROM-4000] Updating reel_stats...');
-            
-            // Get all unique postIds that were affected
-            const affectedPostIds = new Set([
-                ...likesToAdd.map(l => l.postId),
-                ...likesToRemove.map(l => l.postId)
-            ]);
-
-            for (const postId of affectedPostIds) {
-                try {
-                    // Count actual likes for this post
-                    const actualLikeCount = await db.collection('contributionToLike')
-                        .countDocuments({ postId });
-
-                    // Update reel_stats
-                    await db.collection('reel_stats').updateOne(
-                        { _id: postId },
-                        { 
-                            $set: { 
-                                likeCount: actualLikeCount,
-                                lastUpdated: new Date()
-                            }
-                        },
-                        { upsert: true }
-                    );
-                } catch (error) {
-                    console.error(`[SYNC-STATS-ERROR] ${postId}:`, error.message);
-                }
-            }
-        }
-
-        const duration = Date.now() - startTime;
-        console.log(`[SYNC-FROM-4000-COMPLETE] Added: ${added}, Removed: ${removed}, Errors: ${errors}, Duration: ${duration}ms`);
-
-        res.json({
-            success: true,
-            added,
-            removed,
-            errors,
-            duration,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('[SYNC-FROM-4000-ERROR]', error);
-        res.status(500).json({ 
-            success: false,
-            error: error.message 
-        });
-    }
-});
-
-
-
-
-// Sync likes from PORT 4000
-app.post('/api/interactions/sync-likes-from-port4000', async (req, res) => {
-    try {
-        const { likes, timestamp } = req.body;
-
-        if (!Array.isArray(likes)) {
-            return res.status(400).json({ error: 'likes array required' });
-        }
-
-        console.log(`[SYNC-FROM-4000] Received ${likes.length} likes from PORT 4000`);
-
-        let added = 0;
-        let removed = 0;
-        let errors = 0;
-
-        // Get all existing likes from PORT 2000
-        const existingLikes = await db.collection('contributionToLike')
-            .find({})
-            .project({ userId: 1, postId: 1, _id: 1 })
-            .toArray();
-
-        // Create sets for comparison
-        const port4000Set = new Set(
-            likes.map(like => `${like.userId}_${like.postId}`)
-        );
-        const port2000Set = new Set(
-            existingLikes.map(like => `${like.userId}_${like.postId}`)
-        );
-
-        // Add missing likes to PORT 2000
-        const likesToAdd = likes.filter(like => 
-            !port2000Set.has(`${like.userId}_${like.postId}`)
-        );
-
-        for (const like of likesToAdd) {
-            try {
-                await db.collection('contributionToLike').insertOne({
-                    _id: `${like.userId}_${like.postId}`,
-                    userId: like.userId,
-                    postId: like.postId,
-                    likedAt: new Date(),
-                    syncedFrom: 'PORT_4000',
-                    sessionDate: new Date().toISOString().split('T')[0]
-                });
-                added++;
-            } catch (error) {
-                if (error.code !== 11000) {
-                    errors++;
-                }
-            }
-        }
-
-        // Remove extra likes from PORT 2000
-        const likesToRemove = existingLikes.filter(like => 
-            !port4000Set.has(`${like.userId}_${like.postId}`)
-        );
-
-        for (const like of likesToRemove) {
-            try {
-                await db.collection('contributionToLike').deleteOne({
-                    _id: like._id
-                });
-                removed++;
-            } catch (error) {
-                errors++;
-            }
-        }
-
-        console.log(`[SYNC-FROM-4000-COMPLETE] Added: ${added}, Removed: ${removed}, Errors: ${errors}`);
-
-        res.json({
-            success: true,
-            added,
-            removed,
-            errors,
-            timestamp: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('[SYNC-FROM-4000-ERROR]', error);
-        res.status(500).json({ error: 'Sync failed' });
-    }
-});
-
-
-
 app.get('/api/posts/single-reel/:postId', async (req, res) => {
     const startTime = Date.now();
     const { postId } = req.params;
@@ -2719,7 +2400,7 @@ app.get('/api/retention/check/:userId/:postId', async (req, res) => {
 
 
 
-// ✅ CRITICAL: Bulk like state restoration endpoint (uses covering index)
+// ✅ REPLACE - Forward to PORT 4000
 app.post('/api/interactions/restore-like-states', async (req, res) => {
     try {
         const { userId, postIds } = req.body;
@@ -2727,49 +2408,41 @@ app.post('/api/interactions/restore-like-states', async (req, res) => {
         if (!userId || !Array.isArray(postIds) || postIds.length === 0) {
             return res.status(400).json({ error: 'userId and postIds array required' });
         }
-        if (postIds.length > 500) {
-            return res.status(400).json({ error: 'Maximum 500 postIds per request' });
-        }
         
-        console.log(`[RESTORE-LIKE-STATES] User: ${userId} | Checking ${postIds.length} posts`);
-        const start = Date.now();
+        console.log(`[RESTORE-LIKE-STATES-PROXY] User: ${userId} | Checking ${postIds.length} posts`);
         
-        // ✅ FIX: Only get postIds that ARE liked
-        const likedPosts = await db.collection('contributionToLike')
-            .find({
-                userId: userId,
-                postId: { $in: postIds }
-            })
-            .project({ postId: 1, _id: 0 })
-            .toArray();
-        
-        const queryTime = Date.now() - start;
-        
-        const likedPostIds = new Set(likedPosts.map(doc => doc.postId));
-        
-        // ✅ CRITICAL FIX: Return boolean values, not empty objects
-        const likeStates = {};
-        postIds.forEach(postId => {
-            likeStates[postId] = likedPostIds.has(postId); // true/false, NOT {}
-        });
-        
-        console.log(`[RESTORE-LIKE-STATES-SUCCESS] Found ${likedPostIds.size}/${postIds.length} liked posts in ${queryTime}ms`);
-        
-        return res.json({
-            success: true,
-            likeStates,  // Now contains {postId: true/false}
-            optimization: {
-                postsChecked: postIds.length,
-                likedCount: likedPostIds.size,
-                queryTimeMs: queryTime
+        // Forward to PORT 4000
+        const port4000Response = await axios.post(
+            'https://database-22io.onrender.com/api/posts/batch-check-liked',
+            { userId, postIds },
+            { timeout: 10000 }
+        );
+
+        if (port4000Response.data.success) {
+            const likes = port4000Response.data.likes;
+            
+            // Convert format
+            const likeStates = {};
+            for (const [postId, likeInfo] of Object.entries(likes)) {
+                likeStates[postId] = likeInfo.isLiked || false;
             }
-        });
+            
+            return res.json({
+                success: true,
+                likeStates: likeStates,
+                optimization: {
+                    postsChecked: postIds.length,
+                    likedCount: Object.values(likeStates).filter(Boolean).length,
+                    source: 'PORT_4000_post_likes'
+                }
+            });
+        }
+
+        return res.status(500).json({ success: false, error: 'PORT 4000 failed' });
+
     } catch (error) {
-        console.error('[RESTORE-LIKE-STATES-ERROR]', error);
-        return res.status(500).json({ 
-            success: false,
-            error: 'Failed to restore like states' 
-        });
+        console.error('[RESTORE-LIKE-STATES-ERROR]', error.message);
+        return res.status(500).json({ success: false, error: 'Failed to restore like states' });
     }
 });
 
@@ -3138,11 +2811,10 @@ function calculateRankingScore(item) {
 
 
 
-// New endpoint to handle like operations
-// In your PORT 2000 server - ensure this endpoint returns proper success response
+// ✅ REPLACE WITH THIS SIMPLIFIED VERSION
 app.post('/api/interactions/contribution-like', async (req, res) => {
     try {
-        const { userId, postId, action, sourceDocument } = req.body;
+        const { userId, postId, action } = req.body;
         
         if (!userId || !postId || !['like', 'unlike'].includes(action)) {
             return res.status(400).json({ 
@@ -3154,82 +2826,43 @@ app.post('/api/interactions/contribution-like', async (req, res) => {
         const isLiking = action === 'like';
         const today = new Date().toISOString().split('T')[0];
 
-        console.log(`[CONTRIBUTION-LIKE] ${userId} ${action}ing ${postId}`);
+        console.log(`[CONTRIBUTION-LIKE-PROXY] ${userId} ${action}ing ${postId} - forwarding to PORT 4000`);
 
-        // Ultra-fast duplicate check using compound index
-        const existingLike = await db.collection('contributionToLike').findOne({
-            _id: `${userId}_${postId}` // Compound key for instant lookup
-        });
-
-        if (isLiking && existingLike) {
-            return res.json({ 
-                success: true, 
-                message: 'Already liked', 
-                duplicate: true,
-                isLiked: true
-            });
-        }
-        
-        if (!isLiking && !existingLike) {
-            return res.json({ 
-                success: true, 
-                message: 'Not previously liked', 
-                duplicate: true,
-                isLiked: false
-            });
-        }
-
-        if (isLiking) {
-            // Add like record
-            await db.collection('contributionToLike').insertOne({
-                _id: `${userId}_${postId}`,
+        // Forward directly to PORT 4000 (MongoDB server)
+        const port4000Response = await axios.post(
+            'https://database-22io.onrender.com/api/posts/toggle-like',
+            {
                 userId: userId,
                 postId: postId,
-                likedAt: new Date(),
-                sourceDocument: sourceDocument || 'unknown',
-                sessionDate: today
-            });
+                currentlyLiked: !isLiking, // PORT 4000 expects CURRENT state, not action
+                isReel: true
+            },
+            { timeout: 5000 }
+        );
+
+        if (port4000Response.data.success) {
+            const isLiked = port4000Response.data.isLiked;
+            const likeCount = port4000Response.data.likeCount;
             
-            // Update like count
-            await db.collection('reel_stats').updateOne(
-                { _id: postId },
-                { 
-                    $inc: { likeCount: 1 },
-                    $set: { lastUpdated: new Date() }
-                },
-                { upsert: true }
-            );
+            console.log(`[CONTRIBUTION-LIKE-SUCCESS] ${postId}: isLiked=${isLiked}, count=${likeCount}`);
+            
+            return res.json({
+                success: true,
+                action: isLiked ? 'like' : 'unlike',
+                isLiked: isLiked,
+                likeCount: likeCount,
+                message: `Successfully ${isLiked ? 'liked' : 'unliked'}`,
+                duplicate: port4000Response.data.duplicate || false
+            });
         } else {
-            // Remove like record
-            await db.collection('contributionToLike').deleteOne({
-                _id: `${userId}_${postId}`
+            return res.status(500).json({
+                success: false,
+                error: 'PORT 4000 like failed'
             });
-            
-            // Decrease like count
-            await db.collection('reel_stats').updateOne(
-                { _id: postId },
-                { 
-                    $inc: { likeCount: -1 },
-                    $set: { lastUpdated: new Date() }
-                }
-            );
         }
 
-        // Get updated like count
-        const statsDoc = await db.collection('reel_stats').findOne({ _id: postId });
-        const newLikeCount = Math.max(0, statsDoc?.likeCount || 0);
-
-        return res.json({
-            success: true,
-            action,
-            isLiked: isLiking,
-            likeCount: newLikeCount,
-            duplicate: false,
-            message: `Successfully ${action}d`
-        });
-
     } catch (error) {
-        console.error('[CONTRIBUTION-LIKE-ERROR]', error);
+        console.error('[CONTRIBUTION-LIKE-ERROR]', error.message);
         return res.status(500).json({ 
             success: false,
             error: 'Failed to process like' 
@@ -3288,7 +2921,7 @@ app.post('/api/sync/metrics-from-mongodb', async (req, res) => {
 
 
 
-
+// ✅ REPLACE WITH PORT 4000 PROXY VERSION
 app.post('/api/interactions/check-likes', async (req, res) => {
     try {
         const { userId, postIds } = req.body;
@@ -3297,40 +2930,46 @@ app.post('/api/interactions/check-likes', async (req, res) => {
             return res.status(400).json({ error: 'userId and postIds array required' });
         }
         
-        console.log(`[CHECK-LIKES] User: ${userId} | Checking ${postIds.length} posts`);
-        const start = Date.now();
+        console.log(`[CHECK-LIKES-PROXY] User: ${userId} | Checking ${postIds.length} posts`);
         
-        // ✅ CRITICAL FIX: Query contributionToLike collection
-        const likedPosts = await db.collection('contributionToLike')
-            .find({
+        // Forward to PORT 4000's batch check endpoint
+        const port4000Response = await axios.post(
+            'https://database-22io.onrender.com/api/posts/batch-check-liked',
+            {
                 userId: userId,
-                postId: { $in: postIds }
-            })
-            .project({ postId: 1, _id: 0 })
-            .toArray();
-        
-        const queryTime = Date.now() - start;
-        const likedPostIds = new Set(likedPosts.map(doc => doc.postId));
-        
-        // ✅ CRITICAL FIX: Return DIRECT boolean values, NOT nested objects
-        const likes = {};
-        postIds.forEach(postId => {
-            likes[postId] = likedPostIds.has(postId); // true or false
-        });
-        
-        console.log(`[CHECK-LIKES-SUCCESS] Found ${likedPostIds.size}/${postIds.length} liked in ${queryTime}ms`);
-        
-        return res.json({
-            success: true,
-            likes,  // Now: {"postId": true/false} instead of {"postId": {"isLiked": {}}}
-            optimization: {
-                postsChecked: postIds.length,
-                dbReadsUsed: likedPosts.length,
-                allFromCache: false
+                postIds: postIds
+            },
+            { timeout: 10000 }
+        );
+
+        if (port4000Response.data.success) {
+            const likes = port4000Response.data.likes;
+            
+            // Transform response format: { postId: { isLiked: true } } → { postId: true }
+            const simplifiedLikes = {};
+            for (const [postId, likeInfo] of Object.entries(likes)) {
+                simplifiedLikes[postId] = likeInfo.isLiked || false;
             }
-        });
+            
+            console.log(`[CHECK-LIKES-SUCCESS] Found ${Object.keys(simplifiedLikes).length} like states`);
+            
+            return res.json({
+                success: true,
+                likes: simplifiedLikes,
+                optimization: {
+                    postsChecked: postIds.length,
+                    source: 'PORT_4000_post_likes'
+                }
+            });
+        } else {
+            return res.status(500).json({
+                success: false,
+                error: 'PORT 4000 check failed'
+            });
+        }
+
     } catch (error) {
-        console.error('[CHECK-LIKES-ERROR]', error);
+        console.error('[CHECK-LIKES-ERROR]', error.message);
         return res.status(500).json({ 
             success: false,
             error: 'Failed to check like states' 
@@ -5420,127 +5059,66 @@ app.post('/api/interactions/view', async (req, res) => {
     }
 });
 
+// ✅ REPLACE THIS SECTION - Remove contributionToLike operations
 app.post('/api/interactions/like', async (req, res) => {
-  try {
-    const { userId, postId, sourceDocument, action } = req.body; // action: 'like' or 'unlike'
-    
-    if (!userId || !postId || !['like', 'unlike'].includes(action)) {
-      return res.status(400).json({ error: 'userId, postId, and action (like/unlike) required' });
-    }
-
-    const today = new Date().toISOString().split('T')[0];
-    const docId = `${userId}_${today}`;
-    const isLiking = action === 'like';
-
-    console.log(`[LIKE-${action.toUpperCase()}] ${userId} ${action}d ${postId}`);
-
-    // Check current like status to prevent duplicates
-    const currentDoc = await db.collection('user_reel_interactions').findOne({
-      _id: docId,
-      "likedReels.postId": postId
-    });
-
-    const alreadyLiked = !!currentDoc;
-
-    if (isLiking && alreadyLiked) {
-      return res.json({ success: true, message: 'Already liked', duplicate: true, likeCount: null });
-    }
-
-    if (!isLiking && !alreadyLiked) {
-      return res.json({ success: true, message: 'Not previously liked', duplicate: true, likeCount: null });
-    }
-
-    // Perform like/unlike operation
-    let updateOperation;
-    let likeCountChange;
-
-    if (isLiking) {
-      // Add like
-      updateOperation = {
-        $set: {
-          userId,
-          date: today,
-          updatedAt: new Date()
-        },
-        $setOnInsert: { createdAt: new Date() },
-        $addToSet: {
-          likedReels: {
-            postId,
-            likedAt: new Date(),
-            sourceDocument: sourceDocument || 'unknown'
-          }
+    try {
+        const { userId, postId, sourceDocument, action } = req.body;
+        
+        if (!userId || !postId || !['like', 'unlike'].includes(action)) {
+            return res.status(400).json({ error: 'userId, postId, and action (like/unlike) required' });
         }
-      };
-      likeCountChange = 1;
-    } else {
-      // Remove like
-      updateOperation = {
-        $set: { updatedAt: new Date() },
-        $pull: { likedReels: { postId } }
-      };
-      likeCountChange = -1;
+
+        const today = new Date().toISOString().split('T')[0];
+        const docId = `${userId}_${today}`;
+        const isLiking = action === 'like';
+
+        console.log(`[LIKE-${action.toUpperCase()}] ${userId} ${action}d ${postId} - forwarding to PORT 4000`);
+
+        // Forward to PORT 4000 (single source of truth)
+        const port4000Response = await axios.post(
+            'https://database-22io.onrender.com/api/posts/toggle-like',
+            {
+                userId: userId,
+                postId: postId,
+                currentlyLiked: !isLiking,
+                isReel: true
+            },
+            { timeout: 5000 }
+        );
+
+        if (port4000Response.data.success) {
+            const isLiked = port4000Response.data.isLiked;
+            const likeCount = port4000Response.data.likeCount;
+            
+            // Update local cache for quick access
+            const cacheKey = `${userId}_session_${today}`;
+            const cacheOperation = isLiked 
+                ? { $addToSet: { likedToday: postId } }
+                : { $pull: { likedToday: postId } };
+            
+            await db.collection('user_interaction_cache').updateOne(
+                { _id: cacheKey },
+                {
+                    ...cacheOperation,
+                    $set: { ttl: new Date(Date.now() + 24 * 60 * 60 * 1000) }
+                },
+                { upsert: true }
+            );
+
+            return res.json({
+                success: true,
+                action: isLiked ? 'like' : 'unlike',
+                likeCount: likeCount,
+                message: `Successfully ${isLiked ? 'liked' : 'unliked'} reel`
+            });
+        }
+
+        return res.status(500).json({ error: 'PORT 4000 like failed' });
+
+    } catch (error) {
+        console.error('[LIKE-ERROR]', error);
+        return res.status(500).json({ error: `Failed to ${req.body.action} reel` });
     }
-
-    // Update user interactions
-    await db.collection('user_reel_interactions').updateOne(
-      { _id: docId },
-      updateOperation,
-      { upsert: true }
-    );
-
-    // Update cache
-    const cacheKey = `${userId}_session_${today}`;
-    const cacheOperation = isLiking 
-      ? { $addToSet: { likedToday: postId } }
-      : { $pull: { likedToday: postId } };
-    
-    await db.collection('user_interaction_cache').updateOne(
-      { _id: cacheKey },
-      {
-        ...cacheOperation,
-        $set: { ttl: new Date(Date.now() + 24 * 60 * 60 * 1000) }
-      },
-      { upsert: true }
-    );
-
-    // Update reel stats with like count
-    const statsUpdate = await db.collection('reel_stats').findOneAndUpdate(
-      { _id: postId },
-      {
-        $inc: { likeCount: likeCountChange },
-        $set: { 
-          lastUpdated: new Date(),
-          sourceDocument: sourceDocument || 'unknown'
-        },
-        ...(isLiking && {
-          $addToSet: { recentLikers: userId }
-        }),
-        ...(!isLiking && {
-          $pull: { recentLikers: userId }
-        })
-      },
-      { 
-        upsert: true,
-        returnDocument: 'after'
-      }
-    );
-
-    const newLikeCount = Math.max(0, statsUpdate.value?.likeCount || 0);
-
-    // Also update the like count in the actual reels collection
-    await updateLikeCountInReelsCollection(postId, sourceDocument, newLikeCount);
-
-    return res.json({
-      success: true,
-      action,
-      likeCount: newLikeCount,
-      message: `Successfully ${action}d reel`
-    });
-
-  } catch (error) {
-    console.error('[LIKE-ERROR]', error);
-    return res.status(500).json({ error: `Failed to ${req.body.action} reel` });
-  }
 });
 
 // Helper function to update like count in the main reels collection
