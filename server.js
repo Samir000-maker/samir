@@ -3292,76 +3292,49 @@ app.post('/api/sync/metrics-from-mongodb', async (req, res) => {
 app.post('/api/interactions/check-likes', async (req, res) => {
     try {
         const { userId, postIds } = req.body;
-
-        if (!userId || !Array.isArray(postIds)) {
+        
+        if (!userId || !Array.isArray(postIds) || postIds.length === 0) {
             return res.status(400).json({ error: 'userId and postIds array required' });
         }
-        if (postIds.length > 100) {
-            return res.status(400).json({ error: 'Maximum 100 postIds per request' });
-        }
-
-        console.log(`[CHECK-LIKES] Checking ${postIds.length} posts for user ${userId}`);
-
-        // Check cache first for all posts
-        const cacheResults = {};
-        const uncachedIds = [];
-
-        postIds.forEach(postId => {
-            const cacheKey = `like_${userId}_${postId}`;
-            const cached = getCache(cacheKey);
-            if (cached !== null) {
-                cacheResults[postId] = { isLiked: cached };
-            } else {
-                uncachedIds.push(postId);
-            }
-        });
-
-        if (uncachedIds.length === 0) {
-            console.log(`[LIKE-CHECK-CACHE] All ${postIds.length} from cache`);
-            return res.json({
-                success: true,
-                likes: cacheResults,
-                optimization: { postsChecked: postIds.length, dbReadsUsed: 0, allFromCache: true }
-            });
-        }
-
+        
+        console.log(`[CHECK-LIKES] User: ${userId} | Checking ${postIds.length} posts`);
+        const start = Date.now();
+        
         // ✅ CRITICAL FIX: Query contributionToLike collection
-        const contributionLikes = await db.collection('contributionToLike').find({
-            userId: userId,
-            postId: { $in: uncachedIds }
-        }).project({ postId: 1 }).toArray();
-
-        console.log(`[CHECK-LIKES-DB] Found ${contributionLikes.length} likes for user ${userId}`);
-
-        const likedSet = new Set(contributionLikes.map(doc => doc.postId));
-
-        // Build final result - ✅ FIXED: Return boolean, not object
-        const finalResult = { ...cacheResults };
-        uncachedIds.forEach(postId => {
-            const isLiked = likedSet.has(postId);
-            finalResult[postId] = { isLiked: isLiked }; // ✅ MUST be boolean
-            
-            // Cache for 1 hour
-            setCache(`like_${userId}_${postId}`, isLiked, 3600000);
+        const likedPosts = await db.collection('contributionToLike')
+            .find({
+                userId: userId,
+                postId: { $in: postIds }
+            })
+            .project({ postId: 1, _id: 0 })
+            .toArray();
+        
+        const queryTime = Date.now() - start;
+        const likedPostIds = new Set(likedPosts.map(doc => doc.postId));
+        
+        // ✅ CRITICAL FIX: Return DIRECT boolean values, NOT nested objects
+        const likes = {};
+        postIds.forEach(postId => {
+            likes[postId] = likedPostIds.has(postId); // true or false
         });
-
-        const dbReadsUsed = uncachedIds.length > 0 ? 1 : 0;
-
-        console.log(`[CHECK-LIKES-RESULT] Returning ${Object.keys(finalResult).length} results`);
-
+        
+        console.log(`[CHECK-LIKES-SUCCESS] Found ${likedPostIds.size}/${postIds.length} liked in ${queryTime}ms`);
+        
         return res.json({
             success: true,
-            likes: finalResult,
+            likes,  // Now: {"postId": true/false} instead of {"postId": {"isLiked": {}}}
             optimization: {
                 postsChecked: postIds.length,
-                dbReadsUsed,
-                cachedCount: postIds.length - uncachedIds.length
+                dbReadsUsed: likedPosts.length,
+                allFromCache: false
             }
         });
-
     } catch (error) {
-        console.error('[BATCH-LIKE-ERROR]', error);
-        return res.status(500).json({ error: 'Failed to check likes' });
+        console.error('[CHECK-LIKES-ERROR]', error);
+        return res.status(500).json({ 
+            success: false,
+            error: 'Failed to check like states' 
+        });
     }
 });
 
