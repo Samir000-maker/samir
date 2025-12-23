@@ -2317,7 +2317,60 @@ return res.status(500).json({ error: 'Failed to check retention contribution' })
 }
 });
 
+app.post('/api/interactions/sync-like-immediate', async (req, res) => {
+    try {
+        const { postId, userId, action, isLiked, likeCount, timestamp } = req.body;
 
+        if (!postId || !userId || !action) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'postId, userId, and action required' 
+            });
+        }
+
+        log('info', `[SYNC-LIKE-IMMEDIATE] ${userId} ${action}d ${postId}, count: ${likeCount}`);
+
+        const today = new Date().toISOString().split('T')[0];
+        const cacheKey = `${userId}_session_${today}`;
+
+        // ✅ Update local cache
+        const cacheOperation = isLiked
+            ? { $addToSet: { likedToday: postId } }
+            : { $pull: { likedToday: postId } };
+
+        await db.collection('user_interaction_cache').updateOne(
+            { _id: cacheKey },
+            {
+                ...cacheOperation,
+                $set: { 
+                    ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
+                    lastSynced: timestamp 
+                }
+            },
+            { upsert: true }
+        );
+
+        log('info', `[SYNC-LIKE-SUCCESS] Cache updated for ${userId} -> ${postId}`);
+
+        return res.json({
+            success: true,
+            message: 'Like synced successfully',
+            postId,
+            userId,
+            action,
+            likeCount,
+            syncedAt: new Date().toISOString()
+        });
+
+    } catch (error) {
+        log('error', '[SYNC-LIKE-IMMEDIATE-ERROR]', error.message);
+        return res.status(500).json({ 
+            success: false, 
+            error: 'Sync failed',
+            details: error.message 
+        });
+    }
+});
 
 
 
