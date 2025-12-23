@@ -2976,38 +2976,52 @@ return res.status(500).json({ error: 'Failed to read doc' });
 }
 });
 
-// REPLACE /api/contributed-views/:type/:userId endpoint
 app.get('/api/contributed-views/:type/:userId', async (req, res) => {
-    try {
-        const { type, userId } = req.params;
-        if (!['posts', 'reels'].includes(type)) {
-            return res.status(400).json({ error: 'Invalid type' });
-        }
-
-        console.log(`[postId_debug] [GET-CONTRIB] userId=${userId} | type=${type}`);
-
-        
-        // ✅ Find all documents for this user (now _id is the document name)
-        const docs = await db.collection(collection)
-            .find({ userId })
-            .toArray();
-
-        console.log(`[postId_debug] [GET-CONTRIB-FOUND] ${docs.length} documents for userId=${userId}`);
-
-        // ✅ Build response object with document names as keys
-        const contributions = {};
-        for (const doc of docs) {
-            const docName = doc._id; // ✅ _id is now 'post_0', 'reels_1', etc.
-            contributions[docName] = doc.ids || [];
-            console.log(`[postId_debug] [GET-CONTRIB-DOC] _id=${docName} | count=${contributions[docName].length}`);
-        }
-
-        return res.json({ success: true, contributions });
-        
-    } catch (e) {
-        console.error('[postId_debug] [CONTRIB-VIEWS-ERROR]', e);
-        return res.status(500).json({ error: 'Failed to read contributions' });
+  try {
+    const { type, userId } = req.params;
+    if (!['posts', 'reels'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid type' });
     }
+    
+    console.log(`[GET-CONTRIB] userId=${userId} | type=${type}`);
+    
+    // FIXED: Only use contrib_posts for all content types
+    const collection = 'contrib_posts';
+    
+    // Find the single user document with embedded contributions
+    const userDoc = await db.collection(collection)
+      .findOne({ _id: userId }, { projection: { contributions: 1 } });
+    
+    if (!userDoc || !userDoc.contributions) {
+      console.log(`[GET-CONTRIB-EMPTY] No contributions found for userId=${userId}`);
+      return res.json({ 
+        success: true, 
+        contributions: {},
+        count: 0
+      });
+    }
+    
+    // Build response - return postIds that have been viewed
+    const contributedPostIds = Object.keys(userDoc.contributions);
+    
+    console.log(`[GET-CONTRIB-FOUND] ${contributedPostIds.length} contributions for userId=${userId}`);
+    
+    // Return in format expected by client: { postId1: true, postId2: true, ... }
+    const contributions = {};
+    contributedPostIds.forEach(postId => {
+      contributions[postId] = true;
+    });
+    
+    return res.json({ 
+      success: true, 
+      contributions,
+      count: contributedPostIds.length
+    });
+    
+  } catch (e) {
+    console.error('[CONTRIB-VIEWS-ERROR]', e);
+    return res.status(500).json({ error: 'Failed to read contributions', details: e.message });
+  }
 });
 
 app.get('/api/contributed-views/stats/:userId', async (req, res) => {
