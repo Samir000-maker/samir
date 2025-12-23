@@ -708,6 +708,35 @@ await createUltraFastRetentionIndexes();
 
 
 
+// Inside initMongo() after existing indexes:
+const contributionLikeIndexes = [
+    { 
+        collection: 'contributionToLike', 
+        index: { userId: 1, postId: 1 }, 
+        options: { unique: true, background: true } 
+    },
+    { 
+        collection: 'contributionToLike', 
+        index: { postId: 1 }, 
+        options: { background: true } 
+    },
+    { 
+        collection: 'contributionToLike', 
+        index: { userId: 1 }, 
+        options: { background: true } 
+    }
+];
+
+for (const { collection, index, options } of contributionLikeIndexes) {
+    try {
+        await db.collection(collection).createIndex(index, options);
+        log('info', `Created index for ${collection}`);
+    } catch (e) {
+        log('warn', `Index error for ${collection}: ${e.message}`);
+    }
+}
+    
+
 
 // ADD to initMongo() function
 async function createProductionSpeedIndexes() {
@@ -2328,12 +2357,12 @@ app.post('/api/interactions/sync-like-immediate', async (req, res) => {
             });
         }
 
-        log('info', `[SYNC-LIKE-IMMEDIATE] ${userId} ${action}d ${postId}, count: ${likeCount}`);
+        console.log(`[SYNC-LIKE-IMMEDIATE] ${userId} ${action}d ${postId}, count: ${likeCount}`);
 
         const today = new Date().toISOString().split('T')[0];
         const cacheKey = `${userId}_session_${today}`;
 
-        // ✅ Update local cache
+        // ✅ STEP 1: Update user_interaction_cache (fast lookup)
         const cacheOperation = isLiked
             ? { $addToSet: { likedToday: postId } }
             : { $pull: { likedToday: postId } };
@@ -2350,7 +2379,34 @@ app.post('/api/interactions/sync-like-immediate', async (req, res) => {
             { upsert: true }
         );
 
-        log('info', `[SYNC-LIKE-SUCCESS] Cache updated for ${userId} -> ${postId}`);
+        // ✅ STEP 2: Update contributionToLike collection (persistent storage)
+        if (isLiked) {
+            // Add like
+            await db.collection('contributionToLike').updateOne(
+                { _id: `${userId}_${postId}` },
+                {
+                    $set: {
+                        userId: userId,
+                        postId: postId,
+                        likedAt: timestamp,
+                        updatedAt: new Date().toISOString()
+                    },
+                    $setOnInsert: {
+                        createdAt: new Date().toISOString()
+                    }
+                },
+                { upsert: true }
+            );
+            console.log(`[CONTRIBUTION-LIKE-ADDED] ${userId} -> ${postId}`);
+        } else {
+            // Remove like
+            await db.collection('contributionToLike').deleteOne({
+                _id: `${userId}_${postId}`
+            });
+            console.log(`[CONTRIBUTION-LIKE-REMOVED] ${userId} -> ${postId}`);
+        }
+
+        console.log(`[SYNC-LIKE-SUCCESS] Cache + contributionToLike updated for ${userId} -> ${postId}`);
 
         return res.json({
             success: true,
@@ -2363,7 +2419,7 @@ app.post('/api/interactions/sync-like-immediate', async (req, res) => {
         });
 
     } catch (error) {
-        log('error', '[SYNC-LIKE-IMMEDIATE-ERROR]', error.message);
+        console.error('[SYNC-LIKE-IMMEDIATE-ERROR]', error.message);
         return res.status(500).json({ 
             success: false, 
             error: 'Sync failed',
@@ -2371,7 +2427,6 @@ app.post('/api/interactions/sync-like-immediate', async (req, res) => {
         });
     }
 });
-
 
 
 // ✅ REPLACE - Forward to PORT 4000
@@ -2421,99 +2476,7 @@ return res.status(500).json({ success: false, error: 'Failed to restore like sta
 });
 
 
-// Sync metrics from PORT 4000 to PORT 2000
-app.post('/api/sync/metrics', async (req, res) => {
-try {
-const { postId, metrics, isReel, sourceDocument, userId } = req.body;
 
-if (!postId || !metrics) {
-return res.status(400).json({ error: 'postId and metrics required' });
-}
-
-console.log(`[SYNC-METRICS] Updating ${postId} - isReel: ${isReel}`);
-
-const collection = isReel ? 'reels' : 'posts';
-const arrayField = isReel ? 'reelsList' : 'postList';
-
-// Check if already synced recently (within last 5 seconds to prevent duplicate syncs)
-const recentSync = await db.collection('sync_log').findOne({
-postId: postId,
-syncedAt: { $gte: new Date(Date.now() - 5000) }
-});
-
-if (recentSync) {
-console.log(`[SYNC-SKIP] ${postId} already synced recently`);
-return res.json({
-success: true,
-message: 'Already synced recently',
-postId,
-skipped: true
-});
-}
-
-// Update in the main collection documents
-const updateResult = await db.collection(collection).updateOne(
-{ [`${arrayField}.postId`]: postId },
-{
-$set: {
-[`${arrayField}.$.likeCount`]: metrics.likeCount || 0,
-[`${arrayField}.$.commentCount`]: metrics.commentCount || 0,
-[`${arrayField}.$.viewCount`]: metrics.viewCount || 0,
-[`${arrayField}.$.retention`]: metrics.retention || 0,
-[`${arrayField}.$.lastSynced`]: new Date().toISOString()
-}
-}
-);
-
-if (updateResult.matchedCount === 0) {
-console.warn(`[SYNC-NOT-FOUND] ${postId} not found in ${collection} collection`);
-
-// Try to find in user_slots if not in main collection
-const userSlotUpdate = await db.collection('user_slots').updateOne(
-{ [`${arrayField}.postId`]: postId },
-{
-$set: {
-[`${arrayField}.$.likeCount`]: metrics.likeCount || 0,
-[`${arrayField}.$.commentCount`]: metrics.commentCount || 0,
-[`${arrayField}.$.viewCount`]: metrics.viewCount || 0,
-[`${arrayField}.$.retention`]: metrics.retention || 0,
-[`${arrayField}.$.lastSynced`]: new Date().toISOString()
-}
-}
-);
-
-if (userSlotUpdate.matchedCount === 0) {
-return res.status(404).json({ error: 'Post not found' });
-}
-
-console.log(`[SYNC-SUCCESS-USERSLOT] Updated ${postId} in user_slots`);
-} else {
-console.log(`[SYNC-SUCCESS] Updated ${postId} in ${collection}`);
-}
-
-// Log successful sync to prevent duplicates
-await db.collection('sync_log').insertOne({
-postId: postId,
-syncedAt: new Date(),
-metrics: metrics
-});
-
-// Clean up old sync logs (older than 1 minute)
-await db.collection('sync_log').deleteMany({
-syncedAt: { $lt: new Date(Date.now() - 60000) }
-});
-
-res.json({
-success: true,
-message: 'Metrics synced successfully',
-postId,
-metrics
-});
-} catch (error) {
-console.error('[SYNC-ERROR]', error);
-res.status(500).json({ error: 'Failed to sync metrics' });
-}
-});
 
 
 // Personalized reels feed with interest-based ranking
