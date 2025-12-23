@@ -379,29 +379,6 @@ const log = (level, ...args) => {
 };
 
 
-async function createUltraFastRetentionIndexes() {
-    try {
-        // Remove the unique constraint on _id index (it's automatically unique)
-        // Just ensure the collection exists
-        await db.collection('user_interaction_cache').findOne({});
-        
-        // Compound index for retention queries
-        await db.collection('user_interaction_cache').createIndex({ 
-            "userId": 1, 
-            "retentionContributed": 1 
-        });
-
-        // TTL index for automatic cleanup
-        await db.collection('user_interaction_cache').createIndex({ 
-            "ttl": 1 
-        }, { expireAfterSeconds: 0 });
-
-        console.log('[ULTRA-FAST-RETENTION-INDEXES] Created successfully');
-    } catch (error) {
-        console.error('[INDEX-CREATION-ERROR]', error);
-    }
-}
-
 
 
 
@@ -469,18 +446,7 @@ async function createProductionIndexes() {
                 index: { userId: 1, ids: 1 },
                 options: { name: 'contrib_posts_lookup', background: true }
             },
-            { 
-                collection: 'contrib_reels', 
-                index: { userId: 1, ids: 1 },
-                options: { name: 'contrib_reels_lookup', background: true }
-            },
 
-            // Retention check optimization
-            {
-                collection: 'user_interaction_cache',
-                index: { userId: 1, retentionContributed: 1 },
-                options: { name: 'retention_check_fast', background: true }
-            }
         ];
 
         let successCount = 0;
@@ -662,9 +628,6 @@ setInterval(async () => {
 }, 5 * 60 * 1000); // Every 5 minutes
 
 
-await createUltraFastRetentionIndexes();
-
-
 
 
 // ADD to initMongo() function
@@ -729,31 +692,6 @@ async function createProductionSpeedIndexes() {
 await createProductionSpeedIndexes();
 
 
-// Add to your existing initMongo() function
-async function createInteractionIndexes() {
-    // Compound indexes for ultra-fast lookups
-    await db.collection('user_interaction_cache').createIndex({ 
-        "userId": 1, 
-        "sessionDate": 1 
-    }, { unique: true });
-    
-    // Fast lookup for specific user-reel combinations
-    await db.collection('user_reel_interactions').createIndex({ 
-        "userId": 1, 
-        "date": 1 
-    });
-    
-    // Index for retention contributed lookup
-    await db.collection('user_reel_interactions').createIndex({ 
-        "userId": 1, 
-        "viewedReels.postId": 1,
-        "viewedReels.retentionContributed": 1 
-    });
-    
-    console.log('[INTERACTION-INDEXES] Created optimized interaction indexes');
-}
-
-
 // Ensure indexes
 const ensureIndex = async (col, spec, opts = {}) => {
   try {
@@ -778,7 +716,6 @@ ensureIndex('reels', { index: 1 }),
 ensureIndex('user_posts', { userId: 1, postId: 1 }, { unique: true, sparse: true }),
 ensureIndex('user_status', { _id: 1 }, { unique: true }),
 ensureIndex('contrib_posts', { userId: 1 }),
-ensureIndex('contrib_reels', { userId: 1 }),
 ]);
 console.log('[MONGO-INIT] All indexes ensured')
 
@@ -990,17 +927,6 @@ async function enableSharding() {
       { 
         collection: 'contrib_posts', 
         key: { userId: 'hashed' }, // Hashed for even distribution
-        unique: false 
-      },
-      { 
-        collection: 'contrib_reels', 
-        key: { userId: 'hashed' },
-        unique: false 
-      },
-      // Shard user interactions by userId + date
-      { 
-        collection: 'user_reel_interactions', 
-        key: { userId: 1, date: -1 },
         unique: false 
       },
     ];
@@ -1701,7 +1627,6 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
 const results = [];
 const operations = [
 posts.length > 0 && { type: 'posts', collection: 'contrib_posts', ids: posts },
-reels.length > 0 && { type: 'reels', collection: 'contrib_reels', ids: reels }
 ].filter(Boolean);
 
 for (const op of operations) {
@@ -1966,8 +1891,7 @@ return latestSlot ? latestSlot._id : null;
 
 async getContributedViewsStats(userId) {
 const [postsStats, reelsStats] = await Promise.all([
-this.getContribStatsForType(userId, 'contrib_posts'),
-this.getContribStatsForType(userId, 'contrib_reels')
+this.getContribStatsForType(userId, 'contrib_posts')
 ]);
 
 return {
@@ -2336,115 +2260,6 @@ app.get('/api/server-stats', (req, res) => {
 });
 
 
-// Ultra-fast retention contribution check - O(1) lookup
-// Replace existing /api/retention/check/:userId/:postId endpoint
-app.get('/api/retention/check/:userId/:postId', async (req, res) => {
-  try {
-    const { userId, postId } = req.params;
-    
-    if (!userId || !postId) {
-      return res.status(400).json({ error: 'userId and postId required' });
-    }
-
-    const retentionCacheKey = `retention_${userId}_${postId}`;
-    
-    console.log(`[RETENTION-CHECK] User: ${userId} | Post: ${postId} | Total Reads: ${dbOpCounters.reads}`);
-    
-    // Check memory cache first
-    const cached = getCache(retentionCacheKey);
-    if (cached !== null) {
-      console.log(`[RETENTION-CACHE-HIT] Saved 1 DB read | Total Reads: ${dbOpCounters.reads}`);
-      return res.json({
-        success: true,
-        hasContributed: cached,
-        source: 'cache',
-        queryTime: 0
-      });
-    }
-
-    const today = new Date().toISOString().split('T')[0];
-    const dbReadsBefore = dbOpCounters.reads;
-    const start = Date.now();
-    
-    const result = await db.collection('user_interaction_cache').findOne(
-      { 
-        _id: `${userId}_session_${today}`,
-        retentionContributed: postId
-      },
-      { projection: { _id: 1 } }
-    );
-    
-    const queryTime = Date.now() - start;
-    const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
-    const hasContributed = !!result;
-    
-    // Cache for 2 hours
-    setCache(retentionCacheKey, hasContributed, 7200000);
-    
-    console.log(`[RETENTION-DB-CHECK] Result: ${hasContributed} | Used ${dbReadsUsed} DB reads | Time: ${queryTime}ms | Total Reads: ${dbOpCounters.reads}`);
-    
-    return res.json({
-      success: true,
-      hasContributed,
-      source: 'database',
-      queryTime
-    });
-
-  } catch (error) {
-    console.error(`[RETENTION-CHECK-ERROR] ${error.message} | Total Reads: ${dbOpCounters.reads}`);
-    return res.status(500).json({ error: 'Failed to check retention contribution' });
-  }
-});
-
-
-
-
-
-// ✅ REPLACE - Forward to PORT 4000
-app.post('/api/interactions/restore-like-states', async (req, res) => {
-    try {
-        const { userId, postIds } = req.body;
-        
-        if (!userId || !Array.isArray(postIds) || postIds.length === 0) {
-            return res.status(400).json({ error: 'userId and postIds array required' });
-        }
-        
-        console.log(`[RESTORE-LIKE-STATES-PROXY] User: ${userId} | Checking ${postIds.length} posts`);
-        
-        // Forward to PORT 4000
-        const port4000Response = await axios.post(
-            'https://database-22io.onrender.com/api/posts/batch-check-liked',
-            { userId, postIds },
-            { timeout: 10000 }
-        );
-
-        if (port4000Response.data.success) {
-            const likes = port4000Response.data.likes;
-            
-            // Convert format
-            const likeStates = {};
-            for (const [postId, likeInfo] of Object.entries(likes)) {
-                likeStates[postId] = likeInfo.isLiked || false;
-            }
-            
-            return res.json({
-                success: true,
-                likeStates: likeStates,
-                optimization: {
-                    postsChecked: postIds.length,
-                    likedCount: Object.values(likeStates).filter(Boolean).length,
-                    source: 'PORT_4000_post_likes'
-                }
-            });
-        }
-
-        return res.status(500).json({ success: false, error: 'PORT 4000 failed' });
-
-    } catch (error) {
-        console.error('[RESTORE-LIKE-STATES-ERROR]', error.message);
-        return res.status(500).json({ success: false, error: 'Failed to restore like states' });
-    }
-});
 
 
 // Sync metrics from PORT 4000 to PORT 2000
@@ -2570,11 +2385,7 @@ app.post('/api/feed/reels-personalized', async (req, res) => {
             log('warn', `[USER-INTERESTS-SKIP] ${e.message} - proceeding without interests`);
         }
 
-        // Step 2: Get viewed reels
-        const viewedReelsDoc = await db.collection('contrib_reels').findOne(
-            { userId }, 
-            { projection: { ids: 1 } }
-        );
+
         const viewedReelIds = viewedReelsDoc?.ids || [];
         log('info', `[VIEWED-FILTER] Excluding ${viewedReelIds.length} viewed reels`);
 
@@ -2811,66 +2622,6 @@ function calculateRankingScore(item) {
 
 
 
-// ✅ REPLACE WITH THIS SIMPLIFIED VERSION
-app.post('/api/interactions/contribution-like', async (req, res) => {
-    try {
-        const { userId, postId, action } = req.body;
-        
-        if (!userId || !postId || !['like', 'unlike'].includes(action)) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'userId, postId, and action (like/unlike) required' 
-            });
-        }
-
-        const isLiking = action === 'like';
-        const today = new Date().toISOString().split('T')[0];
-
-        console.log(`[CONTRIBUTION-LIKE-PROXY] ${userId} ${action}ing ${postId} - forwarding to PORT 4000`);
-
-        // Forward directly to PORT 4000 (MongoDB server)
-        const port4000Response = await axios.post(
-            'https://database-22io.onrender.com/api/posts/toggle-like',
-            {
-                userId: userId,
-                postId: postId,
-                currentlyLiked: !isLiking, // PORT 4000 expects CURRENT state, not action
-                isReel: true
-            },
-            { timeout: 5000 }
-        );
-
-        if (port4000Response.data.success) {
-            const isLiked = port4000Response.data.isLiked;
-            const likeCount = port4000Response.data.likeCount;
-            
-            console.log(`[CONTRIBUTION-LIKE-SUCCESS] ${postId}: isLiked=${isLiked}, count=${likeCount}`);
-            
-            return res.json({
-                success: true,
-                action: isLiked ? 'like' : 'unlike',
-                isLiked: isLiked,
-                likeCount: likeCount,
-                message: `Successfully ${isLiked ? 'liked' : 'unliked'}`,
-                duplicate: port4000Response.data.duplicate || false
-            });
-        } else {
-            return res.status(500).json({
-                success: false,
-                error: 'PORT 4000 like failed'
-            });
-        }
-
-    } catch (error) {
-        console.error('[CONTRIBUTION-LIKE-ERROR]', error.message);
-        return res.status(500).json({ 
-            success: false,
-            error: 'Failed to process like' 
-        });
-    }
-});
-
-
 
 
 // Sync metrics from PORT 4000 to PORT 2000
@@ -2921,118 +2672,6 @@ app.post('/api/sync/metrics-from-mongodb', async (req, res) => {
 
 
 
-// ✅ REPLACE WITH PORT 4000 PROXY VERSION
-app.post('/api/interactions/check-likes', async (req, res) => {
-    try {
-        const { userId, postIds } = req.body;
-        
-        if (!userId || !Array.isArray(postIds) || postIds.length === 0) {
-            return res.status(400).json({ error: 'userId and postIds array required' });
-        }
-        
-        console.log(`[CHECK-LIKES-PROXY] User: ${userId} | Checking ${postIds.length} posts`);
-        
-        // Forward to PORT 4000's batch check endpoint
-        const port4000Response = await axios.post(
-            'https://database-22io.onrender.com/api/posts/batch-check-liked',
-            {
-                userId: userId,
-                postIds: postIds
-            },
-            { timeout: 10000 }
-        );
-
-        if (port4000Response.data.success) {
-            const likes = port4000Response.data.likes;
-            
-            // Transform response format: { postId: { isLiked: true } } → { postId: true }
-            const simplifiedLikes = {};
-            for (const [postId, likeInfo] of Object.entries(likes)) {
-                simplifiedLikes[postId] = likeInfo.isLiked || false;
-            }
-            
-            console.log(`[CHECK-LIKES-SUCCESS] Found ${Object.keys(simplifiedLikes).length} like states`);
-            
-            return res.json({
-                success: true,
-                likes: simplifiedLikes,
-                optimization: {
-                    postsChecked: postIds.length,
-                    source: 'PORT_4000_post_likes'
-                }
-            });
-        } else {
-            return res.status(500).json({
-                success: false,
-                error: 'PORT 4000 check failed'
-            });
-        }
-
-    } catch (error) {
-        console.error('[CHECK-LIKES-ERROR]', error.message);
-        return res.status(500).json({ 
-            success: false,
-            error: 'Failed to check like states' 
-        });
-    }
-});
-
-
-
-
-
-
-// Batch retention check for multiple posts
-app.post('/api/retention/check-batch', async (req, res) => {
-    try {
-        const { userId, postIds } = req.body;
-        
-        if (!userId || !Array.isArray(postIds) || postIds.length === 0) {
-            return res.status(400).json({ error: 'userId and postIds array required' });
-        }
-
-        const today = new Date().toISOString().split('T')[0];
-        const result = {};
-        const uncachedIds = [];
-
-        // Check cache first for all posts
-        postIds.forEach(postId => {
-            const cached = getCache(`retention_${userId}_${postId}`);
-            if (cached !== null) {
-                result[postId] = cached;
-            } else {
-                uncachedIds.push(postId);
-            }
-        });
-
-        // Query database only for uncached posts
-        if (uncachedIds.length > 0) {
-            const cacheDoc = await db.collection('user_interaction_cache').findOne(
-                { _id: `${userId}_session_${today}` },
-                { projection: { retentionContributed: 1 } }
-            );
-
-            const contributedSet = new Set(cacheDoc?.retentionContributed || []);
-            
-            uncachedIds.forEach(postId => {
-                const hasContributed = contributedSet.has(postId);
-                result[postId] = hasContributed;
-                setCache(`retention_${userId}_${postId}`, hasContributed, 3600000);
-            });
-        }
-
-        return res.json({
-            success: true,
-            contributions: result,
-            cacheHits: postIds.length - uncachedIds.length,
-            dbQueries: uncachedIds.length > 0 ? 1 : 0
-        });
-
-    } catch (error) {
-        console.error('[BATCH-RETENTION-CHECK-ERROR]', error);
-        return res.status(500).json({ error: 'Failed to check batch retention' });
-    }
-});
 
 
 app.get('/api/feed/:contentType/:userId', async (req, res) => {
@@ -3140,224 +2779,144 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
 });
 
 app.post('/api/contributed-views/batch-optimized', async (req, res) => {
-  const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
   const startTime = Date.now();
-
+  const { userId, postIds, reelIds } = req.body;
+  
   try {
-    const { userId, posts = [], reels = [] } = req.body;
-
     if (!userId) {
       return res.status(400).json({ 
         success: false, 
-        error: 'userId required',
-        requestId 
+        error: 'userId required' 
       });
     }
 
-    console.log(`[postId_debug] [BATCH-START] userId=${userId} | requestId=${requestId} | ${posts.length}P + ${reels.length}R`);
+    console.log(`[CONTRIB-BATCH] ${userId} checking ${(postIds?.length || 0) + (reelIds?.length || 0)} items`);
 
-    // ✅ CRITICAL: Lookup each post's actual document from posts collection
-    const postDocumentMap = new Map(); // postId -> documentId
+    // Single read for user's contributions document
+    const userContrib = await db.collection('contrib_posts').findOne(
+      { _id: userId },
+      { projection: { contributions: 1 } }
+    );
     
-    if (posts.length > 0) {
-      console.log(`[postId_debug] [POST-LOOKUP-START] Finding documents for ${posts.length} posts`);
-      
-      const postsCollection = db.collection('posts');
-      
-      // Get all post documents
-      const postDocs = await postsCollection.find({}).toArray();
-      
-      // Build map of postId -> documentId
-      for (const doc of postDocs) {
-        const docId = doc._id;
-        const postList = doc.postList || [];
-        
-        for (const post of postList) {
-          if (posts.includes(post.postId)) {
-            postDocumentMap.set(post.postId, docId);
-            console.log(`[postId_debug] [POST-MAPPED] ${post.postId.substring(0, 8)} -> ${docId}`);
-          }
-        }
-      }
-      
-      console.log(`[postId_debug] [POST-LOOKUP-COMPLETE] Mapped ${postDocumentMap.size}/${posts.length} posts`);
-    }
+    const startDb = Date.now();
+    logDbOp('findOne', 'contrib_posts', { _id: userId }, userContrib, Date.now() - startDb);
 
-    // ✅ CRITICAL: Lookup each reel's actual document from reels collection
-    const reelDocumentMap = new Map(); // reelId -> documentId
+    const contributedSet = userContrib ? new Set(Object.keys(userContrib.contributions || {})) : new Set();
+
+    // Build response for all requested content
+    const result = {};
     
-    if (reels.length > 0) {
-      console.log(`[postId_debug] [REEL-LOOKUP-START] Finding documents for ${reels.length} reels`);
-      
-      const reelsCollection = db.collection('reels');
-      
-      // Get all reel documents
-      const reelDocs = await reelsCollection.find({}).toArray();
-      
-      // Build map of reelId -> documentId
-      for (const doc of reelDocs) {
-        const docId = doc._id;
-        const reelsList = doc.reelsList || [];
-        
-        for (const reel of reelsList) {
-          if (reels.includes(reel.postId)) {
-            reelDocumentMap.set(reel.postId, docId);
-            console.log(`[postId_debug] [REEL-MAPPED] ${reel.postId.substring(0, 8)} -> ${docId}`);
-          }
-        }
-      }
-      
-      console.log(`[postId_debug] [REEL-LOOKUP-COMPLETE] Mapped ${reelDocumentMap.size}/${reels.length} reels`);
+    if (postIds && Array.isArray(postIds)) {
+      postIds.forEach(postId => {
+        result[postId] = { contributed: contributedSet.has(postId) };
+      });
     }
-
-    // ✅ Group posts by their actual document
-    const postsByDocument = new Map(); // documentId -> [postIds]
     
-    for (const postId of posts) {
-      const docId = postDocumentMap.get(postId);
-      
-      if (!docId) {
-        console.warn(`[postId_debug] [POST-NO-DOC] ${postId.substring(0, 8)} not found in posts collection, skipping`);
-        continue;
-      }
-      
-      if (!postsByDocument.has(docId)) {
-        postsByDocument.set(docId, []);
-      }
-      postsByDocument.get(docId).push(postId);
+    if (reelIds && Array.isArray(reelIds)) {
+      reelIds.forEach(reelId => {
+        result[reelId] = { contributed: contributedSet.has(reelId) };
+      });
     }
-
-    console.log(`[postId_debug] [POST-GROUPS] Posts distributed across ${postsByDocument.size} documents`);
-    for (const [docId, ids] of postsByDocument.entries()) {
-      console.log(`[postId_debug] [POST-GROUP] ${docId}: ${ids.length} posts`);
-    }
-
-    // ✅ Group reels by their actual document
-    const reelsByDocument = new Map(); // documentId -> [reelIds]
-    
-    for (const reelId of reels) {
-      const docId = reelDocumentMap.get(reelId);
-      
-      if (!docId) {
-        console.warn(`[postId_debug] [REEL-NO-DOC] ${reelId.substring(0, 8)} not found in reels collection, skipping`);
-        continue;
-      }
-      
-      if (!reelsByDocument.has(docId)) {
-        reelsByDocument.set(docId, []);
-      }
-      reelsByDocument.get(docId).push(reelId);
-    }
-
-    console.log(`[postId_debug] [REEL-GROUPS] Reels distributed across ${reelsByDocument.size} documents`);
-    for (const [docId, ids] of reelsByDocument.entries()) {
-      console.log(`[postId_debug] [REEL-GROUP] ${docId}: ${ids.length} reels`);
-    }
-
-// ✅ Process posts (route each to its correct document)
-const postResults = [];
-
-for (const [docId, postIds] of postsByDocument.entries()) {
-  console.log(`[postId_debug] [SAVING-POSTS] ${postIds.length} posts to document ${docId}`);
-  
-  const contribPostsCollection = db.collection('contrib_posts');
-  
-  // ✅ FIXED: Use userId_docId as _id to prevent conflicts
-  const uniqueDocId = `${userId}_${docId}`;
-  
-  const result = await contribPostsCollection.updateOne(
-    { _id: uniqueDocId }, // Changed from { _id: docId, userId }
-    {
-      $addToSet: { ids: { $each: postIds } },
-      $setOnInsert: { 
-        userId, 
-        slotId: docId, // Store original slot ID for reference
-        createdAt: new Date() 
-      },
-      $set: { updatedAt: new Date() }
-    },
-    { upsert: true }
-  );
-  
-  postResults.push({
-    documentId: uniqueDocId,
-    originalSlotId: docId,
-    count: postIds.length,
-    matched: result.matchedCount,
-    modified: result.modifiedCount,
-    upserted: result.upsertedCount
-  });
-  
-  console.log(`[postId_debug] [POSTS-SAVED] ${uniqueDocId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
-}
-
-// ✅ Process reels (route each to its correct document)
-const reelResults = [];
-
-for (const [docId, reelIds] of reelsByDocument.entries()) {
-  console.log(`[postId_debug] [SAVING-REELS] ${reelIds.length} reels to document ${docId}`);
-  
-  const contribReelsCollection = db.collection('contrib_reels');
-  
-  // ✅ FIXED: Use userId_docId as _id to prevent conflicts
-  const uniqueDocId = `${userId}_${docId}`;
-  
-  const result = await contribReelsCollection.updateOne(
-    { _id: uniqueDocId }, // Changed from { _id: docId, userId }
-    {
-      $addToSet: { ids: { $each: reelIds } },
-      $setOnInsert: { 
-        userId, 
-        slotId: docId, // Store original slot ID for reference
-        createdAt: new Date() 
-      },
-      $set: { updatedAt: new Date() }
-    },
-    { upsert: true }
-  );
-  
-  reelResults.push({
-    documentId: uniqueDocId,
-    originalSlotId: docId,
-    count: reelIds.length,
-    matched: result.matchedCount,
-    modified: result.modifiedCount,
-    upserted: result.upsertedCount
-  });
-  
-  console.log(`[postId_debug] [REELS-SAVED] ${uniqueDocId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
-}
 
     const duration = Date.now() - startTime;
-    
-    console.log(`[postId_debug] [BATCH-COMPLETE] userId=${userId} | ${posts.length}P + ${reels.length}R in ${duration}ms`);
-    
-    res.json({
+    console.log(`[CONTRIB-BATCH-SUCCESS] ${userId} | ${Object.keys(result).length} items | ${duration}ms | DB reads: 1`);
+
+    return res.json({
       success: true,
-      message: 'Contributed views processed',
-      processed: {
-        posts: posts.length,
-        reels: reels.length
-      },
-      documentDistribution: {
-        posts: Array.from(postsByDocument.keys()),
-        reels: Array.from(reelsByDocument.keys())
-      },
-      postResults,
-      reelResults,
-      requestId,
+      contributions: result,
+      reads: 1,
       duration
     });
 
   } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`[postId_debug] [BATCH-ERROR] requestId=${requestId} | duration=${duration}ms`, error);
-    
-    res.status(500).json({
+    console.error(`[CONTRIB-BATCH-ERROR]`, error);
+    return res.status(500).json({
       success: false,
       error: error.message,
-      requestId,
-      duration
+      duration: Date.now() - startTime
+    });
+  }
+});
+
+
+app.post('/api/retention/record', async (req, res) => {
+  const startTime = Date.now();
+  const { userId, postId, retentionData, isReel } = req.body;
+  
+  try {
+    if (!userId || !postId || !retentionData) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'userId, postId, and retentionData required' 
+      });
+    }
+
+    console.log(`[RETENTION-RECORD-START] ${userId} -> ${postId} | ${retentionData.retentionPercent}%`);
+
+    // Check if already contributed (single read)
+    const existing = await db.collection('contrib_posts').findOne(
+      { 
+        _id: userId,
+        [`contributions.${postId}`]: { $exists: true }
+      },
+      { projection: { _id: 1 } }
+    );
+    
+    const startDb = Date.now();
+    logDbOp('findOne', 'contrib_posts', { _id: userId, postId }, existing, Date.now() - startDb);
+
+    if (existing) {
+      console.log(`[RETENTION-DUPLICATE] ${userId} already contributed to ${postId}`);
+      return res.json({
+        success: true,
+        duplicate: true,
+        message: 'Retention already contributed',
+        reads: 1,
+        duration: Date.now() - startTime
+      });
+    }
+
+    // Record in contrib_posts (single document, single write)
+    const contribution = {
+      contributedAt: new Date(),
+      retentionPercent: Math.round(retentionData.retentionPercent * 100) / 100,
+      watchedDuration: retentionData.watchedDuration,
+      totalDuration: retentionData.totalDuration
+    };
+
+    const updateStart = Date.now();
+    const result = await db.collection('contrib_posts').updateOne(
+      { _id: userId },
+      {
+        $set: {
+          userId: userId,
+          lastUpdated: new Date(),
+          [`contributions.${postId}`]: contribution
+        },
+        $inc: { totalContributions: 1 }
+      },
+      { upsert: true }
+    );
+    
+    logDbOp('updateOne', 'contrib_posts', { _id: userId }, result, Date.now() - updateStart);
+
+    console.log(`[RETENTION-RECORDED] ${userId} -> ${postId} | ${result.modifiedCount || result.upsertedCount} doc updated`);
+
+    return res.json({
+      success: true,
+      duplicate: false,
+      message: 'Retention recorded',
+      reads: 1,
+      writes: 1,
+      duration: Date.now() - startTime
+    });
+
+  } catch (error) {
+    console.error(`[RETENTION-RECORD-ERROR]`, error);
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      duration: Date.now() - startTime
     });
   }
 });
@@ -3427,7 +2986,6 @@ app.get('/api/contributed-views/:type/:userId', async (req, res) => {
 
         console.log(`[postId_debug] [GET-CONTRIB] userId=${userId} | type=${type}`);
 
-        const collection = type === 'posts' ? 'contrib_posts' : 'contrib_reels';
         
         // ✅ Find all documents for this user (now _id is the document name)
         const docs = await db.collection(collection)
@@ -3626,198 +3184,6 @@ app.post('/api/posts', async (req, res) => {
 
 
 
-
-// Ultra-fast single reel interaction check
-app.get('/api/interactions/check-single/:userId/:postId', async (req, res) => {
-    try {
-        const { userId, postId } = req.params;
-        
-        if (!userId || !postId) {
-            return res.status(400).json({ error: 'userId and postId required' });
-        }
-
-        const today = new Date().toISOString().split('T')[0];
-        
-        // Single optimized query using aggregation pipeline
-        const pipeline = [
-            {
-                $match: { userId: userId }
-            },
-            {
-                $lookup: {
-                    from: 'user_reel_interactions',
-                    let: { uid: '$userId' },
-                    pipeline: [
-                        {
-                            $match: {
-                                $expr: { $eq: ['$userId', '$$uid'] },
-                                $or: [
-                                    { "viewedReels.postId": postId },
-                                    { "likedReels.postId": postId }
-                                ]
-                            }
-                        },
-                        {
-                            $project: {
-                                viewedReels: {
-                                    $filter: {
-                                        input: '$viewedReels',
-                                        cond: { $eq: ['$$this.postId', postId] }
-                                    }
-                                },
-                                likedReels: {
-                                    $filter: {
-                                        input: '$likedReels',
-                                        cond: { $eq: ['$$this.postId', postId] }
-                                    }
-                                }
-                            }
-                        }
-                    ],
-                    as: 'interactions'
-                }
-            },
-            {
-                $project: {
-                    userId: 1,
-                    viewedToday: 1,
-                    likedToday: 1,
-                    retentionContributed: 1,
-                    hasViewed: {
-                        $or: [
-                            { $in: [postId, { $ifNull: ['$viewedToday', []] }] },
-                            { $gt: [{ $size: { $ifNull: [{ $arrayElemAt: ['$interactions.viewedReels', 0] }, []] }}, 0] }
-                        ]
-                    },
-                    hasLiked: {
-                        $or: [
-                            { $in: [postId, { $ifNull: ['$likedToday', []] }] },
-                            { $gt: [{ $size: { $ifNull: [{ $arrayElemAt: ['$interactions.likedReels', 0] }, []] }}, 0] }
-                        ]
-                    },
-                    hasRetentionContributed: {
-                        $or: [
-                            { $in: [postId, { $ifNull: ['$retentionContributed', []] }] },
-                            {
-                                $gt: [{
-                                    $size: {
-                                        $filter: {
-                                            input: { $ifNull: [{ $arrayElemAt: ['$interactions.viewedReels', 0] }, []] },
-                                            cond: { $eq: ['$$this.retentionContributed', true] }
-                                        }
-                                    }
-                                }, 0]
-                            }
-                        ]
-                    }
-                }
-            }
-        ];
-
-        const result = await db.collection('user_interaction_cache').aggregate(pipeline).toArray();
-        
-        let interaction = {
-            viewed: false,
-            liked: false,
-            retentionContributed: false
-        };
-
-        if (result && result.length > 0) {
-            const data = result[0];
-            interaction = {
-                viewed: data.hasViewed || false,
-                liked: data.hasLiked || false,
-                retentionContributed: data.hasRetentionContributed || false
-            };
-        }
-
-        return res.json({
-            success: true,
-            postId,
-            interaction,
-            queryTime: Date.now()
-        });
-
-    } catch (error) {
-        console.error('[SINGLE-CHECK-ERROR]', error);
-        return res.status(500).json({ error: 'Failed to check interaction' });
-    }
-});
-
-
-
-// Add this to your existing Node.js server code
-
-// Add new retention endpoint to handle audience retention updates
-app.post('/api/retention/update', async (req, res) => {
-    try {
-        const { reelId, userId, retentionPercent, watchedDuration, totalDuration, sourceDocument, timestamp } = req.body;
-
-        // Validate required fields
-        if (!reelId || !userId || retentionPercent === undefined || !watchedDuration || !totalDuration) {
-            return res.status(400).json({ 
-                error: 'Missing required fields', 
-                required: ['reelId', 'userId', 'retentionPercent', 'watchedDuration', 'totalDuration'] 
-            });
-        }
-
-        // Validate data types and ranges
-        if (typeof retentionPercent !== 'number' || retentionPercent < 0 || retentionPercent > 100) {
-            return res.status(400).json({ error: 'retentionPercent must be between 0 and 100' });
-        }
-
-        if (watchedDuration < 3000) { // Must watch at least 3 seconds
-            return res.status(400).json({ error: 'watchedDuration must be at least 3000ms' });
-        }
-
-        if (totalDuration < 5000) { // Video must be at least 5 seconds
-            return res.status(400).json({ error: 'totalDuration must be at least 5000ms' });
-        }
-
-        console.log(`[RETENTION-UPDATE] ${new Date().toISOString()} | User: ${userId} | Reel: ${reelId} | Retention: ${retentionPercent.toFixed(2)}% | Watched: ${watchedDuration}ms / ${totalDuration}ms`);
-
-        // Find which collection contains this reel and get the document name
-        const { collection, documentId } = await findReelLocation(reelId, sourceDocument);
-        
-        if (!collection || !documentId) {
-            console.log(`[RETENTION-ERROR] Reel ${reelId} not found in any collection`);
-            return res.status(404).json({ error: 'Reel not found' });
-        }
-
-        // Update retention data in the correct document
-        const updateResult = await updateReelRetention(collection, documentId, reelId, {
-            userId,
-            retentionPercent: Math.round(retentionPercent * 100) / 100, // Round to 2 decimal places
-            watchedDuration,
-            totalDuration,
-            timestamp: timestamp || new Date().toISOString(),
-            watchDate: new Date().toISOString().split('T')[0] // YYYY-MM-DD format
-        });
-
-        if (updateResult.success) {
-            console.log(`[RETENTION-SUCCESS] Updated retention for reel ${reelId} in ${collection}/${documentId}`);
-            return res.json({
-                success: true,
-                message: 'Retention updated successfully',
-                reelId,
-                documentId,
-                collection,
-                retentionPercent,
-                totalViews: updateResult.totalViews,
-                averageRetention: updateResult.averageRetention
-            });
-        } else {
-            console.error(`[RETENTION-ERROR] Failed to update retention for reel ${reelId}:`, updateResult.error);
-            return res.status(500).json({ error: 'Failed to update retention', details: updateResult.error });
-        }
-
-    } catch (error) {
-        console.error('[RETENTION-UPDATE-ERROR]', error);
-        return res.status(500).json({ error: 'Internal server error', details: error.message });
-    }
-});
-
-
 function extractDocumentId(item) {
     // Extract document ID from sourceDocument or _id field
     if (item.sourceDocument) return item.sourceDocument;
@@ -3906,12 +3272,9 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
             console.log(`[USER-INTERESTS-FINAL] Using ${userInterests.length} interests for ranking`);
         }
 
-        // STEP 2: Fetch metadata
-        console.log('[METADATA-FETCH-START] Querying contrib_posts, contrib_reels, following...');
 
         const [viewedPostsDocs, viewedReelsDocs, followResponse] = await Promise.all([
             db.collection('contrib_posts').find({ userId }).toArray(),
-            db.collection('contrib_reels').find({ userId }).toArray(),
             axios.get(`http://127.0.0.1:5000/api/users/${userId}/following`, { timeout: 1000, validateStatus: () => true })
                 .catch(err => {
                     console.warn('[FOLLOWING-FETCH-ERROR]', err && err.message ? err.message : err);
@@ -4773,22 +4136,12 @@ async function getReelRetentionAnalytics(collectionName, documentId, reelId) {
 
 async function createOptimizedIndexes() {
   const db = client.db(DB_NAME);
-  
-  // user_reel_interactions indexes
-  await db.collection('user_reel_interactions').createIndex({ "_id": 1 }); // Primary key
-  await db.collection('user_reel_interactions').createIndex({ "userId": 1, "date": -1 });
-  await db.collection('user_reel_interactions').createIndex({ "viewedReels.postId": 1 });
-  await db.collection('user_reel_interactions').createIndex({ "likedReels.postId": 1 });
+
   
   // reel_stats indexes  
   await db.collection('reel_stats').createIndex({ "_id": 1 }); // Primary key (postId)
   await db.collection('reel_stats').createIndex({ "sourceDocument": 1 });
   await db.collection('reel_stats').createIndex({ "likeCount": -1 }); // For trending
-  
-  // user_interaction_cache indexes
-  await db.collection('user_interaction_cache').createIndex({ "_id": 1 });
-  await db.collection('user_interaction_cache').createIndex({ "userId": 1 });
-  await db.collection('user_interaction_cache').createIndex({ "ttl": 1 }, { expireAfterSeconds: 0 });
   
   console.log('[INDEXES] All interaction indexes created successfully');
 }
@@ -4838,7 +4191,6 @@ app.post('/api/interactions/check', async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     const cacheKey = `${userId}_session_${today}`;
     
-    const cacheDoc = await db.collection('user_interaction_cache').findOne({ _id: cacheKey });
     
     let viewedReels = new Set();
     let likedReels = new Set();
@@ -4858,10 +4210,6 @@ app.post('/api/interactions/check', async (req, res) => {
         recentDates.push(`${userId}_${date.toISOString().split('T')[0]}`);
       }
 
-      const recentInteractions = await db.collection('user_reel_interactions').find({
-        _id: { $in: recentDates }
-      }).toArray();
-
       // Process recent interactions
       recentInteractions.forEach(doc => {
         if (doc.viewedReels) {
@@ -4877,21 +4225,6 @@ app.post('/api/interactions/check', async (req, res) => {
         }
       });
 
-      // Update cache for next requests
-      await db.collection('user_interaction_cache').updateOne(
-        { _id: cacheKey },
-        {
-          $set: {
-            userId,
-            sessionStart: new Date(),
-            viewedToday: Array.from(viewedReels),
-            likedToday: Array.from(likedReels),
-            retentionContributed: Array.from(retentionContributed),
-            ttl: new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours TTL
-          }
-        },
-        { upsert: true }
-      );
     }
 
     // Step 3: Build response for requested reels
@@ -4920,316 +4253,6 @@ app.post('/api/interactions/check', async (req, res) => {
 
 
 
-// Update the existing /api/interactions/view endpoint
-app.post('/api/interactions/view', async (req, res) => {
-    try {
-        const { userId, postId, sourceDocument, retentionData } = req.body;
-        
-        if (!userId || !postId) {
-            return res.status(400).json({ error: 'userId and postId required' });
-        }
-
-        console.log(`[VIEW-START] ${userId} -> ${postId} ${retentionData ? '(WITH RETENTION)' : '(VIEW ONLY)'}`);
-
-        const today = new Date().toISOString().split('T')[0];
-        const cacheKey = `${userId}_session_${today}`;
-        const retentionCacheKey = `retention_${userId}_${postId}`;
-
-        if (retentionData) {
-            console.log(`[RETENTION-PRE-CHECK] ${userId} -> ${postId}`);
-            
-            // Ultra-fast existence check using compound query
-            const existingDoc = await db.collection('user_interaction_cache').findOne(
-                { 
-                    _id: cacheKey,
-                    retentionContributed: postId  // Array contains check
-                },
-                { projection: { _id: 1 } }
-            );
-
-            if (existingDoc) {
-                console.log(`[RETENTION-ALREADY-EXISTS] ${userId} already contributed to ${postId} - BLOCKED`);
-                setCache(retentionCacheKey, true, 7200000);
-                return res.json({ 
-                    success: true, 
-                    message: 'Retention already contributed', 
-                    duplicate: true 
-                });
-            }
-
-            // Use $addToSet to ensure uniqueness at database level
-            const updateResult = await db.collection('user_interaction_cache').updateOne(
-                { _id: cacheKey },
-                {
-                    $set: {
-                        userId,
-                        ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
-                        updatedAt: new Date()
-                    },
-                    $addToSet: { 
-                        viewedToday: postId,
-                        retentionContributed: postId  // This ensures uniqueness
-                    },
-                    $setOnInsert: { createdAt: new Date() }
-                },
-                { upsert: true }
-            );
-
-            // Check if the retention was actually added (not a duplicate)
-            if (updateResult.modifiedCount === 0 && updateResult.upsertedCount === 0) {
-                console.log(`[RETENTION-DUPLICATE-BLOCKED] ${userId} -> ${postId} - Database level duplicate`);
-                setCache(retentionCacheKey, true, 7200000);
-                return res.json({ 
-                    success: true, 
-                    message: 'Retention already contributed', 
-                    duplicate: true 
-                });
-            }
-
-            console.log(`[RETENTION-RECORDED] ${userId} -> ${postId} - Unique contribution saved`);
-            setCache(retentionCacheKey, true, 7200000);
-
-        } else {
-            // View only - simpler logic
-            await db.collection('user_interaction_cache').updateOne(
-                { _id: cacheKey },
-                {
-                    $set: {
-                        userId,
-                        ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
-                        updatedAt: new Date()
-                    },
-                    $addToSet: { viewedToday: postId },
-                    $setOnInsert: { createdAt: new Date() }
-                },
-                { upsert: true }
-            );
-            
-            console.log(`[VIEW-ONLY-RECORDED] ${userId} -> ${postId}`);
-        }
-
-        // Background detailed recording remains the same
-        const viewRecord = {
-            postId,
-            viewedAt: new Date(),
-            sourceDocument: sourceDocument || 'unknown',
-            retentionContributed: !!retentionData
-        };
-
-        if (retentionData) {
-            viewRecord.retentionPercent = Math.round(retentionData.retentionPercent * 100) / 100;
-            viewRecord.watchedDuration = retentionData.watchedDuration;
-            viewRecord.totalDuration = retentionData.totalDuration;
-        }
-
-        // Background recording
-        Promise.all([
-            db.collection('user_reel_interactions').updateOne(
-                { _id: `${userId}_${today}` },
-                {
-                    $set: { userId, date: today, updatedAt: new Date() },
-                    $setOnInsert: { createdAt: new Date() },
-                    $addToSet: { viewedReels: viewRecord }
-                },
-                { upsert: true }
-            ),
-            
-            db.collection('reel_stats').updateOne(
-                { _id: postId },
-                {
-                    $inc: { viewCount: 1 },
-                    $set: { 
-                        lastUpdated: new Date(),
-                        sourceDocument: sourceDocument || 'unknown'
-                    }
-                },
-                { upsert: true }
-            )
-        ]).then(() => {
-            console.log(`[DETAILED-RECORD-COMPLETE] ${userId} -> ${postId}`);
-        }).catch(error => {
-            console.error('[DETAILED-RECORD-ERROR]', error);
-        });
-
-        return res.json({ success: true, message: 'View recorded successfully' });
-
-    } catch (error) {
-        console.error('[VIEW-RECORD-ERROR]', error);
-        return res.status(500).json({ error: 'Failed to record view' });
-    }
-});
-
-// ✅ REPLACE THIS SECTION - Remove contributionToLike operations
-app.post('/api/interactions/like', async (req, res) => {
-    try {
-        const { userId, postId, sourceDocument, action } = req.body;
-        
-        if (!userId || !postId || !['like', 'unlike'].includes(action)) {
-            return res.status(400).json({ error: 'userId, postId, and action (like/unlike) required' });
-        }
-
-        const today = new Date().toISOString().split('T')[0];
-        const docId = `${userId}_${today}`;
-        const isLiking = action === 'like';
-
-        console.log(`[LIKE-${action.toUpperCase()}] ${userId} ${action}d ${postId} - forwarding to PORT 4000`);
-
-        // Forward to PORT 4000 (single source of truth)
-        const port4000Response = await axios.post(
-            'https://database-22io.onrender.com/api/posts/toggle-like',
-            {
-                userId: userId,
-                postId: postId,
-                currentlyLiked: !isLiking,
-                isReel: true
-            },
-            { timeout: 5000 }
-        );
-
-        if (port4000Response.data.success) {
-            const isLiked = port4000Response.data.isLiked;
-            const likeCount = port4000Response.data.likeCount;
-            
-            // Update local cache for quick access
-            const cacheKey = `${userId}_session_${today}`;
-            const cacheOperation = isLiked 
-                ? { $addToSet: { likedToday: postId } }
-                : { $pull: { likedToday: postId } };
-            
-            await db.collection('user_interaction_cache').updateOne(
-                { _id: cacheKey },
-                {
-                    ...cacheOperation,
-                    $set: { ttl: new Date(Date.now() + 24 * 60 * 60 * 1000) }
-                },
-                { upsert: true }
-            );
-
-            return res.json({
-                success: true,
-                action: isLiked ? 'like' : 'unlike',
-                likeCount: likeCount,
-                message: `Successfully ${isLiked ? 'liked' : 'unliked'} reel`
-            });
-        }
-
-        return res.status(500).json({ error: 'PORT 4000 like failed' });
-
-    } catch (error) {
-        console.error('[LIKE-ERROR]', error);
-        return res.status(500).json({ error: `Failed to ${req.body.action} reel` });
-    }
-});
-
-// Helper function to update like count in the main reels collection
-async function updateLikeCountInReelsCollection(postId, sourceDocument, newLikeCount) {
-  try {
-    // Find which collection contains this reel
-    const collections = ['reels']; // Add other collections if needed
-    
-    for (const collectionName of collections) {
-      const result = await db.collection(collectionName).updateOne(
-        { "reelsList.postId": postId },
-        { $set: { "reelsList.$.likeCount": newLikeCount } }
-      );
-
-      if (result.matchedCount > 0) {
-        console.log(`[LIKE-COUNT-UPDATE] Updated ${postId} in ${collectionName} to ${newLikeCount} likes`);
-        break;
-      }
-    }
-  } catch (error) {
-    console.error('[LIKE-COUNT-UPDATE-ERROR]', error);
-    // Don't throw error as this is secondary operation
-  }
-}
-
-// Endpoint to get reel statistics (like count, view count, etc.)
-app.get('/api/interactions/stats/:postId', async (req, res) => {
-  try {
-    const { postId } = req.params;
-    
-    if (!postId) {
-      return res.status(400).json({ error: 'postId required' });
-    }
-
-    const stats = await db.collection('reel_stats').findOne({ _id: postId });
-    
-    if (!stats) {
-      return res.json({
-        success: true,
-        stats: {
-          postId,
-          likeCount: 0,
-          viewCount: 0,
-          commentCount: 0,
-          recentLikers: []
-        }
-      });
-    }
-
-    return res.json({
-      success: true,
-      stats: {
-        postId: stats._id,
-        likeCount: stats.likeCount || 0,
-        viewCount: stats.viewCount || 0,  
-        commentCount: stats.commentCount || 0,
-        recentLikers: stats.recentLikers || [],
-        lastUpdated: stats.lastUpdated
-      }
-    });
-
-  } catch (error) {
-    console.error('[STATS-ERROR]', error);
-    return res.status(500).json({ error: 'Failed to get reel statistics' });
-  }
-});
-
-// =================================================================
-// Database Cleanup and Maintenance
-// =================================================================
-
-// Clean up old interaction data (run weekly via cron job)
-async function cleanupOldInteractions() {
-  try {
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    
-    // Remove interaction records older than 30 days
-    const result = await db.collection('user_reel_interactions').deleteMany({
-      createdAt: { $lt: thirtyDaysAgo }
-    });
-    
-    console.log(`[CLEANUP] Removed ${result.deletedCount} old interaction records`);
-    
-    // Cache cleanup is automatic via TTL index
-    
-  } catch (error) {
-    console.error('[CLEANUP-ERROR]', error);
-  }
-}
-
-// Initialize the interaction system
-async function initializeInteractionSystem() {
-  try {
-    await createOptimizedIndexes();
-    
-    // Schedule cleanup to run daily at 2 AM
-    setInterval(cleanupOldInteractions, 24 * 60 * 60 * 1000);
-    
-    console.log('[INTERACTION-SYSTEM] Initialized successfully');
-  } catch (error) {
-    console.error('[INTERACTION-SYSTEM-ERROR]', error);
-  }
-}
-
-// Call this during server startup
-initializeInteractionSystem();
-
-
-
-
 app.get('/api/stats', async (req, res) => {
 try {
 const [postsCount, reelsCount, userIds, contribPostsCount, contribReelsCount] = await Promise.all([
@@ -5237,7 +4260,6 @@ dbManager.getCollectionCount('posts'),
 dbManager.getCollectionCount('reels'),
 dbManager.getDistinctUserIds(),
 dbManager.getCollectionCount('contrib_posts'),
-dbManager.getCollectionCount('contrib_reels')
 ]);
 
 const stats = {
@@ -5295,355 +4317,6 @@ app.post('/api/random-write', async (req, res) => {
 
 
 
-// REPLACE all optimized endpoints in server.js with these FIXED versions
-// Tag: post_algorithm
-
-/**
- * GET /api/user-status/optimized/:userId
- * Returns slot IDs from user_status collection
- * For NEW users: Auto-detects latest reel/post documents and creates user_status
- * READ COUNT: 1-3 (user_status + optional reels/posts collection check for new users)
- */
-app.get('/api/user-status/:userId', async (req, res) => {
-    const startTime = Date.now();
-    const { userId } = req.params;
-    
-    try {
-        console.log(`[post_algorithm] [READ-1-START] user_status lookup for userId=${userId}`);
-        
-        // ✅ CRITICAL FIX: Read document where _id = userId
-        const userStatus = await db.collection('user_status').findOne(
-            { _id: userId },
-            { 
-                projection: { 
-                    _id: 1,
-                    userId: 1,
-                    latestReelSlotId: 1, 
-                    normalReelSlotId: 1, 
-                    latestPostSlotId: 1, 
-                    normalPostSlotId: 1 
-                } 
-            }
-        );
-        
-        const duration = Date.now() - startTime;
-        
-        if (userStatus && userStatus.latestReelSlotId) {
-            // ✅ CASE 1: User status exists with correct fields - return it
-            let latestReelSlot = userStatus.latestReelSlotId || 'reel_0';
-            let normalReelSlot = userStatus.normalReelSlotId || 'reel_0';
-            
-            // Standardize naming (reel_ not reels_)
-            if (latestReelSlot.startsWith('reels_')) {
-                latestReelSlot = latestReelSlot.replace('reels_', 'reel_');
-            }
-            if (normalReelSlot.startsWith('reels_')) {
-                normalReelSlot = normalReelSlot.replace('reels_', 'reel_');
-            }
-            
-            console.log(`[post_algorithm] [READ-1-SUCCESS] user_status EXISTS | duration=${duration}ms | latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${userStatus.latestPostSlotId || 'post_0'} | normalPost=${userStatus.normalPostSlotId || 'post_0'}`);
-            
-            return res.json({
-                success: true,
-                latestReelSlotId: latestReelSlot,
-                normalReelSlotId: normalReelSlot,
-                latestPostSlotId: userStatus.latestPostSlotId || 'post_0',
-                normalPostSlotId: userStatus.normalPostSlotId || 'post_0',
-                reads: 1,
-                duration
-            });
-        } else if (userStatus && !userStatus.latestReelSlotId) {
-            // ✅ CASE 2: Document exists but missing fields (old format) - UPDATE it
-            console.log(`[post_algorithm] [READ-1-INCOMPLETE] Document exists but missing slot fields - updating`);
-            
-            const detectionStart = Date.now();
-            
-            // Get all reel document IDs and find the latest
-            const reelDocs = await db.collection('reels')
-                .find({}, { projection: { _id: 1 } })
-                .toArray();
-            
-            const postDocs = await db.collection('posts')
-                .find({}, { projection: { _id: 1 } })
-                .toArray();
-            
-            // Extract and sort reel IDs (e.g., reel_0, reel_1, reel_2, ...)
-            const reelIds = reelDocs
-                .map(doc => doc._id)
-                .filter(id => id.startsWith('reel_'))
-                .sort((a, b) => {
-                    const numA = parseInt(a.replace('reel_', ''), 10) || 0;
-                    const numB = parseInt(b.replace('reel_', ''), 10) || 0;
-                    return numB - numA; // Descending order (latest first)
-                });
-            
-            // Extract and sort post IDs
-            const postIds = postDocs
-                .map(doc => doc._id)
-                .filter(id => id.startsWith('post_'))
-                .sort((a, b) => {
-                    const numA = parseInt(a.replace('post_', ''), 10) || 0;
-                    const numB = parseInt(b.replace('post_', ''), 10) || 0;
-                    return numB - numA; // Descending order (latest first)
-                });
-            
-            // Determine latest and normal (previous) slots
-            const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
-            const normalReelSlot = reelIds.length > 1 ? reelIds[1] : reelIds[0] || 'reel_0';
-            
-            const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
-            const normalPostSlot = postIds.length > 1 ? postIds[1] : postIds[0] || 'post_0';
-            
-            const detectionDuration = Date.now() - detectionStart;
-            
-            console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
-            console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
-            
-            // ✅ UPDATE existing document (don't insert)
-            const updateResult = await db.collection('user_status').updateOne(
-                { _id: userId },
-                {
-                    $set: {
-                        userId: userId,
-                        latestReelSlotId: latestReelSlot,
-                        normalReelSlotId: normalReelSlot,
-                        latestPostSlotId: latestPostSlot,
-                        normalPostSlotId: normalPostSlot,
-                        updatedAt: new Date()
-                    },
-                    $setOnInsert: {
-                        createdAt: new Date()
-                    }
-                }
-            );
-            
-            const totalDuration = Date.now() - startTime;
-            
-            console.log(`[post_algorithm] [READ-1-UPDATED] Document updated with detected slots | total_duration=${totalDuration}ms | reads=3`);
-            
-            return res.json({
-                success: true,
-                latestReelSlotId: latestReelSlot,
-                normalReelSlotId: normalReelSlot,
-                latestPostSlotId: latestPostSlot,
-                normalPostSlotId: normalPostSlot,
-                reads: 3,
-                duration: totalDuration,
-                wasIncomplete: true
-            });
-        } else {
-            // ✅ CASE 3: No document exists at all - CREATE new one
-            console.log(`[post_algorithm] [READ-1-NEW-USER] User status doesn't exist - auto-detecting latest documents`);
-            
-            const detectionStart = Date.now();
-            
-            // Get all reel document IDs and find the latest
-            const reelDocs = await db.collection('reels')
-                .find({}, { projection: { _id: 1 } })
-                .toArray();
-            
-            const postDocs = await db.collection('posts')
-                .find({}, { projection: { _id: 1 } })
-                .toArray();
-            
-            // Extract and sort reel IDs (e.g., reel_0, reel_1, reel_2, ...)
-            const reelIds = reelDocs
-                .map(doc => doc._id)
-                .filter(id => id.startsWith('reel_'))
-                .sort((a, b) => {
-                    const numA = parseInt(a.replace('reel_', ''), 10) || 0;
-                    const numB = parseInt(b.replace('reel_', ''), 10) || 0;
-                    return numB - numA; // Descending order (latest first)
-                });
-            
-            // Extract and sort post IDs
-            const postIds = postDocs
-                .map(doc => doc._id)
-                .filter(id => id.startsWith('post_'))
-                .sort((a, b) => {
-                    const numA = parseInt(a.replace('post_', ''), 10) || 0;
-                    const numB = parseInt(b.replace('post_', ''), 10) || 0;
-                    return numB - numA; // Descending order (latest first)
-                });
-            
-            // Determine latest and normal (previous) slots
-            const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
-            const normalReelSlot = reelIds.length > 1 ? reelIds[1] : reelIds[0] || 'reel_0';
-            
-            const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
-            const normalPostSlot = postIds.length > 1 ? postIds[1] : postIds[0] || 'post_0';
-            
-            const detectionDuration = Date.now() - detectionStart;
-            
-            console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
-            console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
-            
-            // Create user_status document with detected slots
-            const defaultStatus = {
-                _id: userId,
-                userId: userId,
-                latestReelSlotId: latestReelSlot,
-                normalReelSlotId: normalReelSlot,
-                latestPostSlotId: latestPostSlot,
-                normalPostSlotId: normalPostSlot,
-                createdAt: new Date(),
-                updatedAt: new Date()
-            };
-            
-            await db.collection('user_status').insertOne(defaultStatus);
-            
-            const totalDuration = Date.now() - startTime;
-            
-            console.log(`[post_algorithm] [READ-1-CREATED] New user_status created | total_duration=${totalDuration}ms | reads=3 (user_status + reels + posts)`);
-            
-            return res.json({
-                success: true,
-                latestReelSlotId: latestReelSlot,
-                normalReelSlotId: normalReelSlot,
-                latestPostSlotId: latestPostSlot,
-                normalPostSlotId: normalPostSlot,
-                reads: 3, // user_status (1) + reels collection (1) + posts collection (1)
-                duration: totalDuration,
-                isNewUser: true
-            });
-        }
-        
-    } catch (error) {
-        console.error(`[post_algorithm] [READ-1-ERROR] ${error.message}`);
-        console.error(`[post_algorithm] [READ-1-STACK]`, error.stack);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Failed to read user_status: ' + error.message,
-            reads: 1,
-            duration: Date.now() - startTime
-        });
-    }
-});
-
-
-
-/**
- * POST /api/user-status/:userId
- * Update slot IDs in user_status (WRITE only - no read)
- */
-app.post('/api/user-status/:userId', async (req, res) => {
-    const startTime = Date.now();
-    const { userId } = req.params;
-    const { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId } = req.body;
-    
-    try {
-        console.log(`[post_algorithm] [UPDATE-USER-STATUS] userId=${userId} | latestReel=${latestReelSlotId} | normalReel=${normalReelSlotId} | latestPost=${latestPostSlotId} | normalPost=${normalPostSlotId}`);
-        
-        const updateData = {
-            updatedAt: new Date()
-        };
-        
-        // Only update fields that are provided
-        if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
-        if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
-        if (latestPostSlotId) updateData.latestPostSlotId = latestPostSlotId;
-        if (normalPostSlotId) updateData.normalPostSlotId = normalPostSlotId;
-        
-        // ✅ CRITICAL: Write to document where _id = userId
-        const result = await db.collection('user_status').updateOne(
-            { _id: userId },
-            { 
-                $set: updateData,
-                $setOnInsert: { userId, createdAt: new Date() }
-            },
-            { upsert: true }
-        );
-        
-        const duration = Date.now() - startTime;
-        
-        console.log(`[post_algorithm] [UPDATE-SUCCESS] matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount} | duration=${duration}ms`);
-        
-        return res.json({
-            success: true,
-            message: 'Slot IDs updated',
-            writes: 1,
-            duration
-        });
-        
-    } catch (error) {
-        console.error(`[post_algorithm] [UPDATE-ERROR] ${error.message}`);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Failed to update user_status: ' + error.message,
-            writes: 0,
-            duration: Date.now() - startTime
-        });
-    }
-});
-
-
-
-/**
- * GET /api/contrib-check/:userId/:slotId/:type
- * Returns ids array and count from contrib_posts or contrib_reels
- * READ COUNT: 1 (single document read by _id = slotId)
- */
-app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
-    const startTime = Date.now();
-    const { userId, slotId, type } = req.params;
-    
-    if (!['posts', 'reels'].includes(type)) {
-        return res.status(400).json({ success: false, error: 'Invalid type (must be posts or reels)' });
-    }
-    
-    const collectionName = type === 'posts' ? 'contrib_posts' : 'contrib_reels';
-    const readNum = req.headers['x-read-number'] || '?';
-    
-    try {
-        console.log(`[post_algorithm] [READ-${readNum}-START] ${collectionName} lookup for slotId=${slotId} | userId=${userId}`);
-        
-        // ✅ FIXED: Use userId_slotId as _id
-        const uniqueDocId = `${userId}_${slotId}`;
-        
-        const contribDoc = await db.collection(collectionName).findOne(
-            { _id: uniqueDocId }, // Changed from { _id: slotId, userId: userId }
-            { projection: { ids: 1, _id: 1, slotId: 1 } }
-        );
-        
-        const duration = Date.now() - startTime;
-        
-        if (contribDoc && contribDoc.ids) {
-            const count = contribDoc.ids.length;
-            
-            console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/6 | duration=${duration}ms`);
-            
-            return res.json({
-                success: true,
-                slotId: slotId,
-                ids: contribDoc.ids,
-                count: count,
-                reads: 1,
-                duration
-            });
-        } else {
-            console.log(`[post_algorithm] [READ-${readNum}-NOT-FOUND] ${collectionName} slotId=${slotId} doesn't exist for userId=${userId}`);
-            
-            return res.json({
-                success: true,
-                slotId: slotId,
-                ids: [],
-                count: 0,
-                reads: 1,
-                duration,
-                isNewSlot: true
-            });
-        }
-        
-    } catch (error) {
-        console.error(`[post_algorithm] [READ-${readNum}-ERROR] ${error.message}`);
-        return res.status(500).json({ 
-            success: false, 
-            error: `Failed to read ${collectionName}: ${error.message}`,
-            reads: 1,
-            duration: Date.now() - startTime
-        });
-    }
-});
 
 /**
  * POST /api/feed/optimized-reels
