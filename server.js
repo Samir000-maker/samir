@@ -2711,58 +2711,74 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
                 
                 console.log(`[FEED-DB-QUERY] ${requestKey} | DB reads: ${dbReadsUsed} | Items: ${feedData.content?.length || 0}`);
 
-                if (feedData.content && feedData.content.length > 0) {
-                    // **APPLY INSTAGRAM-STYLE SORTING**
-                    // Note: This is post-query sorting. For better performance, 
-                    // the scoring should be done in the database query itself.
-                    
-                    // Find max values for normalization
-                    const maxLikes = Math.max(...feedData.content.map(item => item.likeCount || 0), 1);
-                    const maxComments = Math.max(...feedData.content.map(item => item.commentCount || 0), 1);
-                    const maxRetention = Math.max(...feedData.content.map(item => item.retention || 0), 1);
-                    
-                    feedData.content.forEach(item => {
-                        const retention = item.retention || 0;
-                        const normalizedLikes = (item.likeCount || 0) / maxLikes * 100;
-                        const normalizedComments = (item.commentCount || 0) / maxComments * 100;
-                        
-                        // Calculate composite score
-                        item.compositeScore = 
-                            (retention * 0.50) +           // 50% retention
-                            (normalizedLikes * 0.30) +     // 30% likes
-                            (normalizedComments * 0.20);   // 20% comments
-                    });
-                    
-                    // Sort by composite score
-                    feedData.content.sort((a, b) => {
-                        // First by composite score
-                        if (Math.abs(a.compositeScore - b.compositeScore) > 1) {
-                            return b.compositeScore - a.compositeScore;
-                        }
-                        
-                        // If scores are very close, use timestamp as tiebreaker
-                        const timeA = new Date(a.timestamp || a.serverTimestamp || 0);
-                        const timeB = new Date(b.timestamp || b.serverTimestamp || 0);
-                        return timeB - timeA;
-                    });
-                    
-                    // Cache for 60 seconds
-                    setCache(cacheKey, feedData, 60000);
-                    
-                    console.log(`[INSTAGRAM-SORT] Applied weighted scoring (Retention=50%, Likes=30%, Comments=20%)`);
-                }
-
-                return {
-                    success: true,
-                    ...feedData,
-                    requestedMinimum: parseInt(minContent),
-                    actualDelivered: feedData.content ? feedData.content.length : 0,
-                    dbReadsUsed,
-                    algorithm: {
-                        weights: { retention: 50, likes: 30, comments: 20 },
-                        normalization: { maxLikes, maxComments, maxRetention }
-                    }
-                };
+if (feedData.content && feedData.content.length > 0) {
+      // **APPLY INSTAGRAM-STYLE SORTING**
+      // Declare max values at the top of the block
+      let maxLikes = 1;
+      let maxComments = 1;
+      let maxRetention = 1;
+      
+      // Find max values for normalization
+      maxLikes = Math.max(...feedData.content.map(item => item.likeCount || 0), 1);
+      maxComments = Math.max(...feedData.content.map(item => item.commentCount || 0), 1);
+      maxRetention = Math.max(...feedData.content.map(item => item.retention || 0), 1);
+      
+      feedData.content.forEach(item => {
+        const retention = item.retention || 0;
+        const normalizedLikes = (item.likeCount || 0) / maxLikes * 100;
+        const normalizedComments = (item.commentCount || 0) / maxComments * 100;
+        
+        // Calculate composite score
+        item.compositeScore =
+          (retention * 0.50) + // 50% retention
+          (normalizedLikes * 0.30) + // 30% likes
+          (normalizedComments * 0.20); // 20% comments
+      });
+      
+      // Sort by composite score
+      feedData.content.sort((a, b) => {
+        // First by composite score
+        if (Math.abs(a.compositeScore - b.compositeScore) > 1) {
+          return b.compositeScore - a.compositeScore;
+        }
+        
+        // If scores are very close, use timestamp as tiebreaker
+        const timeA = new Date(a.timestamp || a.serverTimestamp || 0);
+        const timeB = new Date(b.timestamp || b.serverTimestamp || 0);
+        return timeB - timeA;
+      });
+      
+      // Cache for 60 seconds
+      setCache(cacheKey, feedData, 60000);
+      
+      console.log(`[INSTAGRAM-SORT] Applied weighted scoring (Retention=50%, Likes=30%, Comments=20%)`);
+      
+      // Return response with normalization values
+      return {
+        success: true,
+        ...feedData,
+        requestedMinimum: parseInt(minContent),
+        actualDelivered: feedData.content ? feedData.content.length : 0,
+        dbReadsUsed,
+        algorithm: {
+          weights: { retention: 50, likes: 30, comments: 20 },
+          normalization: { maxLikes, maxComments, maxRetention }
+        }
+      };
+    }
+    
+    // If no content, return empty response
+    return {
+      success: true,
+      ...feedData,
+      requestedMinimum: parseInt(minContent),
+      actualDelivered: 0,
+      dbReadsUsed,
+      algorithm: {
+        weights: { retention: 50, likes: 30, comments: 20 },
+        normalization: { maxLikes: 1, maxComments: 1, maxRetention: 1 }
+      }
+    };
             } finally {
                 activeRequests.delete(requestKey);
             }
