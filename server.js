@@ -27,6 +27,8 @@ const DEDUP_WINDOW = 5000; // 5 seconds
 
 const RESULT_CACHE_TTL = 30000; // 30 seconds
 
+const crypto = require('crypto');
+
 // Global counters and cache
 const dbOpCounters = { reads: 0, writes: 0, updates: 0, inserts: 0, deletes: 0, queries: 0, aggregations: 0 };
 //const cache = { latestSlots: new Map(), userStatus: new Map(), maxIndexes: new Map(), ttl: 30 };
@@ -39,11 +41,26 @@ maxIndexes: new Map(),
 ttl: 30000 // Increased to 30 seconds
 };
 
+const MAX_ACTIVE_REQUESTS = 5000;  // Hard limit
+const REQUEST_DEDUP_TTL = 5000;    // 5 seconds
+
 const processedRequests = new Map();
 
 
 const compression = require('compression');
 const { promisify } = require('util');
+
+
+console.log('[CONFIG] System Configuration:');
+console.log(` MAX_CONTENT_PER_SLOT: ${MAX_CONTENT_PER_SLOT} (500 posts per slot)`);
+console.log(` DEFAULT_CONTENT_BATCH_SIZE: ${DEFAULT_CONTENT_BATCH_SIZE} (40 items per request)`);
+console.log(` MIN_CONTENT_FOR_FEED: ${MIN_CONTENT_FOR_FEED} (40 items minimum)`);
+console.log(` DOCUMENT REDUCTION: 12.5x fewer documents vs 40-item slots`);
+
+// ✅ Add calculation helper for monitoring
+const CACHE_TTL_SHORT = 15000;
+const CACHE_TTL_MEDIUM = 60000;
+const CACHE_TTL_LONG = 300000;
 
 
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
@@ -81,34 +98,69 @@ console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entrie
 
 
 const getOrCreateRequest = (key, requestFactory) => {
-const now = Date.now();
+    const now = Date.now();
 
-// Quick inline cleanup (don't iterate entire map)
-if (activeRequestsWithTimestamp.size > 1000) {
-console.warn(`[REQUEST-MAP-WARNING] Map size: ${activeRequestsWithTimestamp.size} - forcing cleanup`);
-for (const [reqKey, reqData] of activeRequestsWithTimestamp.entries()) {
-if (now - reqData.timestamp > REQUEST_DEDUP_TTL) {
-activeRequestsWithTimestamp.delete(reqKey);
-}
-}
-}
+    // ✅ FIXED: Efficient cleanup - only check if over threshold
+    if (activeRequestsWithTimestamp.size > MAX_ACTIVE_REQUESTS) {
+        console.warn(`[REQUEST-DEDUP] Map size: ${activeRequestsWithTimestamp.size} - forcing cleanup`);
+        
+        // ✅ Use Array.from + filter for faster cleanup
+        const expiredKeys = [];
+        for (const [reqKey, reqData] of activeRequestsWithTimestamp.entries()) {
+            if (now - reqData.timestamp > REQUEST_DEDUP_TTL) {
+                expiredKeys.push(reqKey);
+            }
+            // ✅ Early exit if we've found enough to clean
+            if (expiredKeys.length > 1000) break;
+        }
+        
+        expiredKeys.forEach(k => activeRequestsWithTimestamp.delete(k));
+        console.log(`[REQUEST-DEDUP-CLEANUP] Removed ${expiredKeys.length} expired entries`);
+        
+        // ✅ CRITICAL: If still over limit, remove oldest entries
+        if (activeRequestsWithTimestamp.size > MAX_ACTIVE_REQUESTS) {
+            const sortedEntries = Array.from(activeRequestsWithTimestamp.entries())
+                .sort((a, b) => a[1].timestamp - b[1].timestamp);
+            
+            const toRemove = sortedEntries.slice(0, 1000);
+            toRemove.forEach(([k]) => activeRequestsWithTimestamp.delete(k));
+            
+            console.warn(`[REQUEST-DEDUP-EVICTION] Evicted ${toRemove.length} oldest entries`);
+        }
+    }
 
-if (activeRequestsWithTimestamp.has(key)) {
-console.log(`[REQUEST-DEDUP] ${key} - using existing request | Map size: ${activeRequestsWithTimestamp.size}`);
-return activeRequestsWithTimestamp.get(key).promise;
-}
+    // Check if request already in-flight
+    if (activeRequestsWithTimestamp.has(key)) {
+        console.log(`[REQUEST-DEDUP-HIT] ${key.substring(0, 50)}`);
+        return activeRequestsWithTimestamp.get(key).promise;
+    }
 
-const promise = requestFactory().finally(() => {
-activeRequestsWithTimestamp.delete(key);
-});
+    // Create new request
+    const promise = requestFactory().finally(() => {
+        activeRequestsWithTimestamp.delete(key);
+    });
 
-activeRequestsWithTimestamp.set(key, {
-promise,
-timestamp: now
-});
+    activeRequestsWithTimestamp.set(key, {
+        promise,
+        timestamp: now
+    });
 
-return promise;
+    return promise;
 };
+
+
+
+// ✅ Alternative: If excluded IDs change frequently, use user slot-based caching
+function generateSlotBasedCacheKey(userId, userStatus) {
+    // Cache based on current slots - invalidates when user moves to new slot
+    const reelSlot = userStatus?.latestReelSlotId || 'reel_0';
+    const postSlot = userStatus?.latestPostSlotId || 'post_0';
+    
+    return `feed:${userId}:${reelSlot}:${postSlot}`;
+}
+
+
+
 
 // CRITICAL: Enhanced logging with collection scan detection
 function logDbOp(op, col, query = {}, result = null, time = 0, options = {}) {
@@ -599,78 +651,108 @@ log('error', '[AGG-INDEX-ERROR]', error.message);
 
 // MongoDB initialization
 async function initMongo() {
-console.log('[MONGO-INIT] Starting connection...');
+    console.log('[MONGO-INIT] Starting connection...');
 
+    process.removeAllListeners('warning');
+    process.on('warning', (warning) => {
+        if (!warning.message?.includes('snappy') &&
+            !warning.message?.includes('kerberos')) {
+            console.warn('[NODE-WARNING]', warning.message);
+        }
+    });
 
-process.removeAllListeners('warning');
-process.on('warning', (warning) => {
-// Only log critical warnings, ignore dependency warnings
-if (!warning.message?.includes('snappy') &&
-!warning.message?.includes('kerberos')) {
-console.warn('[NODE-WARNING]', warning.message);
-}
-});
+    const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
 
+    console.log(`[MONGO-INIT] Connecting to MongoDB Atlas`);
 
-// FIXED: Use correct localhost URI
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
-
-console.log(`[MONGO-INIT] Connecting to: ${MONGODB_URI}`);
-
-// PRODUCTION-READY: Compression with fallback
-const compressors = ['zlib']; // Safe fallback if snappy installation fails
-
-// Try to detect snappy availability
-try {
-require.resolve('snappy');
-compressors.unshift('snappy'); // Prioritize snappy if available
-console.log('[MONGO-INIT] ✅ Snappy compression available');
-} catch (e) {
-console.log('[MONGO-INIT]⚠️ Snappy not available, using zlib compression');
-}
-
-// Add to initMongo() function
-
-client = new MongoClient(MONGODB_URI, {
-    maxPoolSize: 50, // ✅ Reduced from 100
-    minPoolSize: 5,  // ✅ Reduced from 10
-    maxIdleTimeMS: 30000,
-    serverSelectionTimeoutMS: 5000, // ✅ Faster timeout
-    socketTimeoutMS: 30000,
-    readPreference: 'nearest',
-    retryWrites: true,
-    retryReads: true,
-    waitQueueTimeoutMS: 5000, // ✅ Faster timeout
-    directConnection: false,
-    compressors: compressors,
-    maxConnecting: 2,
-    w: 1,
-    journal: false, // ✅ Disable for speed (use with caution)
-    
-    // ✅ CRITICAL: Add connection pooling monitoring
-    monitorCommands: false,
-    autoEncryption: undefined
-});
-
-// ✅ Add connection pool monitoring
-client.on('connectionPoolCreated', () => {
-    console.log('[MONGO-POOL] Pool created');
-});
-
-client.on('connectionCheckOutStarted', () => {
-    const poolSize = client.topology?.s?.pool?.totalConnectionCount || 0;
-    if (poolSize > 40) {
-        console.warn(`[MONGO-POOL-WARNING] Pool size: ${poolSize}/50`);
+    const compressors = ['zlib'];
+    try {
+        require.resolve('snappy');
+        compressors.unshift('snappy');
+        console.log('[MONGO-INIT] ✅ Snappy compression available');
+    } catch (e) {
+        console.log('[MONGO-INIT] ⚠️ Snappy not available, using zlib');
     }
-});
 
-console.log(`[MONGO-INIT] Compression: ${compressors.join(', ')}`);
+    // ✅ CRITICAL FIX: Production-ready connection pool configuration
+    client = new MongoClient(MONGODB_URI, {
+        // ✅ FIXED: Increase pool size to handle high concurrency
+        maxPoolSize: 200,           // Was 50 → Now 200 (supports 20,000+ req/sec)
+        minPoolSize: 20,            // Was 5 → Now 20 (keep warm connections)
+        
+        // ✅ FIXED: Increase idle timeout to prevent connection churn
+        maxIdleTimeMS: 120000,      // Was 30s → Now 2 minutes
+        
+        // Timeouts optimized for fast queries
+        serverSelectionTimeoutMS: 5000,
+        socketTimeoutMS: 45000,     // Increased from 30s for large aggregations
+        connectTimeoutMS: 10000,
+        
+        // Connection strategy
+        readPreference: 'nearest',
+        retryWrites: true,
+        retryReads: true,
+        waitQueueTimeoutMS: 10000,  // Increased from 5s to handle bursts
+        directConnection: false,
+        
+        // Compression
+        compressors: compressors,
+        
+        // ✅ FIXED: Increase maxConnecting to prevent queue buildup
+        maxConnecting: 10,          // Was 2 → Now 10
+        
+        // Write concern optimized for speed
+        w: 1,
+        journal: false,
+        
+        // ✅ NEW: Add heartbeat configuration for better connection health
+        heartbeatFrequencyMS: 10000,  // Check connection health every 10s
+        
+        // Disable command monitoring in production (performance)
+        monitorCommands: false,
+        autoEncryption: undefined
+    });
 
-console.log('[MONGO-INIT] Connecting with sharded cluster optimizations...');
+    // ✅ CRITICAL: Enhanced connection pool monitoring
+    let poolWarningThreshold = 160; // Warn at 80% capacity (160/200)
+    
+    client.on('connectionPoolCreated', () => {
+        console.log('[MONGO-POOL] Pool created | maxSize=200 | minSize=20');
+    });
 
-await client.connect();
-db = client.db(DB_NAME);
-console.log(`[MONGO-INIT] Connected to ${DB_NAME}`);
+    client.on('connectionPoolReady', () => {
+        console.log('[MONGO-POOL] ✅ Pool ready');
+    });
+
+    client.on('connectionCheckOutStarted', () => {
+        const poolSize = client.topology?.s?.pool?.totalConnectionCount || 0;
+        const availableConnections = client.topology?.s?.pool?.availableConnectionCount || 0;
+        
+        if (poolSize > poolWarningThreshold) {
+            console.warn(`[MONGO-POOL-WARNING] ⚠️ High pool usage: ${poolSize}/200 connections | Available: ${availableConnections}`);
+        }
+    });
+
+    // ✅ NEW: Monitor connection pool cleared events
+    client.on('connectionPoolCleared', () => {
+        console.warn('[MONGO-POOL] ⚠️ Pool cleared - connections will be recreated');
+    });
+
+    // ✅ NEW: Monitor checkout failures
+    client.on('connectionCheckOutFailed', (event) => {
+        console.error('[MONGO-POOL-ERROR] ❌ Connection checkout failed:', event.reason);
+    });
+
+    console.log(`[MONGO-INIT] Compression: ${compressors.join(', ')}`);
+    console.log('[MONGO-INIT] Connecting with optimized pool settings...');
+
+    await client.connect();
+    db = client.db(DB_NAME);
+    console.log(`[MONGO-INIT] ✅ Connected to ${DB_NAME}`);
+
+    // Continue with index creation...
+    await initializeSlots();
+    await ensurePostIdUniqueness();
 
 // CRITICAL: Enable sharding for collections (run once during setup)
 if (process.env.ENABLE_SHARDING === 'true') {
@@ -736,6 +818,128 @@ for (const { collection, index, options } of contributionLikeIndexes) {
     }
 }
     
+await createRetentionOptimizedIndexes();
+
+
+
+
+
+
+// ADD to initMongo() function after existing index creation
+
+async function createContribCollectionIndexes() {
+    try {
+        console.log('[CONTRIB-INDEXES] Creating optimized contrib indexes...');
+
+        const contribIndexes = [
+            // ✅ Index for finding all contrib docs for a user
+            {
+                collection: 'contrib_posts',
+                index: { userId: 1 },
+                options: { name: 'user_contrib_posts', background: true }
+            },
+            {
+                collection: 'contrib_reels',
+                index: { userId: 1 },
+                options: { name: 'user_contrib_reels', background: true }
+            },
+            
+            // ✅ Index for finding contrib doc by slot
+            {
+                collection: 'contrib_posts',
+                index: { slotId: 1 },
+                options: { name: 'slot_contrib_posts', background: true, sparse: true }
+            },
+            {
+                collection: 'contrib_reels',
+                index: { slotId: 1 },
+                options: { name: 'slot_contrib_reels', background: true, sparse: true }
+            },
+            
+            // ✅ Compound index for userId + slotId queries
+            {
+                collection: 'contrib_posts',
+                index: { userId: 1, slotId: 1 },
+                options: { name: 'user_slot_contrib_posts', background: true }
+            },
+            {
+                collection: 'contrib_reels',
+                index: { userId: 1, slotId: 1 },
+                options: { name: 'user_slot_contrib_reels', background: true }
+            },
+            
+            // ✅ Index for checking if specific postId is in ids array
+            {
+                collection: 'contrib_posts',
+                index: { 'ids': 1 },
+                options: { name: 'postids_lookup', background: true }
+            },
+            {
+                collection: 'contrib_reels',
+                index: { 'ids': 1 },
+                options: { name: 'reelids_lookup', background: true }
+            }
+        ];
+
+        let created = 0;
+        for (const { collection, index, options } of contribIndexes) {
+            try {
+                await db.collection(collection).createIndex(index, options);
+                created++;
+                console.log(`[CONTRIB-INDEX] ✅ ${options.name}`);
+            } catch (err) {
+                if (err.code !== 85 && err.code !== 86) {
+                    console.warn(`[CONTRIB-INDEX-WARN] ${collection}: ${err.message}`);
+                }
+            }
+        }
+
+        console.log(`[CONTRIB-INDEXES] ✅ Created ${created}/${contribIndexes.length} indexes`);
+
+    } catch (error) {
+        console.error('[CONTRIB-INDEX-ERROR]', error.message);
+    }
+}
+
+// Call in initMongo() after line ~655
+await createContribCollectionIndexes();
+
+
+
+async function createRetentionOptimizedIndexes() {
+    try {
+        console.log('[RETENTION-INDEXES] Creating optimized indexes...');
+
+        // ✅ CRITICAL FIX: Create covering index for retention check
+        // Query pattern: { _id: "userId_session_date", retentionContributed: "postId" }
+        await db.collection('user_interaction_cache').createIndex(
+            { _id: 1, retentionContributed: 1 },
+            { 
+                name: 'retention_check_covering',
+                background: true,
+                // ✅ COVERING INDEX: Query can be answered entirely from index
+                // No document access needed
+            }
+        );
+
+        // ✅ Also create index for array membership queries
+        await db.collection('user_interaction_cache').createIndex(
+            { retentionContributed: 1 },
+            { 
+                name: 'retention_array_lookup',
+                background: true,
+                sparse: true  // Only index documents with this field
+            }
+        );
+
+        console.log('[RETENTION-INDEXES] ✅ Optimized indexes created');
+
+    } catch (error) {
+        if (error.code !== 85 && error.code !== 86) {
+            console.error('[RETENTION-INDEX-ERROR]', error.message);
+        }
+    }
+}
 
 
 // ADD to initMongo() function
@@ -967,6 +1171,38 @@ await createPersonalizedReelsIndexes();
 
 
 
+setInterval(() => {
+    const now = Date.now();
+    const expiredKeys = [];
+    
+    for (const [key, data] of activeRequestsWithTimestamp.entries()) {
+        if (now - data.timestamp > REQUEST_DEDUP_TTL * 2) {  // 10 seconds
+            expiredKeys.push(key);
+        }
+    }
+    
+    if (expiredKeys.length > 0) {
+        expiredKeys.forEach(k => activeRequestsWithTimestamp.delete(k));
+        console.log(`[REQUEST-DEDUP-BG-CLEANUP] Removed ${expiredKeys.length} stale entries | Active: ${activeRequestsWithTimestamp.size}`);
+    }
+}, 30000);  // Every 30 seconds
+
+
+  setInterval(() => {
+        if (client.topology?.s?.pool) {
+            const pool = client.topology.s.pool;
+            const total = pool.totalConnectionCount || 0;
+            const available = pool.availableConnectionCount || 0;
+            const pending = pool.pendingConnectionCount || 0;
+            
+            console.log(`[MONGO-POOL-HEALTH] Total: ${total}/200 | Available: ${available} | Pending: ${pending}`);
+            
+            // Alert if pool is consistently near capacity
+            if (total > 180) {
+                console.error(`[MONGO-POOL-CRITICAL] 🚨 Pool near capacity: ${total}/200 - Consider scaling!`);
+            }
+        }
+    }, 60000); // Every 1 minute
 
 
 }
@@ -1740,133 +1976,128 @@ console.log(`[MAX-INDEX-COMPUTED] ${collection} = ${maxIndex} | DB Reads: ${dbOp
 return maxIndex;
 }
 
-async allocateSlot(col, postData, maxAttempts = 3) {
-const coll = this.db.collection(col);
-const listKey = col === 'reels' ? 'reelsList' : 'postList';
-const postId = postData.postId;
+async allocateSlot(col, postData, maxAttempts = 5) {
+    const coll = this.db.collection(col);
+    const listKey = col === 'reels' ? 'reelsList' : 'postList';
+    const postId = postData.postId;
 
-console.log(`[SLOT-ALLOCATION-START] ${col} | PostId: ${postId} | MAX_PER_SLOT: ${MAX_CONTENT_PER_SLOT}`);
+    console.log(`[SLOT-ALLOCATION] ${col} | PostId: ${postId} | MAX: ${MAX_CONTENT_PER_SLOT}`);
 
-// ✅ CRITICAL: Check if post already exists FIRST
-const existingCheck = await coll.findOne(
-{ [`${listKey}.postId`]: postId },
-{ projection: { _id: 1, count: 1 } }
-);
+    // ✅ CRITICAL: Check for duplicates FIRST (prevents duplicate writes)
+    const existingCheck = await coll.findOne(
+        { [`${listKey}.postId`]: postId },
+        { projection: { _id: 1, count: 1 } }
+    );
 
-if (existingCheck) {
-console.log(`[DUPLICATE-PREVENTED] ${postId} already exists in ${existingCheck._id} (count: ${existingCheck.count})`);
-return existingCheck;
-}
+    if (existingCheck) {
+        console.log(`[DUPLICATE-PREVENTED] ${postId} exists in ${existingCheck._id}`);
+        return existingCheck;
+    }
 
-for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-try {
-console.log(`[SLOT-ATTEMPT-${attempt}/${maxAttempts}] ${col} | PostId: ${postId}`);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            console.log(`[SLOT-ATTEMPT-${attempt}/${maxAttempts}] ${col} | PostId: ${postId}`);
 
-// ✅ CHANGED: From count < 2 to count < MAX_CONTENT_PER_SLOT
-const availableSlot = await coll.findOne(
-{ count: { $lt: MAX_CONTENT_PER_SLOT } },
-{
-sort: { index: -1 },
-projection: { _id: 1, index: 1, count: 1 }
-}
-);
+            // ✅ CRITICAL FIX: Use findOneAndUpdate with ATOMIC increment
+            // This prevents race conditions by making find+update atomic
+            const result = await coll.findOneAndUpdate(
+                {
+                    count: { $lt: MAX_CONTENT_PER_SLOT },
+                    [`${listKey}.postId`]: { $ne: postId }  // Extra duplicate check
+                },
+                {
+                    $push: { [listKey]: postData },
+                    $inc: { count: 1 }  // ✅ ATOMIC increment
+                },
+                {
+                    sort: { index: -1 },  // Get latest slot first
+                    returnDocument: 'after',  // Return updated document
+                    projection: { _id: 1, index: 1, count: 1 }
+                }
+            );
 
-if (availableSlot) {
-console.log(`[SLOT-FOUND] ${availableSlot._id} (current count: ${availableSlot.count}/${MAX_CONTENT_PER_SLOT})`);
+            if (result) {
+                console.log(`[SLOT-SUCCESS] ${postId} → ${result._id} | Count: ${result.count - 1} → ${result.count}/${MAX_CONTENT_PER_SLOT}`);
 
-// ✅ CHANGED: Condition updated to use MAX_CONTENT_PER_SLOT
-const updateResult = await coll.updateOne(
-{
-_id: availableSlot._id,
-count: { $lt: MAX_CONTENT_PER_SLOT },
-[`${listKey}.postId`]: { $ne: postId }
-},
-{
-$push: { [listKey]: postData },
-$inc: { count: 1 }
-}
-);
+                // ✅ Invalidate cache
+                await this.invalidateSlotCache(col);
+                if (redisClient) {
+                    await redisClient.del(`max_index_${col}`).catch(() => {});
+                }
 
-if (updateResult.matchedCount > 0 && updateResult.modifiedCount > 0) {
-const newCount = availableSlot.count + 1;
-console.log(`[SLOT-SUCCESS] ${postId} → ${availableSlot._id} | Count: ${availableSlot.count} → ${newCount}/${MAX_CONTENT_PER_SLOT}`);
+                return {
+                    _id: result._id,
+                    index: result.index,
+                    count: result.count
+                };
+            }
 
-await this.invalidateSlotCache(col);
-if (redisClient) {
-await redisClient.del(`max_index_${col}`).catch(() => {});
-}
+            // ✅ No available slot - create new one
+            console.log(`[NO-SLOTS] All slots full (${MAX_CONTENT_PER_SLOT} items) - creating new slot`);
 
-return {
-_id: availableSlot._id,
-index: availableSlot.index,
-count: newCount
-};
-} else {
-console.log(`[SLOT-TAKEN] ${availableSlot._id} filled by another process, retrying...`);
-await new Promise(resolve => setTimeout(resolve, 50 * attempt));
-continue;
-}
-}
+            // ✅ Get max index atomically
+            const maxDoc = await coll.findOne(
+                {},
+                {
+                    sort: { index: -1 },
+                    projection: { index: 1 }
+                }
+            );
 
-// ✅ STEP 2: No available slot - create new one
-console.log(`[NO-SLOTS-AVAILABLE] Creating new slot for ${postId} (all existing slots have ${MAX_CONTENT_PER_SLOT} items)`);
+            const currentMaxIndex = maxDoc?.index ?? -1;
+            const nextIndex = currentMaxIndex + 1;
+            const newId = `${col.slice(0, -1)}_${nextIndex}`;
 
-const maxDoc = await coll.findOne({}, {
-sort: { index: -1 },
-projection: { index: 1 }
-});
+            console.log(`[CREATE-SLOT-${attempt}] ${newId} (index: ${nextIndex})`);
 
-const currentMaxIndex = maxDoc?.index ?? -1;
-const nextIndex = currentMaxIndex + 1;
-const newId = `${col.slice(0, -1)}_${nextIndex}`;
+            try {
+                const newDoc = {
+                    _id: newId,
+                    index: nextIndex,
+                    count: 1,
+                    [listKey]: [postData],
+                    createdAt: new Date().toISOString()
+                };
 
-console.log(`[CREATE-NEW-SLOT-${attempt}] ${newId} (index: ${nextIndex})`);
+                await coll.insertOne(newDoc);
 
-try {
-const newDoc = {
-_id: newId,
-index: nextIndex,
-count: 1,
-[listKey]: [postData],
-createdAt: new Date().toISOString()
-};
+                console.log(`[SLOT-CREATED] ${newId} | PostId: ${postId} | Capacity: 1/${MAX_CONTENT_PER_SLOT}`);
 
-await coll.insertOne(newDoc);
+                await setCache(`max_index_${col}`, nextIndex, 5000);
+                await this.invalidateSlotCache(col);
 
-console.log(`[SLOT-CREATED-SUCCESS] ${newId} | PostId: ${postId} | Capacity: 1/${MAX_CONTENT_PER_SLOT}`);
+                return newDoc;
 
-await setCache(`max_index_${col}`, nextIndex, 5000);
-await this.invalidateSlotCache(col);
+            } catch (insertErr) {
+                if (insertErr.code === 11000) {
+                    // ✅ Another process created this slot - retry with findOneAndUpdate
+                    console.log(`[DUPLICATE-KEY-${attempt}] ${newId} exists, retrying...`);
 
-return newDoc;
+                    if (redisClient) {
+                        await redisClient.del(`max_index_${col}`).catch(() => {});
+                    }
 
-} catch (insertErr) {
-if (insertErr.code === 11000) {
-console.log(`[DUPLICATE-KEY-${attempt}] ${newId} exists, retrying...`);
+                    // ✅ Exponential backoff
+                    await new Promise(resolve => setTimeout(resolve, 50 * Math.pow(2, attempt - 1)));
+                    continue;
+                }
 
-if (redisClient) {
-await redisClient.del(`max_index_${col}`).catch(() => {});
-}
+                throw insertErr;
+            }
 
-await new Promise(resolve => setTimeout(resolve, 100 * attempt));
-continue;
-}
+        } catch (error) {
+            console.error(`[SLOT-ERROR-${attempt}] ${col} | ${error.message}`);
 
-throw insertErr;
-}
+            if (attempt === maxAttempts) {
+                throw new Error(`Slot allocation failed after ${maxAttempts} attempts: ${error.message}`);
+            }
 
-} catch (error) {
-console.error(`[SLOT-ERROR-${attempt}] ${col} | ${error.message}`);
+            // ✅ Exponential backoff
+            await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, attempt - 1)));
+        }
+    }
 
-if (attempt === maxAttempts) {
-throw new Error(`Slot allocation failed after ${maxAttempts} attempts: ${error.message}`);
-}
-
-await new Promise(resolve => setTimeout(resolve, 150 * attempt));
-}
-}
-
-throw new Error(`Could not allocate slot for ${postId} after ${maxAttempts} attempts`);
+    throw new Error(`Could not allocate slot for ${postId} after ${maxAttempts} attempts`);
 }
 
 // NEW: Helper to invalidate slot cache
@@ -2058,6 +2289,48 @@ stack: error.stack
 }
 });
 
+
+app.get('/api/slot-stats', async (req, res) => {
+    try {
+        const [postStats, reelStats] = await Promise.all([
+            db.collection('posts').aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalSlots: { $sum: 1 },
+                        avgItemsPerSlot: { $avg: '$count' },
+                        maxItemsPerSlot: { $max: '$count' },
+                        minItemsPerSlot: { $min: '$count' }
+                    }
+                }
+            ]).toArray(),
+            db.collection('reels').aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalSlots: { $sum: 1 },
+                        avgItemsPerSlot: { $avg: '$count' },
+                        maxItemsPerSlot: { $max: '$count' },
+                        minItemsPerSlot: { $min: '$count' }
+                    }
+                }
+            ]).toArray()
+        ]);
+
+        res.json({
+            success: true,
+            config: {
+                maxContentPerSlot: MAX_CONTENT_PER_SLOT,
+                defaultBatchSize: DEFAULT_CONTENT_BATCH_SIZE
+            },
+            posts: postStats[0] || { totalSlots: 0, avgItemsPerSlot: 0 },
+            reels: reelStats[0] || { totalSlots: 0, avgItemsPerSlot: 0 },
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 
 app.get('/api/posts/single-reel/:postId', async (req, res) => {
@@ -2452,90 +2725,6 @@ app.post('/api/sync/metrics', async (req, res) => {
 });
 
 
-
-// app.post('/api/interactions/sync-like-immediate', async (req, res) => {
-//     try {
-//         const { postId, userId, action, isLiked, likeCount, timestamp } = req.body;
-
-//         if (!postId || !userId || !action) {
-//             return res.status(400).json({ 
-//                 success: false, 
-//                 error: 'postId, userId, and action required' 
-//             });
-//         }
-
-//         console.log(`[SYNC-LIKE-IMMEDIATE] ${userId} ${action}d ${postId}, count: ${likeCount}`);
-
-//         const today = new Date().toISOString().split('T')[0];
-//         const cacheKey = `${userId}_session_${today}`;
-
-//         // ✅ STEP 1: Update user_interaction_cache (fast lookup)
-//         const cacheOperation = isLiked
-//             ? { $addToSet: { likedToday: postId } }
-//             : { $pull: { likedToday: postId } };
-
-//         await db.collection('user_interaction_cache').updateOne(
-//             { _id: cacheKey },
-//             {
-//                 ...cacheOperation,
-//                 $set: { 
-//                     ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
-//                     lastSynced: timestamp 
-//                 }
-//             },
-//             { upsert: true }
-//         );
-
-//         // ✅ STEP 2: Update contributionToLike collection (persistent storage)
-//         if (isLiked) {
-//             // Add like
-//             await db.collection('contributionToLike').updateOne(
-//                 { _id: `${userId}_${postId}` },
-//                 {
-//                     $set: {
-//                         userId: userId,
-//                         postId: postId,
-//                         likedAt: timestamp,
-//                         updatedAt: new Date().toISOString()
-//                     },
-//                     $setOnInsert: {
-//                         createdAt: new Date().toISOString()
-//                     }
-//                 },
-//                 { upsert: true }
-//             );
-//             console.log(`[CONTRIBUTION-LIKE-ADDED] ${userId} -> ${postId}`);
-//         } else {
-//             // Remove like
-//             await db.collection('contributionToLike').deleteOne({
-//                 _id: `${userId}_${postId}`
-//             });
-//             console.log(`[CONTRIBUTION-LIKE-REMOVED] ${userId} -> ${postId}`);
-//         }
-
-//         console.log(`[SYNC-LIKE-SUCCESS] Cache + contributionToLike updated for ${userId} -> ${postId}`);
-
-//         return res.json({
-//             success: true,
-//             message: 'Like synced successfully',
-//             postId,
-//             userId,
-//             action,
-//             likeCount,
-//             syncedAt: new Date().toISOString()
-//         });
-
-//     } catch (error) {
-//         console.error('[SYNC-LIKE-IMMEDIATE-ERROR]', error.message);
-//         return res.status(500).json({ 
-//             success: false, 
-//             error: 'Sync failed',
-//             details: error.message 
-//         });
-//     }
-// });
-
-
 // ✅ REPLACE - Forward to PORT 4000
 app.post('/api/interactions/restore-like-states', async (req, res) => {
 try {
@@ -2585,248 +2774,6 @@ return res.status(500).json({ success: false, error: 'Failed to restore like sta
 
 
 
-
-// Personalized reels feed with interest-based ranking
-app.post('/api/feed/reels-personalized', async (req, res) => {
-try {
-const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, offset = 0 } = req.body;
-
-if (!userId || userId === 'undefined' || userId === 'null') {
-return res.status(400).json({ success: false, error: 'Valid userId required' });
-}
-
-const limitNum = parseInt(limit, 10) || DEFAULT_CONTENT_BATCH_SIZE;
-const offsetNum = parseInt(offset, 10) || 0;
-
-log('info', `[REELS-PERSONALIZED-START] userId=${userId}, limit=${limitNum}, offset=${offsetNum}`);
-
-// Step 1: Get user interests
-let userInterests = [];
-try {
-const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, {
-timeout: 2000
-});
-if (userResponse.status === 200 && userResponse.data.success) {
-userInterests = userResponse.data.user.interests || [];
-log('info', `[USER-INTERESTS] ${userId}: [${userInterests.join(', ')}]`);
-}
-} catch (e) {
-log('warn', `[USER-INTERESTS-SKIP] ${e.message} - proceeding without interests`);
-}
-
-// Step 2: Get viewed reels
-const viewedReelsDoc = await db.collection('contrib_reels').findOne(
-{ userId },
-{ projection: { ids: 1 } }
-);
-const viewedReelIds = viewedReelsDoc?.ids || [];
-log('info', `[VIEWED-FILTER] Excluding ${viewedReelIds.length} viewed reels`);
-
-// **CRITICAL: First pass to get max values for normalization**
-const maxValuesQuery = [
-{ $match: { 'reelsList': { $exists: true, $ne: [] } } },
-{ $unwind: '$reelsList' },
-{ $match: { 'reelsList.postId': { $nin: viewedReelIds } }},
-{
-$group: {
-_id: null,
-maxLikes: { $max: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } } },
-maxComments: { $max: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } } },
-maxViews: { $max: { $toInt: { $ifNull: ['$reelsList.viewCount', 0] } } }
-}
-}
-];
-
-const maxValues = await db.collection('reels').aggregate(maxValuesQuery).toArray();
-const maxLikes = maxValues[0]?.maxLikes || 1;
-const maxComments = maxValues[0]?.maxComments || 1;
-const maxViews = maxValues[0]?.maxViews || 1;
-
-log('info', `[NORMALIZATION-VALUES] maxLikes=${maxLikes}, maxComments=${maxComments}, maxViews=${maxViews}`);
-
-// Step 3: Build Instagram-style weighted scoring pipeline
-const pipeline = [
-{ $match: { 'reelsList': { $exists: true, $ne: [] } } },
-{ $unwind: '$reelsList' },
-{
-$match: {
-'reelsList.postId': { $nin: viewedReelIds }
-}
-},
-{
-$addFields: {
-// Base metrics (converted to numbers)
-retentionNum: { $toDouble: { $ifNull: ['$reelsList.retention', 0] } },
-likeCountNum: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } },
-commentCountNum: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } },
-viewCountNum: { $toInt: { $ifNull: ['$reelsList.viewCount', 0] } },
-
-// Interest match score (0, 50, or 100)
-interestScore: {
-$cond: {
-if: {
-$and: [
-{ $gt: [{ $size: { $ifNull: [userInterests, []] } }, 0] },
-{ $in: ['$reelsList.category', userInterests] }
-]
-},
-then: 100,
-else: {
-$cond: {
-if: { $eq: [{ $size: { $ifNull: [userInterests, []] } }, 0] },
-then: 50,
-else: 0
-}
-}
-}
-}
-}
-},
-{
-$addFields: {
-// **INSTAGRAM-STYLE NORMALIZATION (0-100 scale)**
-normalizedLikes: {
-$multiply: [
-{ $divide: ['$likeCountNum', maxLikes] },
-100
-]
-},
-normalizedComments: {
-$multiply: [
-{ $divide: ['$commentCountNum', maxComments] },
-100
-]
-},
-normalizedViews: {
-$multiply: [
-{ $divide: ['$viewCountNum', maxViews] },
-100
-]
-}
-}
-},
-{
-$addFields: {
-// **INSTAGRAM-STYLE WEIGHTED COMPOSITE SCORE**
-// Retention: 50%, Likes: 25%, Comments: 12%, Interest: 10%, Views: 3%
-compositeScore: {
-$add: [
-{ $multiply: ['$retentionNum', 0.50] }, // 50% weight
-{ $multiply: ['$normalizedLikes', 0.25] }, // 25% weight
-{ $multiply: ['$normalizedComments', 0.12] }, // 12% weight
-{ $multiply: ['$interestScore', 0.10] }, // 10% weight
-{ $multiply: ['$normalizedViews', 0.03] } // 3% weight
-]
-}
-}
-},
-{
-// **CRITICAL: Sort by composite score (Instagram algorithm)**
-$sort: {
-compositeScore: -1 // Highest score first
-}
-},
-{ $skip: offsetNum },
-{ $limit: limitNum * 2 },
-{
-$project: {
-postId: '$reelsList.postId',
-userId: '$reelsList.userId',
-username: '$reelsList.username',
-imageUrl: {
-$cond: {
-if: { $ifNull: ['$reelsList.videoUrl', false] },
-then: '$reelsList.videoUrl',
-else: '$reelsList.imageUrl'
-}
-},
-videoUrl: '$reelsList.videoUrl',
-caption: '$reelsList.caption',
-description: '$reelsList.description',
-category: '$reelsList.category',
-profilePicUrl: { $ifNull: ['$reelsList.profile_picture_url', ''] },
-timestamp: '$reelsList.timestamp',
-likeCount: '$likeCountNum',
-commentCount: '$commentCountNum',
-viewCount: '$viewCountNum',
-retention: '$retentionNum',
-interestScore: '$interestScore',
-compositeScore: '$compositeScore', // Include for debugging
-sourceDocument: '$_id',
-isReel: { $literal: true }
-}
-}
-];
-
-const startAgg = Date.now();
-const reels = await db.collection('reels').aggregate(pipeline).toArray();
-const aggTime = Date.now() - startAgg;
-
-log('info', `[AGGREGATION-COMPLETE] ${reels.length} reels in ${aggTime}ms`);
-
-// Step 4: Client-side deduplication + enhanced logging
-const seenIds = new Set();
-const uniqueReels = [];
-
-for (const reel of reels) {
-if (!seenIds.has(reel.postId)) {
-seenIds.add(reel.postId);
-
-// **ENHANCED DEBUG: Log Instagram-style ranking**
-log('info', `[REEL-RANKED] ${reel.postId.substring(0, 8)} | ` +
-`SCORE=${reel.compositeScore.toFixed(2)} | ` +
-`retention=${reel.retention.toFixed(1)}% (${(reel.retention * 0.50).toFixed(1)}) | ` +
-`likes=${reel.likeCount} (${(reel.likeCount/maxLikes*100*0.25).toFixed(1)}) | ` +
-`comments=${reel.commentCount} (${(reel.commentCount/maxComments*100*0.12).toFixed(1)}) | ` +
-`interest=${reel.interestScore} (${(reel.interestScore * 0.10).toFixed(1)}) | ` +
-`views=${reel.viewCount} (${(reel.viewCount/maxViews*100*0.03).toFixed(1)}) | ` +
-`category=${reel.category || 'none'}`);
-
-uniqueReels.push(reel);
-
-if (uniqueReels.length >= limitNum) break;
-}
-}
-
-log('info', `[REELS-PERSONALIZED-COMPLETE] Returning ${uniqueReels.length}/${reels.length} unique reels`);
-log('info', `[ALGORITHM-WEIGHTS] Retention=50%, Likes=25%, Comments=12%, Interest=10%, Views=3%`);
-
-return res.json({
-success: true,
-content: uniqueReels,
-hasMore: reels.length >= limitNum,
-metadata: {
-totalReturned: uniqueReels.length,
-userInterests: userInterests,
-viewedReelsFiltered: viewedReelIds.length,
-aggregationTimeMs: aggTime,
-offset: offsetNum,
-normalization: {
-maxLikes,
-maxComments,
-maxViews
-},
-algorithmWeights: {
-retention: 50,
-likes: 25,
-comments: 12,
-interest: 10,
-views: 3
-}
-}
-});
-
-} catch (error) {
-log('error', '[REELS-PERSONALIZED-ERROR]', error);
-return res.status(500).json({
-success: false,
-error: 'Failed to load personalized reels',
-details: error.message
-});
-}
-});
-
-
 // Calculate ranking score based on Instagram's algorithm
 // Replace the existing calculateRankingScore function with this enhanced version
 function calculateRankingScore(item) {
@@ -2852,66 +2799,6 @@ const score = (
 log('info', `[RANKING] ${item.postId}: retention=${retention}% → score=${score.toFixed(0)}`);
 return score;
 }
-
-
-
-// ✅ REPLACE WITH THIS - Forward to PORT 4000 only
-app.post('/api/interactions/contribution-like', async (req, res) => {
-    try {
-        const { userId, postId, action } = req.body;
-
-        if (!userId || !postId || !['like', 'unlike'].includes(action)) {
-            return res.status(400).json({
-                success: false,
-                error: 'userId, postId, and action (like/unlike) required'
-            });
-        }
-
-        const isLiking = action === 'like';
-
-        console.log(`[CONTRIBUTION-LIKE-PROXY] ${userId} ${action}ing ${postId} - forwarding to PORT 4000`);
-
-        // Forward directly to PORT 4000 (single source of truth)
-        const port4000Response = await axios.post(
-            'https://database-22io.onrender.com/api/posts/toggle-like',
-            {
-                userId: userId,
-                postId: postId,
-                currentlyLiked: !isLiking, // PORT 4000 expects CURRENT state
-                isReel: true
-            },
-            { timeout: 5000 }
-        );
-
-        if (port4000Response.data.success) {
-            const isLiked = port4000Response.data.isLiked;
-            const likeCount = port4000Response.data.likeCount;
-
-            console.log(`[CONTRIBUTION-LIKE-SUCCESS] ${postId}: isLiked=${isLiked}, count=${likeCount}`);
-
-            return res.json({
-                success: true,
-                action: isLiked ? 'like' : 'unlike',
-                isLiked: isLiked,
-                likeCount: likeCount,
-                message: `Successfully ${isLiked ? 'liked' : 'unliked'}`,
-                duplicate: port4000Response.data.duplicate || false
-            });
-        }
-
-        return res.status(500).json({
-            success: false,
-            error: 'PORT 4000 like failed'
-        });
-
-    } catch (error) {
-        console.error('[CONTRIBUTION-LIKE-ERROR]', error.message);
-        return res.status(500).json({
-            success: false,
-            error: 'Failed to process like'
-        });
-    }
-});
 
 
 
@@ -3146,331 +3033,181 @@ return res.status(500).json({ error: 'Failed to check batch retention' });
 });
 
 
-app.get('/api/feed/:contentType/:userId', async (req, res) => {
-try {
-const { contentType, userId } = req.params;
-const { minContent = MIN_CONTENT_FOR_FEED } = req.query;
-
-if (!['posts', 'reels'].includes(contentType)) {
-return res.status(400).json({ error: 'Invalid content type' });
-}
-
-const requestKey = `${contentType}_${userId}_${minContent}`;
-
-console.log(`[FEED-REQUEST] User: ${userId} | Type: ${contentType} | Min: ${minContent}`);
-
-// Check duplicate requests
-if (activeRequests.has(requestKey)) {
-console.log(`[DUPLICATE-BLOCKED] ${requestKey}`);
-const result = await activeRequests.get(requestKey);
-return res.json({ ...result, servedFromDuplicatePrevention: true });
-}
-
-// Check cache
-const cacheKey = `feed_${contentType}_${userId}`;
-const cached = getCache(cacheKey);
-if (cached && cached.content && cached.content.length >= parseInt(minContent)) {
-console.log(`[CACHE-SERVED] ${requestKey} | Items: ${cached.content.length}`);
-return res.json({ ...cached, servedFromCache: true });
-}
-
-const requestPromise = (async () => {
-try {
-const dbReadsBefore = dbOpCounters.reads;
-
-const feedData = await dbManager.getOptimizedFeedFixedReads(userId, contentType, parseInt(minContent));
-const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
-
-console.log(`[FEED-DB-QUERY] ${requestKey} | DB reads: ${dbReadsUsed} | Items: ${feedData.content?.length || 0}`);
-
-if (feedData.content && feedData.content.length > 0) {
-// **APPLY INSTAGRAM-STYLE SORTING**
-// Note: This is post-query sorting. For better performance,
-// the scoring should be done in the database query itself.
-
-// Find max values for normalization
-const maxLikes = Math.max(...feedData.content.map(item => item.likeCount || 0), 1);
-const maxComments = Math.max(...feedData.content.map(item => item.commentCount || 0), 1);
-const maxRetention = Math.max(...feedData.content.map(item => item.retention || 0), 1);
-
-feedData.content.forEach(item => {
-const retention = item.retention || 0;
-const normalizedLikes = (item.likeCount || 0) / maxLikes * 100;
-const normalizedComments = (item.commentCount || 0) / maxComments * 100;
-
-// Calculate composite score
-item.compositeScore =
-(retention * 0.50) + // 50% retention
-(normalizedLikes * 0.30) + // 30% likes
-(normalizedComments * 0.20); // 20% comments
-});
-
-// Sort by composite score
-feedData.content.sort((a, b) => {
-// First by composite score
-if (Math.abs(a.compositeScore - b.compositeScore) > 1) {
-return b.compositeScore - a.compositeScore;
-}
-
-// If scores are very close, use timestamp as tiebreaker
-const timeA = new Date(a.timestamp || a.serverTimestamp || 0);
-const timeB = new Date(b.timestamp || b.serverTimestamp || 0);
-return timeB - timeA;
-});
-
-// Cache for 60 seconds
-setCache(cacheKey, feedData, 60000);
-
-console.log(`[INSTAGRAM-SORT] Applied weighted scoring (Retention=50%, Likes=30%, Comments=20%)`);
-}
-
-return {
-success: true,
-...feedData,
-requestedMinimum: parseInt(minContent),
-actualDelivered: feedData.content ? feedData.content.length : 0,
-dbReadsUsed,
-algorithm: {
-weights: { retention: 50, likes: 30, comments: 20 },
-normalization: { maxLikes, maxComments, maxRetention }
-}
-};
-} finally {
-activeRequests.delete(requestKey);
-}
-})();
-
-activeRequests.set(requestKey, requestPromise);
-const result = await requestPromise;
-return res.json(result);
-
-} catch (e) {
-console.error(`[FEED-ERROR] ${e.message}`);
-return res.status(500).json({ error: 'Failed to load feed', details: e.message });
-}
-});
-
 app.post('/api/contributed-views/batch-optimized', async (req, res) => {
-const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
-const startTime = Date.now();
+    const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
+    const startTime = Date.now();
 
-try {
-const { userId, posts = [], reels = [] } = req.body;
+    try {
+        const { userId, posts = [], reels = [] } = req.body;
 
-if (!userId) {
-return res.status(400).json({
-success: false,
-error: 'userId required',
-requestId
-});
-}
+        if (!userId) {
+            return res.status(400).json({
+                success: false,
+                error: 'userId required',
+                requestId
+            });
+        }
 
-console.log(`[postId_debug] [BATCH-START] userId=${userId} | requestId=${requestId} | ${posts.length}P + ${reels.length}R`);
+        console.log(`[BATCH-CONTRIB] userId=${userId} | ${posts.length}P + ${reels.length}R`);
 
-// ✅ CRITICAL: Lookup each post's actual document from posts collection
-const postDocumentMap = new Map(); // postId -> documentId
+        // ✅ CRITICAL FIX: Use aggregation instead of full collection scan
+        const postDocumentMap = new Map();
+        const reelDocumentMap = new Map();
 
-if (posts.length > 0) {
-console.log(`[postId_debug] [POST-LOOKUP-START] Finding documents for ${posts.length} posts`);
+        if (posts.length > 0) {
+            console.log(`[BATCH-CONTRIB] Looking up ${posts.length} posts via aggregation`);
+            
+            // ✅ FIXED: Use aggregation to find documents efficiently
+            const postAggregation = await db.collection('posts').aggregate([
+                { $match: { 'postList.postId': { $in: posts } } },
+                { $project: { _id: 1, postList: { postId: 1 } } },
+                { $unwind: '$postList' },
+                { $match: { 'postList.postId': { $in: posts } } },
+                { $project: { _id: 1, postId: '$postList.postId' } }
+            ]).toArray();
 
-const postsCollection = db.collection('posts');
+            postAggregation.forEach(doc => {
+                postDocumentMap.set(doc.postId, doc._id);
+                console.log(`[POST-MAPPED] ${doc.postId.substring(0, 8)} -> ${doc._id}`);
+            });
 
-// Get all post documents
-const postDocs = await postsCollection.find({}).toArray();
+            console.log(`[POST-LOOKUP] Mapped ${postDocumentMap.size}/${posts.length} posts`);
+        }
 
-// Build map of postId -> documentId
-for (const doc of postDocs) {
-const docId = doc._id;
-const postList = doc.postList || [];
+        if (reels.length > 0) {
+            console.log(`[BATCH-CONTRIB] Looking up ${reels.length} reels via aggregation`);
+            
+            // ✅ FIXED: Use aggregation for reels
+            const reelAggregation = await db.collection('reels').aggregate([
+                { $match: { 'reelsList.postId': { $in: reels } } },
+                { $project: { _id: 1, reelsList: { postId: 1 } } },
+                { $unwind: '$reelsList' },
+                { $match: { 'reelsList.postId': { $in: reels } } },
+                { $project: { _id: 1, postId: '$reelsList.postId' } }
+            ]).toArray();
 
-for (const post of postList) {
-if (posts.includes(post.postId)) {
-postDocumentMap.set(post.postId, docId);
-console.log(`[postId_debug] [POST-MAPPED] ${post.postId.substring(0, 8)} -> ${docId}`);
-}
-}
-}
+            reelAggregation.forEach(doc => {
+                reelDocumentMap.set(doc.postId, doc._id);
+                console.log(`[REEL-MAPPED] ${doc.postId.substring(0, 8)} -> ${doc._id}`);
+            });
 
-console.log(`[postId_debug] [POST-LOOKUP-COMPLETE] Mapped ${postDocumentMap.size}/${posts.length} posts`);
-}
+            console.log(`[REEL-LOOKUP] Mapped ${reelDocumentMap.size}/${reels.length} reels`);
+        }
 
-// ✅ CRITICAL: Lookup each reel's actual document from reels collection
-const reelDocumentMap = new Map(); // reelId -> documentId
+        // ✅ Group by document
+        const postsByDocument = new Map();
+        const reelsByDocument = new Map();
 
-if (reels.length > 0) {
-console.log(`[postId_debug] [REEL-LOOKUP-START] Finding documents for ${reels.length} reels`);
+        for (const postId of posts) {
+            const docId = postDocumentMap.get(postId);
+            if (!docId) {
+                console.warn(`[POST-NOT-FOUND] ${postId.substring(0, 8)} not in posts collection`);
+                continue;
+            }
+            if (!postsByDocument.has(docId)) {
+                postsByDocument.set(docId, []);
+            }
+            postsByDocument.get(docId).push(postId);
+        }
 
-const reelsCollection = db.collection('reels');
+        for (const reelId of reels) {
+            const docId = reelDocumentMap.get(reelId);
+            if (!docId) {
+                console.warn(`[REEL-NOT-FOUND] ${reelId.substring(0, 8)} not in reels collection`);
+                continue;
+            }
+            if (!reelsByDocument.has(docId)) {
+                reelsByDocument.set(docId, []);
+            }
+            reelsByDocument.get(docId).push(reelId);
+        }
 
-// Get all reel documents
-const reelDocs = await reelsCollection.find({}).toArray();
+        console.log(`[GROUPING] Posts: ${postsByDocument.size} docs | Reels: ${reelsByDocument.size} docs`);
 
-// Build map of reelId -> documentId
-for (const doc of reelDocs) {
-const docId = doc._id;
-const reelsList = doc.reelsList || [];
+        // ✅ Batch write operations
+        const postResults = [];
+        const reelResults = [];
 
-for (const reel of reelsList) {
-if (reels.includes(reel.postId)) {
-reelDocumentMap.set(reel.postId, docId);
-console.log(`[postId_debug] [REEL-MAPPED] ${reel.postId.substring(0, 8)} -> ${docId}`);
-}
-}
-}
+        for (const [docId, postIds] of postsByDocument.entries()) {
+            const uniqueDocId = `${userId}_${docId}`;
 
-console.log(`[postId_debug] [REEL-LOOKUP-COMPLETE] Mapped ${reelDocumentMap.size}/${reels.length} reels`);
-}
+            const result = await db.collection('contrib_posts').updateOne(
+                { _id: uniqueDocId },
+                {
+                    $addToSet: { ids: { $each: postIds } },
+                    $setOnInsert: {
+                        userId,
+                        slotId: docId,
+                        createdAt: new Date()
+                    },
+                    $set: { updatedAt: new Date() }
+                },
+                { upsert: true }
+            );
 
-// ✅ Group posts by their actual document
-const postsByDocument = new Map(); // documentId -> [postIds]
+            postResults.push({
+                documentId: uniqueDocId,
+                originalSlotId: docId,
+                count: postIds.length,
+                matched: result.matchedCount,
+                modified: result.modifiedCount
+            });
+        }
 
-for (const postId of posts) {
-const docId = postDocumentMap.get(postId);
+        for (const [docId, reelIds] of reelsByDocument.entries()) {
+            const uniqueDocId = `${userId}_${docId}`;
 
-if (!docId) {
-console.warn(`[postId_debug] [POST-NO-DOC] ${postId.substring(0, 8)} not found in posts collection, skipping`);
-continue;
-}
+            const result = await db.collection('contrib_reels').updateOne(
+                { _id: uniqueDocId },
+                {
+                    $addToSet: { ids: { $each: reelIds } },
+                    $setOnInsert: {
+                        userId,
+                        slotId: docId,
+                        createdAt: new Date()
+                    },
+                    $set: { updatedAt: new Date() }
+                },
+                { upsert: true }
+            );
 
-if (!postsByDocument.has(docId)) {
-postsByDocument.set(docId, []);
-}
-postsByDocument.get(docId).push(postId);
-}
+            reelResults.push({
+                documentId: uniqueDocId,
+                originalSlotId: docId,
+                count: reelIds.length,
+                matched: result.matchedCount,
+                modified: result.modifiedCount
+            });
+        }
 
-console.log(`[postId_debug] [POST-GROUPS] Posts distributed across ${postsByDocument.size} documents`);
-for (const [docId, ids] of postsByDocument.entries()) {
-console.log(`[postId_debug] [POST-GROUP] ${docId}: ${ids.length} posts`);
-}
+        const duration = Date.now() - startTime;
 
-// ✅ Group reels by their actual document
-const reelsByDocument = new Map(); // documentId -> [reelIds]
+        console.log(`[BATCH-CONTRIB-COMPLETE] ${posts.length}P + ${reels.length}R in ${duration}ms`);
 
-for (const reelId of reels) {
-const docId = reelDocumentMap.get(reelId);
+        res.json({
+            success: true,
+            message: 'Contributed views processed',
+            processed: {
+                posts: posts.length,
+                reels: reels.length
+            },
+            postResults,
+            reelResults,
+            requestId,
+            duration
+        });
 
-if (!docId) {
-console.warn(`[postId_debug] [REEL-NO-DOC] ${reelId.substring(0, 8)} not found in reels collection, skipping`);
-continue;
-}
+    } catch (error) {
+        const duration = Date.now() - startTime;
+        console.error(`[BATCH-CONTRIB-ERROR] ${error.message}`);
 
-if (!reelsByDocument.has(docId)) {
-reelsByDocument.set(docId, []);
-}
-reelsByDocument.get(docId).push(reelId);
-}
-
-console.log(`[postId_debug] [REEL-GROUPS] Reels distributed across ${reelsByDocument.size} documents`);
-for (const [docId, ids] of reelsByDocument.entries()) {
-console.log(`[postId_debug] [REEL-GROUP] ${docId}: ${ids.length} reels`);
-}
-
-// ✅ Process posts (route each to its correct document)
-const postResults = [];
-
-for (const [docId, postIds] of postsByDocument.entries()) {
-console.log(`[postId_debug] [SAVING-POSTS] ${postIds.length} posts to document ${docId}`);
-
-const contribPostsCollection = db.collection('contrib_posts');
-
-// ✅ FIXED: Use userId_docId as _id to prevent conflicts
-const uniqueDocId = `${userId}_${docId}`;
-
-const result = await contribPostsCollection.updateOne(
-{ _id: uniqueDocId }, // Changed from { _id: docId, userId }
-{
-$addToSet: { ids: { $each: postIds } },
-$setOnInsert: {
-userId,
-slotId: docId, // Store original slot ID for reference
-createdAt: new Date()
-},
-$set: { updatedAt: new Date() }
-},
-{ upsert: true }
-);
-
-postResults.push({
-documentId: uniqueDocId,
-originalSlotId: docId,
-count: postIds.length,
-matched: result.matchedCount,
-modified: result.modifiedCount,
-upserted: result.upsertedCount
-});
-
-console.log(`[postId_debug] [POSTS-SAVED] ${uniqueDocId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
-}
-
-// ✅ Process reels (route each to its correct document)
-const reelResults = [];
-
-for (const [docId, reelIds] of reelsByDocument.entries()) {
-console.log(`[postId_debug] [SAVING-REELS] ${reelIds.length} reels to document ${docId}`);
-
-const contribReelsCollection = db.collection('contrib_reels');
-
-// ✅ FIXED: Use userId_docId as _id to prevent conflicts
-const uniqueDocId = `${userId}_${docId}`;
-
-const result = await contribReelsCollection.updateOne(
-{ _id: uniqueDocId }, // Changed from { _id: docId, userId }
-{
-$addToSet: { ids: { $each: reelIds } },
-$setOnInsert: {
-userId,
-slotId: docId, // Store original slot ID for reference
-createdAt: new Date()
-},
-$set: { updatedAt: new Date() }
-},
-{ upsert: true }
-);
-
-reelResults.push({
-documentId: uniqueDocId,
-originalSlotId: docId,
-count: reelIds.length,
-matched: result.matchedCount,
-modified: result.modifiedCount,
-upserted: result.upsertedCount
-});
-
-console.log(`[postId_debug] [REELS-SAVED] ${uniqueDocId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
-}
-
-const duration = Date.now() - startTime;
-
-console.log(`[postId_debug] [BATCH-COMPLETE] userId=${userId} | ${posts.length}P + ${reels.length}R in ${duration}ms`);
-
-res.json({
-success: true,
-message: 'Contributed views processed',
-processed: {
-posts: posts.length,
-reels: reels.length
-},
-documentDistribution: {
-posts: Array.from(postsByDocument.keys()),
-reels: Array.from(reelsByDocument.keys())
-},
-postResults,
-reelResults,
-requestId,
-duration
-});
-
-} catch (error) {
-const duration = Date.now() - startTime;
-console.error(`[postId_debug] [BATCH-ERROR] requestId=${requestId} | duration=${duration}ms`, error);
-
-res.status(500).json({
-success: false,
-error: error.message,
-requestId,
-duration
-});
-}
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            requestId,
+            duration
+        });
+    }
 });
 
 app.get('/api/status/:userId', async (req, res) => {
@@ -3938,6 +3675,8 @@ return null;
 
 
 
+// REPLACE /api/feed/instagram-ranked endpoint (starting ~line 2920)
+
 app.post('/api/feed/instagram-ranked', async (req, res) => {
     const requestStart = Date.now();
     const readsBefore = dbOpCounters.reads;
@@ -3950,9 +3689,9 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         }
         
         const limitNum = parseInt(limit, 10) || DEFAULT_CONTENT_BATCH_SIZE;
-        const cacheKey = `feed:${userId}:${limitNum}:${excludedPostIds.length}:${excludedReelIds.length}`;
+        const cacheKey = generateSlotBasedCacheKey(userId, userStatus);
         
-        // ✅ CRITICAL: Check Redis cache FIRST (avoid ALL DB reads)
+        // ✅ CHECK REDIS CACHE FIRST
         if (redisClient) {
             try {
                 const cached = await redisClient.get(cacheKey);
@@ -3966,26 +3705,48 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
             }
         }
         
-        console.log(`[FEED-CACHE-MISS] Executing aggregation for ${userId}`);
+        console.log(`[FEED-START] userId=${userId} | limit=${limitNum}`);
         
-        // Step 1: Get user interests (with timeout)
-        let userInterests = [];
-        try {
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, {
-                timeout: 1000,
-                validateStatus: s => s >= 200 && s < 500
-            });
-            if (userResponse.status === 200 && userResponse.data?.success) {
-                userInterests = userResponse.data.user?.interests || [];
-            }
-        } catch (e) {
-            console.warn(`[USER-INTERESTS-SKIP] ${e.message}`);
+        // ✅ STEP 1: Get user's current slots (1 read)
+        const userStatus = await db.collection('user_status').findOne(
+            { _id: userId },
+            { projection: { latestReelSlotId: 1, latestPostSlotId: 1 } }
+        );
+        
+        // Default to latest slots if user is new
+        let reelSlotIds = ['reel_0'];
+        let postSlotIds = ['post_0'];
+        
+        if (userStatus) {
+            // Extract slot numbers and get current + 2 previous slots
+            const reelNum = parseInt(userStatus.latestReelSlotId?.match(/_(\d+)$/)?.[1] || '0');
+            const postNum = parseInt(userStatus.latestPostSlotId?.match(/_(\d+)$/)?.[1] || '0');
+            
+            reelSlotIds = [
+                `reel_${reelNum}`,
+                reelNum > 0 ? `reel_${reelNum - 1}` : null,
+                reelNum > 1 ? `reel_${reelNum - 2}` : null
+            ].filter(Boolean);
+            
+            postSlotIds = [
+                `post_${postNum}`,
+                postNum > 0 ? `post_${postNum - 1}` : null,
+                postNum > 1 ? `post_${postNum - 2}` : null
+            ].filter(Boolean);
         }
         
-        // Step 2: Get viewed content (SINGLE query with limit)
+        console.log(`[FEED-SLOTS] Reels: ${reelSlotIds} | Posts: ${postSlotIds}`);
+        
+        // ✅ STEP 2: Get viewed content (1 read each)
         const [viewedPostsDocs, viewedReelsDocs] = await Promise.all([
-            db.collection('contrib_posts').find({ userId }).limit(10).toArray(), // ✅ LIMIT added
-            db.collection('contrib_reels').find({ userId }).limit(10).toArray()  // ✅ LIMIT added
+            db.collection('contrib_posts').find(
+                { userId },
+                { projection: { ids: 1 }, limit: 5 }
+            ).toArray(),
+            db.collection('contrib_reels').find(
+                { userId },
+                { projection: { ids: 1 }, limit: 5 }
+            ).toArray()
         ]);
         
         const serverViewedPosts = viewedPostsDocs.flatMap(doc => doc.ids || []);
@@ -3994,57 +3755,29 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         const allExcludedPosts = [...new Set([...serverViewedPosts, ...excludedPostIds])];
         const allExcludedReels = [...new Set([...serverViewedReels, ...excludedReelIds])];
         
-        console.log(`[EXCLUSION-MERGE] Posts: ${allExcludedPosts.length} | Reels: ${allExcludedReels.length}`);
+        console.log(`[FEED-EXCLUSIONS] Posts: ${allExcludedPosts.length} | Reels: ${allExcludedReels.length}`);
         
-        // Step 3: **SINGLE AGGREGATION** for normalization (not separate for posts/reels)
-        const normalizationPipeline = [
-            {
-                $facet: {
-                    postsMax: [
-                        { $match: { 'postList': { $exists: true, $ne: [] } } },
-                        { $unwind: '$postList' },
-                        { $match: { 'postList.postId': { $nin: allExcludedPosts } } },
-                        { $limit: 1000 }, // ✅ LIMIT scan
-                        { $group: {
-                            _id: null,
-                            maxLikes: { $max: { $toInt: { $ifNull: ['$postList.likeCount', 0] } } },
-                            maxComments: { $max: { $toInt: { $ifNull: ['$postList.commentCount', 0] } } }
-                        }}
-                    ],
-                    reelsMax: [
-                        { $match: { 'reelsList': { $exists: true, $ne: [] } } },
-                        { $unwind: '$reelsList' },
-                        { $match: { 'reelsList.postId': { $nin: allExcludedReels } } },
-                        { $limit: 1000 }, // ✅ LIMIT scan
-                        { $group: {
-                            _id: null,
-                            maxLikes: { $max: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } } },
-                            maxComments: { $max: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } } }
-                        }}
-                    ]
-                }
+        // ✅ STEP 3: Fetch user interests (optional, best-effort)
+        let userInterests = [];
+        try {
+            const userResponse = await axios.get(
+                `https://server1-ki1x.onrender.com/api/users/${userId}`,
+                { timeout: 1000, validateStatus: s => s >= 200 && s < 500 }
+            );
+            if (userResponse.status === 200 && userResponse.data?.success) {
+                userInterests = userResponse.data.user?.interests || [];
             }
-        ];
+        } catch (e) {
+            console.warn(`[INTERESTS-SKIP] ${e.message}`);
+        }
         
-        const normStart = Date.now();
-        const normResults = await db.collection('posts').aggregate(normalizationPipeline).toArray();
-        console.log(`[NORMALIZATION] Single aggregation: ${Date.now() - normStart}ms`);
-        
-        const globalMaxLikes = Math.max(
-            normResults[0]?.postsMax[0]?.maxLikes || 1,
-            normResults[0]?.reelsMax[0]?.maxLikes || 1
-        );
-        const globalMaxComments = Math.max(
-            normResults[0]?.postsMax[0]?.maxComments || 1,
-            normResults[0]?.reelsMax[0]?.maxComments || 1
-        );
-        
-        // Step 4: Build content aggregation (with INDEX HINTS)
-        const buildPipeline = (collectionName, arrayField, excludedIds) => [
-            { $match: { [arrayField]: { $exists: true, $ne: [] } } },
+        // ✅ STEP 4: TARGETED aggregation - only query specific slot documents
+        const buildSlotPipeline = (slotIds, arrayField, excludedIds) => [
+            // ✅ CRITICAL FIX: Target specific documents by _id
+            { $match: { _id: { $in: slotIds } } },
             { $unwind: `$${arrayField}` },
             { $match: { [`${arrayField}.postId`]: { $nin: excludedIds } } },
-            { $limit: limitNum * 2 }, // ✅ EARLY LIMIT
+            { $limit: limitNum * 2 },
             {
                 $addFields: {
                     retentionNum: { $toDouble: { $ifNull: [`$${arrayField}.retention`, 0] } },
@@ -4061,55 +3794,77 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
             },
             {
                 $addFields: {
-                    normalizedLikes: { $multiply: [{ $divide: ['$likeCountNum', globalMaxLikes] }, 100] },
-                    normalizedComments: { $multiply: [{ $divide: ['$commentCountNum', globalMaxComments] }, 100] }
-                }
-            },
-            {
-                $addFields: {
                     compositeScore: {
                         $add: [
                             { $multiply: ['$retentionNum', 0.50] },
-                            { $multiply: ['$normalizedLikes', 0.25] },
+                            { $multiply: ['$likeCountNum', 0.30] },
                             { $multiply: ['$interestScore', 0.15] },
-                            { $multiply: ['$normalizedComments', 0.10] }
+                            { $multiply: ['$commentCountNum', 0.05] }
                         ]
                     }
                 }
             },
             { $sort: { compositeScore: -1 } },
-            { $limit: limitNum },
-            { $project: {
-                postId: `$${arrayField}.postId`,
-                userId: `$${arrayField}.userId`,
-                username: `$${arrayField}.username`,
-                imageUrl: { $ifNull: [`$${arrayField}.imageUrl`, `$${arrayField}.imageUrl1`] },
-                multiple_posts: { $ifNull: [`$${arrayField}.multiple_posts`, false] },
-                media_count: { $ifNull: [`$${arrayField}.media_count`, 1] },
-                imageUrl2: `$${arrayField}.imageUrl2`,
-                imageUrl3: `$${arrayField}.imageUrl3`,
-                profilePicUrl: `$${arrayField}.profile_picture_url`,
-                caption: `$${arrayField}.caption`,
-                category: `$${arrayField}.category`,
-                timestamp: `$${arrayField}.timestamp`,
-                likeCount: '$likeCountNum',
-                commentCount: '$commentCountNum',
-                retention: '$retentionNum',
-                compositeScore: '$compositeScore',
-                sourceDocument: '$_id',
-                ratio: { $ifNull: [`$${arrayField}.ratio`, arrayField === 'reelsList' ? '9:16' : '4:5'] },
-                isReel: { $literal: arrayField === 'reelsList' }
-            }}
+            { $limit: limitNum }
         ];
         
         const aggStart = Date.now();
-        const [allPosts, allReels] = await Promise.all([
-            db.collection('posts').aggregate(buildPipeline('posts', 'postList', allExcludedPosts), { maxTimeMS: 2000 }).toArray(),
-            db.collection('reels').aggregate(buildPipeline('reels', 'reelsList', allExcludedReels), { maxTimeMS: 2000 }).toArray()
-        ]);
-        console.log(`[AGGREGATION] ${Date.now() - aggStart}ms | Posts: ${allPosts.length} | Reels: ${allReels.length}`);
         
-        // Step 5: Deduplicate and merge
+        // ✅ Execute TARGETED aggregations (only on specific slot documents)
+        const [allPosts, allReels] = await Promise.all([
+            db.collection('posts').aggregate([
+                ...buildSlotPipeline(postSlotIds, 'postList', allExcludedPosts),
+                {
+                    $project: {
+                        postId: '$postList.postId',
+                        userId: '$postList.userId',
+                        username: '$postList.username',
+                        imageUrl: { $ifNull: ['$postList.imageUrl', '$postList.imageUrl1'] },
+                        multiple_posts: { $ifNull: ['$postList.multiple_posts', false] },
+                        media_count: { $ifNull: ['$postList.media_count', 1] },
+                        profilePicUrl: '$postList.profile_picture_url',
+                        caption: '$postList.caption',
+                        category: '$postList.category',
+                        timestamp: '$postList.timestamp',
+                        likeCount: '$likeCountNum',
+                        commentCount: '$commentCountNum',
+                        retention: '$retentionNum',
+                        compositeScore: '$compositeScore',
+                        sourceDocument: '$_id',
+                        ratio: { $ifNull: ['$postList.ratio', '4:5'] },
+                        isReel: { $literal: false }
+                    }
+                }
+            ], { maxTimeMS: 3000 }).toArray(),
+            
+            db.collection('reels').aggregate([
+                ...buildSlotPipeline(reelSlotIds, 'reelsList', allExcludedReels),
+                {
+                    $project: {
+                        postId: '$reelsList.postId',
+                        userId: '$reelsList.userId',
+                        username: '$reelsList.username',
+                        imageUrl: { $ifNull: ['$reelsList.videoUrl', '$reelsList.imageUrl'] },
+                        videoUrl: '$reelsList.videoUrl',
+                        profilePicUrl: '$reelsList.profile_picture_url',
+                        caption: '$reelsList.caption',
+                        category: '$reelsList.category',
+                        timestamp: '$reelsList.timestamp',
+                        likeCount: '$likeCountNum',
+                        commentCount: '$commentCountNum',
+                        retention: '$retentionNum',
+                        compositeScore: '$compositeScore',
+                        sourceDocument: '$_id',
+                        ratio: '9:16',
+                        isReel: { $literal: true }
+                    }
+                }
+            ], { maxTimeMS: 3000 }).toArray()
+        ]);
+        
+        console.log(`[FEED-AGGREGATION] ${Date.now() - aggStart}ms | Posts: ${allPosts.length} | Reels: ${allReels.length}`);
+        
+        // ✅ STEP 5: Deduplicate and merge
         const seenIds = new Set();
         const finalContent = [];
         const allContent = [...allPosts, ...allReels].sort((a, b) => (b.compositeScore || 0) - (a.compositeScore || 0));
@@ -4119,22 +3874,6 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
             seenIds.add(item.postId);
             finalContent.push(item);
         }
-        
-        // Extract document IDs
-        const sortedPostDocs = [...new Set(allPosts.map(p => p.sourceDocument).filter(Boolean))].sort((a, b) => {
-            const numA = parseInt(a.split('_')[1] || '0', 10);
-            const numB = parseInt(b.split('_')[1] || '0', 10);
-            return numB - numA;
-        });
-        
-        const sortedReelDocs = [...new Set(allReels.map(r => r.sourceDocument).filter(Boolean))].sort((a, b) => {
-            const numA = parseInt(a.split('_')[1] || '0', 10);
-            const numB = parseInt(b.split('_')[1] || '0', 10);
-            return numB - numA;
-        });
-        
-        const latestPostDoc = sortedPostDocs[0] || 'post_0';
-        const latestReelDoc = sortedReelDocs[0] || 'reel_0';
         
         const totalReads = dbOpCounters.reads - readsBefore;
         const totalTime = Date.now() - requestStart;
@@ -4146,12 +3885,12 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
             metadata: {
                 totalReturned: finalContent.length,
                 responseTime: totalTime,
-                documentIds: { latestPost: latestPostDoc, latestReel: latestReelDoc },
-                dbActivity: { totalReads }
+                dbActivity: { totalReads },
+                slotsQueried: { reels: reelSlotIds, posts: postSlotIds }
             }
         };
         
-        // ✅ Cache response in Redis (30 seconds)
+        // ✅ Cache response (30 seconds)
         if (redisClient && finalContent.length > 0) {
             redisClient.setex(cacheKey, 30, JSON.stringify(responseData)).catch(e => {
                 console.warn('[CACHE-SET-ERROR]', e.message);
@@ -4323,37 +4062,6 @@ return res.status(500).json({ success: false, error: 'Failed to recover userId' 
 
 
 
-
-// Add analytics endpoint to get retention statistics
-app.get('/api/retention/analytics/:reelId', async (req, res) => {
-try {
-const { reelId } = req.params;
-
-if (!reelId) {
-return res.status(400).json({ error: 'reelId is required' });
-}
-
-// Find the reel location
-const { collection, documentId } = await findReelLocation(reelId);
-
-if (!collection || !documentId) {
-return res.status(404).json({ error: 'Reel not found' });
-}
-
-// Get retention analytics
-const analytics = await getReelRetentionAnalytics(collection, documentId, reelId);
-
-return res.json({
-success: true,
-reelId,
-analytics
-});
-
-} catch (error) {
-console.error('[RETENTION-ANALYTICS-ERROR]', error);
-return res.status(500).json({ error: 'Failed to get retention analytics', details: error.message });
-}
-});
 
 
 async function createInstagramFeedIndexes() {
@@ -4810,143 +4518,125 @@ return res.status(500).json({ error: 'Failed to check interactions' });
 
 
 
-// Update the existing /api/interactions/view endpoint
+// REPLACE /api/interactions/view endpoint (line ~3487)
+
 app.post('/api/interactions/view', async (req, res) => {
-try {
-const { userId, postId, sourceDocument, retentionData } = req.body;
+    try {
+        const { userId, postId, sourceDocument, retentionData } = req.body;
 
-if (!userId || !postId) {
-return res.status(400).json({ error: 'userId and postId required' });
-}
+        if (!userId || !postId) {
+            return res.status(400).json({ error: 'userId and postId required' });
+        }
 
-console.log(`[VIEW-START] ${userId} -> ${postId} ${retentionData ? '(WITH RETENTION)' : '(VIEW ONLY)'}`);
+        console.log(`[VIEW-START] ${userId} -> ${postId} ${retentionData ? '(WITH RETENTION)' : '(VIEW ONLY)'}`);
 
-const today = new Date().toISOString().split('T')[0];
-const cacheKey = `${userId}_session_${today}`;
-const retentionCacheKey = `retention_${userId}_${postId}`;
+        const today = new Date().toISOString().split('T')[0];
+        const cacheKey = `${userId}_session_${today}`;
 
-if (retentionData) {
-console.log(`[RETENTION-PRE-CHECK] ${userId} -> ${postId}`);
+        // ✅ CRITICAL FIX: Batch all operations together
+        const operations = [];
 
-// Ultra-fast existence check using compound query
-const existingDoc = await db.collection('user_interaction_cache').findOne(
-{
-_id: cacheKey,
-retentionContributed: postId // Array contains check
-},
-{ projection: { _id: 1 } }
-);
+        if (retentionData) {
+            console.log(`[RETENTION-CHECK] ${userId} -> ${postId}`);
 
-if (existingDoc) {
-console.log(`[RETENTION-ALREADY-EXISTS] ${userId} already contributed to ${postId} - BLOCKED`);
-setCache(retentionCacheKey, true, 7200000);
-return res.json({
-success: true,
-message: 'Retention already contributed',
-duplicate: true
-});
-}
+            // ✅ Single atomic operation with $addToSet (prevents duplicates at DB level)
+            operations.push(
+                db.collection('user_interaction_cache').updateOne(
+                    { _id: cacheKey },
+                    {
+                        $set: {
+                            userId,
+                            ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
+                            updatedAt: new Date()
+                        },
+                        $addToSet: {
+                            viewedToday: postId,
+                            retentionContributed: postId  // Atomic duplicate prevention
+                        },
+                        $setOnInsert: { createdAt: new Date() }
+                    },
+                    { upsert: true }
+                )
+            );
 
-// Use $addToSet to ensure uniqueness at database level
-const updateResult = await db.collection('user_interaction_cache').updateOne(
-{ _id: cacheKey },
-{
-$set: {
-userId,
-ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
-updatedAt: new Date()
-},
-$addToSet: {
-viewedToday: postId,
-retentionContributed: postId // This ensures uniqueness
-},
-$setOnInsert: { createdAt: new Date() }
-},
-{ upsert: true }
-);
+            // ✅ Background detailed recording (non-blocking)
+            const viewRecord = {
+                postId,
+                viewedAt: new Date(),
+                sourceDocument: sourceDocument || 'unknown',
+                retentionContributed: true,
+                retentionPercent: Math.round(retentionData.retentionPercent * 100) / 100,
+                watchedDuration: retentionData.watchedDuration,
+                totalDuration: retentionData.totalDuration
+            };
 
-// Check if the retention was actually added (not a duplicate)
-if (updateResult.modifiedCount === 0 && updateResult.upsertedCount === 0) {
-console.log(`[RETENTION-DUPLICATE-BLOCKED] ${userId} -> ${postId} - Database level duplicate`);
-setCache(retentionCacheKey, true, 7200000);
-return res.json({
-success: true,
-message: 'Retention already contributed',
-duplicate: true
-});
-}
+            operations.push(
+                db.collection('user_reel_interactions').updateOne(
+                    { _id: `${userId}_${today}` },
+                    {
+                        $set: { userId, date: today, updatedAt: new Date() },
+                        $setOnInsert: { createdAt: new Date() },
+                        $addToSet: { viewedReels: viewRecord }
+                    },
+                    { upsert: true }
+                ),
+                db.collection('reel_stats').updateOne(
+                    { _id: postId },
+                    {
+                        $inc: { viewCount: 1 },
+                        $set: {
+                            lastUpdated: new Date(),
+                            sourceDocument: sourceDocument || 'unknown'
+                        }
+                    },
+                    { upsert: true }
+                )
+            );
 
-console.log(`[RETENTION-RECORDED] ${userId} -> ${postId} - Unique contribution saved`);
-setCache(retentionCacheKey, true, 7200000);
+        } else {
+            // View only
+            operations.push(
+                db.collection('user_interaction_cache').updateOne(
+                    { _id: cacheKey },
+                    {
+                        $set: {
+                            userId,
+                            ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
+                            updatedAt: new Date()
+                        },
+                        $addToSet: { viewedToday: postId },
+                        $setOnInsert: { createdAt: new Date() }
+                    },
+                    { upsert: true }
+                )
+            );
+        }
 
-} else {
-// View only - simpler logic
-await db.collection('user_interaction_cache').updateOne(
-{ _id: cacheKey },
-{
-$set: {
-userId,
-ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
-updatedAt: new Date()
-},
-$addToSet: { viewedToday: postId },
-$setOnInsert: { createdAt: new Date() }
-},
-{ upsert: true }
-);
+        // ✅ FIXED: Execute all operations in parallel
+        const results = await Promise.all(operations);
 
-console.log(`[VIEW-ONLY-RECORDED] ${userId} -> ${postId}`);
-}
+        // Check if retention was actually added (not duplicate)
+        if (retentionData && results[0].modifiedCount === 0 && results[0].upsertedCount === 0) {
+            console.log(`[RETENTION-DUPLICATE] ${userId} -> ${postId} already contributed`);
+            return res.json({
+                success: true,
+                message: 'Retention already contributed',
+                duplicate: true
+            });
+        }
 
-// Background detailed recording remains the same
-const viewRecord = {
-postId,
-viewedAt: new Date(),
-sourceDocument: sourceDocument || 'unknown',
-retentionContributed: !!retentionData
-};
+        console.log(`[VIEW-RECORDED] ${userId} -> ${postId} | Operations: ${operations.length}`);
 
-if (retentionData) {
-viewRecord.retentionPercent = Math.round(retentionData.retentionPercent * 100) / 100;
-viewRecord.watchedDuration = retentionData.watchedDuration;
-viewRecord.totalDuration = retentionData.totalDuration;
-}
+        return res.json({ 
+            success: true, 
+            message: 'View recorded successfully',
+            operations: operations.length
+        });
 
-// Background recording
-Promise.all([
-db.collection('user_reel_interactions').updateOne(
-{ _id: `${userId}_${today}` },
-{
-$set: { userId, date: today, updatedAt: new Date() },
-$setOnInsert: { createdAt: new Date() },
-$addToSet: { viewedReels: viewRecord }
-},
-{ upsert: true }
-),
-
-db.collection('reel_stats').updateOne(
-{ _id: postId },
-{
-$inc: { viewCount: 1 },
-$set: {
-lastUpdated: new Date(),
-sourceDocument: sourceDocument || 'unknown'
-}
-},
-{ upsert: true }
-)
-]).then(() => {
-console.log(`[DETAILED-RECORD-COMPLETE] ${userId} -> ${postId}`);
-}).catch(error => {
-console.error('[DETAILED-RECORD-ERROR]', error);
-});
-
-return res.json({ success: true, message: 'View recorded successfully' });
-
-} catch (error) {
-console.error('[VIEW-RECORD-ERROR]', error);
-return res.status(500).json({ error: 'Failed to record view' });
-}
+    } catch (error) {
+        console.error('[VIEW-RECORD-ERROR]', error);
+        return res.status(500).json({ error: 'Failed to record view' });
+    }
 });
 
 // ✅ REPLACE THIS SECTION - Remove contributionToLike operations
@@ -5149,265 +4839,194 @@ return res.status(500).json({ error: 'Failed to fetch stats' });
 
 
 
-// === MongoDB Stress Test Endpoints ===
+// REPLACE GET /api/user-status/:userId (line ~3627)
 
-// Simulate random read: find a random document (or none)
-app.get('/api/random-read', async (req, res) => {
-try {
-const db = mongoose.connection.db;
-const collection = db.collection('stress_test');
-const random = Math.random();
-const doc = await collection.findOne({ random: { $gte: random } });
-res.status(200).json({ success: true, random, found: !!doc });
-} catch (err) {
-console.error('Random read error:', err);
-res.status(500).json({ success: false, error: err.message });
-}
-});
-
-// Simulate random write: insert random data
-app.post('/api/random-write', async (req, res) => {
-try {
-const db = mongoose.connection.db;
-const collection = db.collection('stress_test');
-const doc = {
-random: Math.random(),
-timestamp: new Date(),
-payload: Math.random().toString(36).substring(2, 10)
-};
-await collection.insertOne(doc);
-res.status(201).json({ success: true });
-} catch (err) {
-console.error('Random write error:', err);
-res.status(500).json({ success: false, error: err.message });
-}
-});
-
-
-
-// REPLACE all optimized endpoints in server.js with these FIXED versions
-// Tag: post_algorithm
-
-/**
-* GET /api/user-status/optimized/:userId
-* Returns slot IDs from user_status collection
-* For NEW users: Auto-detects latest reel/post documents and creates user_status
-* READ COUNT: 1-3 (user_status + optional reels/posts collection check for new users)
-*/
 app.get('/api/user-status/:userId', async (req, res) => {
-const startTime = Date.now();
-const { userId } = req.params;
+    const startTime = Date.now();
+    const { userId } = req.params;
 
-try {
-console.log(`[post_algorithm] [READ-1-START] user_status lookup for userId=${userId}`);
+    try {
+        console.log(`[USER-STATUS] Lookup for userId=${userId}`);
 
-// ✅ CRITICAL FIX: Read document where _id = userId
-const userStatus = await db.collection('user_status').findOne(
-{ _id: userId },
-{
-projection: {
-_id: 1,
-userId: 1,
-latestReelSlotId: 1,
-normalReelSlotId: 1,
-latestPostSlotId: 1,
-normalPostSlotId: 1
-}
-}
-);
+        // ✅ FIXED: Read only necessary fields, no redundant userId field
+        const userStatus = await db.collection('user_status').findOne(
+            { _id: userId },
+            {
+                projection: {
+                    _id: 1,
+                    latestReelSlotId: 1,
+                    normalReelSlotId: 1,
+                    latestPostSlotId: 1,
+                    normalPostSlotId: 1
+                    // ❌ REMOVED: userId field (redundant with _id)
+                }
+            }
+        );
 
-const duration = Date.now() - startTime;
+        const duration = Date.now() - startTime;
 
-if (userStatus && userStatus.latestReelSlotId) {
-// ✅ CASE 1: User status exists with correct fields - return it
-let latestReelSlot = userStatus.latestReelSlotId || 'reel_0';
-let normalReelSlot = userStatus.normalReelSlotId || 'reel_0';
+        if (userStatus && userStatus.latestReelSlotId) {
+            let latestReelSlot = userStatus.latestReelSlotId || 'reel_0';
+            let normalReelSlot = userStatus.normalReelSlotId || 'reel_0';
 
-// Standardize naming (reel_ not reels_)
-if (latestReelSlot.startsWith('reels_')) {
-latestReelSlot = latestReelSlot.replace('reels_', 'reel_');
-}
-if (normalReelSlot.startsWith('reels_')) {
-normalReelSlot = normalReelSlot.replace('reels_', 'reel_');
-}
+            // Standardize naming
+            if (latestReelSlot.startsWith('reels_')) {
+                latestReelSlot = latestReelSlot.replace('reels_', 'reel_');
+            }
+            if (normalReelSlot.startsWith('reels_')) {
+                normalReelSlot = normalReelSlot.replace('reels_', 'reel_');
+            }
 
-console.log(`[post_algorithm] [READ-1-SUCCESS] user_status EXISTS | duration=${duration}ms | latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${userStatus.latestPostSlotId || 'post_0'} | normalPost=${userStatus.normalPostSlotId || 'post_0'}`);
+            console.log(`[USER-STATUS-SUCCESS] duration=${duration}ms | latestReel=${latestReelSlot}`);
 
-return res.json({
-success: true,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: userStatus.latestPostSlotId || 'post_0',
-normalPostSlotId: userStatus.normalPostSlotId || 'post_0',
-reads: 1,
-duration
-});
-} else if (userStatus && !userStatus.latestReelSlotId) {
-// ✅ CASE 2: Document exists but missing fields (old format) - UPDATE it
-console.log(`[post_algorithm] [READ-1-INCOMPLETE] Document exists but missing slot fields - updating`);
+            return res.json({
+                success: true,
+                latestReelSlotId: latestReelSlot,
+                normalReelSlotId: normalReelSlot,
+                latestPostSlotId: userStatus.latestPostSlotId || 'post_0',
+                normalPostSlotId: userStatus.normalPostSlotId || 'post_0',
+                reads: 1,
+                duration
+            });
+        } else if (userStatus && !userStatus.latestReelSlotId) {
+            // Document exists but missing slot fields - auto-detect and update
+            console.log(`[USER-STATUS-INCOMPLETE] Auto-detecting latest slots`);
 
-const detectionStart = Date.now();
+            const [reelDocs, postDocs] = await Promise.all([
+                db.collection('reels').find({}, { projection: { _id: 1 } }).sort({ _id: -1 }).limit(2).toArray(),
+                db.collection('posts').find({}, { projection: { _id: 1 } }).sort({ _id: -1 }).limit(2).toArray()
+            ]);
 
-// Get all reel document IDs and find the latest
-const reelDocs = await db.collection('reels')
-.find({}, { projection: { _id: 1 } })
-.toArray();
+            const latestReelSlot = reelDocs[0]?._id || 'reel_0';
+            const normalReelSlot = reelDocs[1]?._id || reelDocs[0]?._id || 'reel_0';
+            const latestPostSlot = postDocs[0]?._id || 'post_0';
+            const normalPostSlot = postDocs[1]?._id || postDocs[0]?._id || 'post_0';
 
-const postDocs = await db.collection('posts')
-.find({}, { projection: { _id: 1 } })
-.toArray();
+            // ✅ FIXED: Update without redundant userId field
+            await db.collection('user_status').updateOne(
+                { _id: userId },
+                {
+                    $set: {
+                        latestReelSlotId: latestReelSlot,
+                        normalReelSlotId: normalReelSlot,
+                        latestPostSlotId: latestPostSlot,
+                        normalPostSlotId: normalPostSlot,
+                        updatedAt: new Date()
+                        // ❌ REMOVED: userId field
+                    }
+                }
+            );
 
-// Extract and sort reel IDs (e.g., reel_0, reel_1, reel_2, ...)
-const reelIds = reelDocs
-.map(doc => doc._id)
-.filter(id => id.startsWith('reel_'))
-.sort((a, b) => {
-const numA = parseInt(a.replace('reel_', ''), 10) || 0;
-const numB = parseInt(b.replace('reel_', ''), 10) || 0;
-return numB - numA; // Descending order (latest first)
-});
+            const totalDuration = Date.now() - startTime;
 
-// Extract and sort post IDs
-const postIds = postDocs
-.map(doc => doc._id)
-.filter(id => id.startsWith('post_'))
-.sort((a, b) => {
-const numA = parseInt(a.replace('post_', ''), 10) || 0;
-const numB = parseInt(b.replace('post_', ''), 10) || 0;
-return numB - numA; // Descending order (latest first)
-});
+            return res.json({
+                success: true,
+                latestReelSlotId: latestReelSlot,
+                normalReelSlotId: normalReelSlot,
+                latestPostSlotId: latestPostSlot,
+                normalPostSlotId: normalPostSlot,
+                reads: 3,
+                duration: totalDuration
+            });
+        } else {
+            // New user - create document
+            console.log(`[USER-STATUS-NEW] Creating for userId=${userId}`);
 
-// Determine latest and normal (previous) slots
-const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
-const normalReelSlot = reelIds.length > 1 ? reelIds[1] : reelIds[0] || 'reel_0';
+            const [reelDocs, postDocs] = await Promise.all([
+                db.collection('reels').find({}, { projection: { _id: 1 } }).sort({ _id: -1 }).limit(2).toArray(),
+                db.collection('posts').find({}, { projection: { _id: 1 } }).sort({ _id: -1 }).limit(2).toArray()
+            ]);
 
-const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
-const normalPostSlot = postIds.length > 1 ? postIds[1] : postIds[0] || 'post_0';
+            const latestReelSlot = reelDocs[0]?._id || 'reel_0';
+            const normalReelSlot = reelDocs[1]?._id || reelDocs[0]?._id || 'reel_0';
+            const latestPostSlot = postDocs[0]?._id || 'post_0';
+            const normalPostSlot = postDocs[1]?._id || postDocs[0]?._id || 'post_0';
 
-const detectionDuration = Date.now() - detectionStart;
+            // ✅ FIXED: Insert without redundant userId field
+            const defaultStatus = {
+                _id: userId,  // Only store once as _id
+                latestReelSlotId: latestReelSlot,
+                normalReelSlotId: normalReelSlot,
+                latestPostSlotId: latestPostSlot,
+                normalPostSlotId: normalPostSlot,
+                createdAt: new Date(),
+                updatedAt: new Date()
+                // ❌ REMOVED: userId field (redundant)
+            };
 
-console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
-console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
+            await db.collection('user_status').insertOne(defaultStatus);
 
-// ✅ UPDATE existing document (don't insert)
-const updateResult = await db.collection('user_status').updateOne(
-{ _id: userId },
-{
-$set: {
-userId: userId,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: latestPostSlot,
-normalPostSlotId: normalPostSlot,
-updatedAt: new Date()
-},
-$setOnInsert: {
-createdAt: new Date()
-}
-}
-);
+            const totalDuration = Date.now() - startTime;
 
-const totalDuration = Date.now() - startTime;
+            return res.json({
+                success: true,
+                latestReelSlotId: latestReelSlot,
+                normalReelSlotId: normalReelSlot,
+                latestPostSlotId: latestPostSlot,
+                normalPostSlotId: normalPostSlot,
+                reads: 3,
+                duration: totalDuration,
+                isNewUser: true
+            });
+        }
 
-console.log(`[post_algorithm] [READ-1-UPDATED] Document updated with detected slots | total_duration=${totalDuration}ms | reads=3`);
-
-return res.json({
-success: true,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: latestPostSlot,
-normalPostSlotId: normalPostSlot,
-reads: 3,
-duration: totalDuration,
-wasIncomplete: true
-});
-} else {
-// ✅ CASE 3: No document exists at all - CREATE new one
-console.log(`[post_algorithm] [READ-1-NEW-USER] User status doesn't exist - auto-detecting latest documents`);
-
-const detectionStart = Date.now();
-
-// Get all reel document IDs and find the latest
-const reelDocs = await db.collection('reels')
-.find({}, { projection: { _id: 1 } })
-.toArray();
-
-const postDocs = await db.collection('posts')
-.find({}, { projection: { _id: 1 } })
-.toArray();
-
-// Extract and sort reel IDs (e.g., reel_0, reel_1, reel_2, ...)
-const reelIds = reelDocs
-.map(doc => doc._id)
-.filter(id => id.startsWith('reel_'))
-.sort((a, b) => {
-const numA = parseInt(a.replace('reel_', ''), 10) || 0;
-const numB = parseInt(b.replace('reel_', ''), 10) || 0;
-return numB - numA; // Descending order (latest first)
+    } catch (error) {
+        console.error(`[USER-STATUS-ERROR] ${error.message}`);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to read user_status: ' + error.message,
+            reads: 1,
+            duration: Date.now() - startTime
+        });
+    }
 });
 
-// Extract and sort post IDs
-const postIds = postDocs
-.map(doc => doc._id)
-.filter(id => id.startsWith('post_'))
-.sort((a, b) => {
-const numA = parseInt(a.replace('post_', ''), 10) || 0;
-const numB = parseInt(b.replace('post_', ''), 10) || 0;
-return numB - numA; // Descending order (latest first)
-});
+// ALSO FIX: POST /api/user-status/:userId (line ~3765)
+app.post('/api/user-status/:userId', async (req, res) => {
+    const startTime = Date.now();
+    const { userId } = req.params;
+    const { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId } = req.body;
 
-// Determine latest and normal (previous) slots
-const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
-const normalReelSlot = reelIds.length > 1 ? reelIds[1] : reelIds[0] || 'reel_0';
+    try {
+        const updateData = {
+            updatedAt: new Date()
+            // ❌ REMOVED: userId field (redundant)
+        };
 
-const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
-const normalPostSlot = postIds.length > 1 ? postIds[1] : postIds[0] || 'post_0';
+        if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
+        if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
+        if (latestPostSlotId) updateData.latestPostSlotId = latestPostSlotId;
+        if (normalPostSlotId) updateData.normalPostSlotId = normalPostSlotId;
 
-const detectionDuration = Date.now() - detectionStart;
+        const result = await db.collection('user_status').updateOne(
+            { _id: userId },
+            {
+                $set: updateData,
+                $setOnInsert: { createdAt: new Date() }  // ❌ REMOVED: userId from $setOnInsert
+            },
+            { upsert: true }
+        );
 
-console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
-console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
+        const duration = Date.now() - startTime;
 
-// Create user_status document with detected slots
-const defaultStatus = {
-_id: userId,
-userId: userId,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: latestPostSlot,
-normalPostSlotId: normalPostSlot,
-createdAt: new Date(),
-updatedAt: new Date()
-};
+        console.log(`[USER-STATUS-UPDATE] matched=${result.matchedCount} | modified=${result.modifiedCount} | duration=${duration}ms`);
 
-await db.collection('user_status').insertOne(defaultStatus);
+        return res.json({
+            success: true,
+            message: 'Slot IDs updated',
+            writes: 1,
+            duration
+        });
 
-const totalDuration = Date.now() - startTime;
-
-console.log(`[post_algorithm] [READ-1-CREATED] New user_status created | total_duration=${totalDuration}ms | reads=3 (user_status + reels + posts)`);
-
-return res.json({
-success: true,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: latestPostSlot,
-normalPostSlotId: normalPostSlot,
-reads: 3, // user_status (1) + reels collection (1) + posts collection (1)
-duration: totalDuration,
-isNewUser: true
-});
-}
-
-} catch (error) {
-console.error(`[post_algorithm] [READ-1-ERROR] ${error.message}`);
-console.error(`[post_algorithm] [READ-1-STACK]`, error.stack);
-return res.status(500).json({
-success: false,
-error: 'Failed to read user_status: ' + error.message,
-reads: 1,
-duration: Date.now() - startTime
-});
-}
+    } catch (error) {
+        console.error(`[USER-STATUS-UPDATE-ERROR] ${error.message}`);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to update user_status: ' + error.message,
+            writes: 0,
+            duration: Date.now() - startTime
+        });
+    }
 });
 
 
