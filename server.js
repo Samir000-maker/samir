@@ -56,11 +56,6 @@ console.log(` DEFAULT_CONTENT_BATCH_SIZE: ${DEFAULT_CONTENT_BATCH_SIZE} (40 item
 console.log(` MIN_CONTENT_FOR_FEED: ${MIN_CONTENT_FOR_FEED} (40 items minimum)`);
 console.log(` DOCUMENT REDUCTION: 12.5x fewer documents vs 40-item slots`);
 
-// ✅ Add calculation helper for monitoring
-const CACHE_TTL_SHORT = 15000;
-const CACHE_TTL_MEDIUM = 60000;
-const CACHE_TTL_LONG = 300000;
-
 
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
 const MAX_CONTENT_PER_SLOT = 40; // Maximum content items per document before creating new slot
