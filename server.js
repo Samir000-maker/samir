@@ -682,26 +682,26 @@ await createInstagramFeedIndexes();
 
 
 // Add after initMongo() in PORT 2000
-setInterval(async () => {
-try {
-console.log('[PERIODIC-SYNC] Running background metrics sync check');
+// setInterval(async () => {
+// try {
+// console.log('[PERIODIC-SYNC] Running background metrics sync check');
 
-// Get all posts/reels that haven't been synced in the last 5 minutes
-const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+// // Get all posts/reels that haven't been synced in the last 5 minutes
+// const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
 
-const collections = ['posts', 'reels'];
-for (const collection of collections) {
-const arrayField = collection === 'reels' ? 'reelsList' : 'postList';
-const docs = await db.collection(collection).find({
-[`${arrayField}.lastSynced`]: { $lt: fiveMinutesAgo.toISOString() }
-}).limit(50).toArray();
+// const collections = ['posts', 'reels'];
+// for (const collection of collections) {
+// const arrayField = collection === 'reels' ? 'reelsList' : 'postList';
+// const docs = await db.collection(collection).find({
+// [`${arrayField}.lastSynced`]: { $lt: fiveMinutesAgo.toISOString() }
+// }).limit(50).toArray();
 
-console.log(`[PERIODIC-SYNC] Found ${docs.length} outdated ${collection}`);
-}
-} catch (error) {
-console.error('[PERIODIC-SYNC-ERROR]', error);
-}
-}, 5 * 60 * 1000); // Every 5 minutes
+// console.log(`[PERIODIC-SYNC] Found ${docs.length} outdated ${collection}`);
+// }
+// } catch (error) {
+// console.error('[PERIODIC-SYNC-ERROR]', error);
+// }
+// }, 5 * 60 * 1000); // Every 5 minutes
 
 
 await createUltraFastRetentionIndexes();
@@ -2363,64 +2363,47 @@ app.post('/api/sync/batch-metrics', async (req, res) => {
       return res.status(400).json({ error: 'metrics object required' });
     }
     
-    console.log(`[BATCH-SYNC] Received ${Object.keys(metrics).length} posts`);
+    const postIds = Object.keys(metrics);
+    console.log(`[BATCH-SYNC] Processing ${postIds.length} posts`);
     
     let updated = 0;
     let notFound = 0;
     
-    // Process all posts in parallel
-    const updates = Object.entries(metrics).map(async ([postId, data]) => {
-      const arrayField = data.isReel ? 'reelsList' : 'postList';
-      
-      // Try user_slots first
-      const result = await db.collection('user_slots').updateOne(
-        { [`${arrayField}.postId`]: postId },
-        {
-          $set: {
-            [`${arrayField}.$.likeCount`]: data.likeCount,
-            [`${arrayField}.$.commentCount`]: data.commentCount,
-            [`${arrayField}.$.viewCount`]: data.viewCount,
-            [`${arrayField}.$.retention`]: data.retention,
-            [`${arrayField}.$.lastSynced`]: new Date().toISOString()
-          }
-        }
-      );
-      
-      if (result.matchedCount > 0) {
-        updated++;
-      } else {
-        // Try main collection as fallback
-        const collection = data.isReel ? 'reels' : 'posts';
-        const fallbackResult = await db.collection(collection).updateOne(
+    // Update all in parallel
+    await Promise.all(
+      postIds.map(async (postId) => {
+        const data = metrics[postId];
+        const arrayField = data.isReel ? 'reelsList' : 'postList';
+        
+        const result = await db.collection('user_slots').updateOne(
           { [`${arrayField}.postId`]: postId },
           {
             $set: {
-              [`${arrayField}.$.likeCount`]: data.likeCount,
-              [`${arrayField}.$.commentCount`]: data.commentCount,
-              [`${arrayField}.$.viewCount`]: data.viewCount,
-              [`${arrayField}.$.retention`]: data.retention,
+              [`${arrayField}.$.likeCount`]: data.likeCount || 0,
+              [`${arrayField}.$.commentCount`]: data.commentCount || 0,
+              [`${arrayField}.$.viewCount`]: data.viewCount || 0,
+              [`${arrayField}.$.retention`]: data.retention || 0,
               [`${arrayField}.$.lastSynced`]: new Date().toISOString()
             }
           }
         );
         
-        if (fallbackResult.matchedCount > 0) {
+        if (result.matchedCount > 0) {
           updated++;
         } else {
           notFound++;
+          console.warn(`[BATCH-SYNC] Post not found: ${postId}`);
         }
-      }
-    });
+      })
+    );
     
-    await Promise.all(updates);
-    
-    console.log(`[BATCH-SYNC-SUCCESS] Updated: ${updated}, Not found: ${notFound}`);
+    console.log(`[BATCH-SYNC-DONE] ${updated} updated, ${notFound} not found`);
     
     res.json({
       success: true,
       updated,
       notFound,
-      total: Object.keys(metrics).length
+      total: postIds.length
     });
     
   } catch (error) {
@@ -2428,6 +2411,7 @@ app.post('/api/sync/batch-metrics', async (req, res) => {
     res.status(500).json({ error: 'Batch sync failed' });
   }
 });
+
 
 // -------------------
 // KEEP /api/sync/metrics but simplify it (for backward compatibility):
@@ -2871,7 +2855,6 @@ return score;
 
 
 
-// ✅ REPLACE WITH THIS SIMPLIFIED VERSION
 // ✅ REPLACE WITH THIS - Forward to PORT 4000 only
 app.post('/api/interactions/contribution-like', async (req, res) => {
     try {
