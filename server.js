@@ -2443,87 +2443,87 @@ res.status(500).json({ error: 'Failed to sync metrics' });
 
 
 
-app.post('/api/interactions/sync-like-immediate', async (req, res) => {
-    try {
-        const { postId, userId, action, isLiked, likeCount, timestamp } = req.body;
+// app.post('/api/interactions/sync-like-immediate', async (req, res) => {
+//     try {
+//         const { postId, userId, action, isLiked, likeCount, timestamp } = req.body;
 
-        if (!postId || !userId || !action) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'postId, userId, and action required' 
-            });
-        }
+//         if (!postId || !userId || !action) {
+//             return res.status(400).json({ 
+//                 success: false, 
+//                 error: 'postId, userId, and action required' 
+//             });
+//         }
 
-        console.log(`[SYNC-LIKE-IMMEDIATE] ${userId} ${action}d ${postId}, count: ${likeCount}`);
+//         console.log(`[SYNC-LIKE-IMMEDIATE] ${userId} ${action}d ${postId}, count: ${likeCount}`);
 
-        const today = new Date().toISOString().split('T')[0];
-        const cacheKey = `${userId}_session_${today}`;
+//         const today = new Date().toISOString().split('T')[0];
+//         const cacheKey = `${userId}_session_${today}`;
 
-        // ✅ STEP 1: Update user_interaction_cache (fast lookup)
-        const cacheOperation = isLiked
-            ? { $addToSet: { likedToday: postId } }
-            : { $pull: { likedToday: postId } };
+//         // ✅ STEP 1: Update user_interaction_cache (fast lookup)
+//         const cacheOperation = isLiked
+//             ? { $addToSet: { likedToday: postId } }
+//             : { $pull: { likedToday: postId } };
 
-        await db.collection('user_interaction_cache').updateOne(
-            { _id: cacheKey },
-            {
-                ...cacheOperation,
-                $set: { 
-                    ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
-                    lastSynced: timestamp 
-                }
-            },
-            { upsert: true }
-        );
+//         await db.collection('user_interaction_cache').updateOne(
+//             { _id: cacheKey },
+//             {
+//                 ...cacheOperation,
+//                 $set: { 
+//                     ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
+//                     lastSynced: timestamp 
+//                 }
+//             },
+//             { upsert: true }
+//         );
 
-        // ✅ STEP 2: Update contributionToLike collection (persistent storage)
-        if (isLiked) {
-            // Add like
-            await db.collection('contributionToLike').updateOne(
-                { _id: `${userId}_${postId}` },
-                {
-                    $set: {
-                        userId: userId,
-                        postId: postId,
-                        likedAt: timestamp,
-                        updatedAt: new Date().toISOString()
-                    },
-                    $setOnInsert: {
-                        createdAt: new Date().toISOString()
-                    }
-                },
-                { upsert: true }
-            );
-            console.log(`[CONTRIBUTION-LIKE-ADDED] ${userId} -> ${postId}`);
-        } else {
-            // Remove like
-            await db.collection('contributionToLike').deleteOne({
-                _id: `${userId}_${postId}`
-            });
-            console.log(`[CONTRIBUTION-LIKE-REMOVED] ${userId} -> ${postId}`);
-        }
+//         // ✅ STEP 2: Update contributionToLike collection (persistent storage)
+//         if (isLiked) {
+//             // Add like
+//             await db.collection('contributionToLike').updateOne(
+//                 { _id: `${userId}_${postId}` },
+//                 {
+//                     $set: {
+//                         userId: userId,
+//                         postId: postId,
+//                         likedAt: timestamp,
+//                         updatedAt: new Date().toISOString()
+//                     },
+//                     $setOnInsert: {
+//                         createdAt: new Date().toISOString()
+//                     }
+//                 },
+//                 { upsert: true }
+//             );
+//             console.log(`[CONTRIBUTION-LIKE-ADDED] ${userId} -> ${postId}`);
+//         } else {
+//             // Remove like
+//             await db.collection('contributionToLike').deleteOne({
+//                 _id: `${userId}_${postId}`
+//             });
+//             console.log(`[CONTRIBUTION-LIKE-REMOVED] ${userId} -> ${postId}`);
+//         }
 
-        console.log(`[SYNC-LIKE-SUCCESS] Cache + contributionToLike updated for ${userId} -> ${postId}`);
+//         console.log(`[SYNC-LIKE-SUCCESS] Cache + contributionToLike updated for ${userId} -> ${postId}`);
 
-        return res.json({
-            success: true,
-            message: 'Like synced successfully',
-            postId,
-            userId,
-            action,
-            likeCount,
-            syncedAt: new Date().toISOString()
-        });
+//         return res.json({
+//             success: true,
+//             message: 'Like synced successfully',
+//             postId,
+//             userId,
+//             action,
+//             likeCount,
+//             syncedAt: new Date().toISOString()
+//         });
 
-    } catch (error) {
-        console.error('[SYNC-LIKE-IMMEDIATE-ERROR]', error.message);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Sync failed',
-            details: error.message 
-        });
-    }
-});
+//     } catch (error) {
+//         console.error('[SYNC-LIKE-IMMEDIATE-ERROR]', error.message);
+//         return res.status(500).json({ 
+//             success: false, 
+//             error: 'Sync failed',
+//             details: error.message 
+//         });
+//     }
+// });
 
 
 // ✅ REPLACE - Forward to PORT 4000
@@ -2846,65 +2846,133 @@ return score;
 
 
 // ✅ REPLACE WITH THIS SIMPLIFIED VERSION
+// ✅ REPLACE WITH THIS - Forward to PORT 4000 only
 app.post('/api/interactions/contribution-like', async (req, res) => {
-try {
-const { userId, postId, action } = req.body;
+    try {
+        const { userId, postId, action } = req.body;
 
-if (!userId || !postId || !['like', 'unlike'].includes(action)) {
-return res.status(400).json({
-success: false,
-error: 'userId, postId, and action (like/unlike) required'
+        if (!userId || !postId || !['like', 'unlike'].includes(action)) {
+            return res.status(400).json({
+                success: false,
+                error: 'userId, postId, and action (like/unlike) required'
+            });
+        }
+
+        const isLiking = action === 'like';
+
+        console.log(`[CONTRIBUTION-LIKE-PROXY] ${userId} ${action}ing ${postId} - forwarding to PORT 4000`);
+
+        // Forward directly to PORT 4000 (single source of truth)
+        const port4000Response = await axios.post(
+            'https://database-22io.onrender.com/api/posts/toggle-like',
+            {
+                userId: userId,
+                postId: postId,
+                currentlyLiked: !isLiking, // PORT 4000 expects CURRENT state
+                isReel: true
+            },
+            { timeout: 5000 }
+        );
+
+        if (port4000Response.data.success) {
+            const isLiked = port4000Response.data.isLiked;
+            const likeCount = port4000Response.data.likeCount;
+
+            console.log(`[CONTRIBUTION-LIKE-SUCCESS] ${postId}: isLiked=${isLiked}, count=${likeCount}`);
+
+            return res.json({
+                success: true,
+                action: isLiked ? 'like' : 'unlike',
+                isLiked: isLiked,
+                likeCount: likeCount,
+                message: `Successfully ${isLiked ? 'liked' : 'unliked'}`,
+                duplicate: port4000Response.data.duplicate || false
+            });
+        }
+
+        return res.status(500).json({
+            success: false,
+            error: 'PORT 4000 like failed'
+        });
+
+    } catch (error) {
+        console.error('[CONTRIBUTION-LIKE-ERROR]', error.message);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to process like'
+        });
+    }
 });
-}
 
-const isLiking = action === 'like';
-const today = new Date().toISOString().split('T')[0];
 
-console.log(`[CONTRIBUTION-LIKE-PROXY] ${userId} ${action}ing ${postId} - forwarding to PORT 4000`);
 
-// Forward directly to PORT 4000 (MongoDB server)
-const port4000Response = await axios.post(
-'https://database-22io.onrender.com/api/posts/toggle-like',
-{
-userId: userId,
-postId: postId,
-currentlyLiked: !isLiking, // PORT 4000 expects CURRENT state, not action
-isReel: true
-},
-{ timeout: 5000 }
-);
+// ✅ ADD THIS NEW ENDPOINT - Receives like data from PORT 4000
+app.post('/api/interactions/sync-from-port4000', async (req, res) => {
+    try {
+        const { likes, timestamp, trigger } = req.body;
 
-if (port4000Response.data.success) {
-const isLiked = port4000Response.data.isLiked;
-const likeCount = port4000Response.data.likeCount;
+        if (!Array.isArray(likes)) {
+            return res.status(400).json({ error: 'likes array required' });
+        }
 
-console.log(`[CONTRIBUTION-LIKE-SUCCESS] ${postId}: isLiked=${isLiked}, count=${likeCount}`);
+        console.log(`[SYNC-FROM-4000] Received ${likes.length} likes, trigger: ${trigger || 'manual'}`);
 
-return res.json({
-success: true,
-action: isLiked ? 'like' : 'unlike',
-isLiked: isLiked,
-likeCount: likeCount,
-message: `Successfully ${isLiked ? 'liked' : 'unliked'}`,
-duplicate: port4000Response.data.duplicate || false
+        // Build a Set of current PORT 2000 likes for comparison
+        const port2000CurrentLikes = await db.collection('user_interaction_cache').aggregate([
+            { $match: { likedToday: { $exists: true, $ne: [] } } },
+            { $unwind: '$likedToday' },
+            { $group: { _id: null, allLikes: { $addToSet: '$likedToday' } } }
+        ]).toArray();
+
+        const currentLikesSet = new Set(port2000CurrentLikes[0]?.allLikes || []);
+        const port4000LikesSet = new Set(likes.map(l => l.postId));
+
+        // Determine what needs to be added/removed
+        const toAdd = likes.filter(l => !currentLikesSet.has(l.postId));
+        const toRemove = [...currentLikesSet].filter(postId => !port4000LikesSet.has(postId));
+
+        let added = 0, removed = 0;
+
+        // Add missing likes
+        for (const like of toAdd) {
+            const today = new Date().toISOString().split('T')[0];
+            const cacheKey = `${like.userId}_session_${today}`;
+
+            await db.collection('user_interaction_cache').updateOne(
+                { _id: cacheKey },
+                {
+                    $addToSet: { likedToday: like.postId },
+                    $set: { ttl: new Date(Date.now() + 24 * 60 * 60 * 1000) }
+                },
+                { upsert: true }
+            );
+            added++;
+        }
+
+        // Remove extra likes (unliked on PORT 4000)
+        for (const postId of toRemove) {
+            await db.collection('user_interaction_cache').updateMany(
+                { likedToday: postId },
+                { $pull: { likedToday: postId } }
+            );
+            removed++;
+        }
+
+        console.log(`[SYNC-FROM-4000-COMPLETE] Added: ${added}, Removed: ${removed}`);
+
+        return res.json({
+            success: true,
+            added,
+            removed,
+            total: likes.length,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('[SYNC-FROM-4000-ERROR]', error);
+        return res.status(500).json({ error: 'Sync failed' });
+    }
 });
-} else {
-return res.status(500).json({
-success: false,
-error: 'PORT 4000 like failed'
-});
-}
-
-} catch (error) {
-console.error('[CONTRIBUTION-LIKE-ERROR]', error.message);
-return res.status(500).json({
-success: false,
-error: 'Failed to process like'
-});
-}
-});
-
-
 
 
 // Sync metrics from PORT 4000 to PORT 2000
