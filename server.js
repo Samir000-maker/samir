@@ -28,6 +28,19 @@ const RESULT_CACHE_TTL = 30000; // 30 seconds
 
 const crypto = require('crypto');
 
+const CACHE_TTL_SHORT = 15000; // 15 seconds
+const CACHE_TTL_MEDIUM = 60000; // 1 minute
+const CACHE_TTL_LONG = 300000; // 5 minutes
+
+// ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
+const MAX_CONTENT_PER_SLOT = 40; // Maximum content items per document before creating new slot
+const DEFAULT_CONTENT_BATCH_SIZE = 40; // Default number of items to return per request
+const MIN_CONTENT_FOR_FEED = 40; // Minimum content required for feed requests
+// ============================================================================
+
+const MAX_ACTIVE_REQUESTS = 5000;  // Hard limit
+const REQUEST_DEDUP_TTL = 5000;    // 5 seconds
+
 // Global counters and cache
 const dbOpCounters = { reads: 0, writes: 0, updates: 0, inserts: 0, deletes: 0, queries: 0, aggregations: 0 };
 //const cache = { latestSlots: new Map(), userStatus: new Map(), maxIndexes: new Map(), ttl: 30 };
@@ -40,8 +53,7 @@ maxIndexes: new Map(),
 ttl: 30000 // Increased to 30 seconds
 };
 
-const MAX_ACTIVE_REQUESTS = 5000;  // Hard limit
-const REQUEST_DEDUP_TTL = 5000;    // 5 seconds
+
 
 const processedRequests = new Map();
 
@@ -57,20 +69,14 @@ console.log(` MIN_CONTENT_FOR_FEED: ${MIN_CONTENT_FOR_FEED} (40 items minimum)`)
 console.log(` DOCUMENT REDUCTION: 12.5x fewer documents vs 40-item slots`);
 
 
-// ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
-const MAX_CONTENT_PER_SLOT = 40; // Maximum content items per document before creating new slot
-const DEFAULT_CONTENT_BATCH_SIZE = 40; // Default number of items to return per request
-const MIN_CONTENT_FOR_FEED = 40; // Minimum content required for feed requests
-// ============================================================================
+
 
 console.log('[CONFIG] System Configuration:');
 console.log(` MAX_CONTENT_PER_SLOT: ${MAX_CONTENT_PER_SLOT}`);
 console.log(` DEFAULT_CONTENT_BATCH_SIZE: ${DEFAULT_CONTENT_BATCH_SIZE}`);
 console.log(` MIN_CONTENT_FOR_FEED: ${MIN_CONTENT_FOR_FEED}`);
 
-const CACHE_TTL_SHORT = 15000; // 15 seconds
-const CACHE_TTL_MEDIUM = 60000; // 1 minute
-const CACHE_TTL_LONG = 300000; // 5 minutes
+
 
 
 setInterval(() => {
