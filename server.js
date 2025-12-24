@@ -24,9 +24,6 @@ const activeRequestsWithTimestamp = new Map();
 const REQUEST_DEDUP_TTL = 5000; // 5 seconds
 const requestDeduplication = new Map();
 const DEDUP_WINDOW = 5000; // 5 seconds
-
-const RESULT_CACHE_TTL = 30000; // 30 seconds
-
 // Global counters and cache
 const dbOpCounters = { reads: 0, writes: 0, updates: 0, inserts: 0, deletes: 0, queries: 0, aggregations: 0 };
 //const cache = { latestSlots: new Map(), userStatus: new Map(), maxIndexes: new Map(), ttl: 30 };
@@ -264,39 +261,6 @@ app.use('/api', rateLimit({ windowMs: 1000, max: 1000, standardHeaders: true, le
 
 app.use(express.json());
 
-
-app.use(async (req, res, next) => {
-    if (req.method !== 'POST' && req.method !== 'GET') return next();
-    
-    const requestKey = `req:${req.method}:${req.originalUrl}:${req.body ? JSON.stringify(req.body) : ''}`;
-    
-    if (redisClient) {
-        try {
-            // Check if identical request is in-flight
-            const inFlight = await redisClient.get(requestKey);
-            if (inFlight) {
-                console.log(`[REQUEST-DEDUP-BLOCKED] ${requestKey.substring(0, 50)}`);
-                return res.status(429).json({ 
-                    success: false, 
-                    error: 'Duplicate request in progress',
-                    retryAfter: 3 
-                });
-            }
-            
-            // Mark request as in-flight
-            await redisClient.setex(requestKey, Math.floor(REQUEST_DEDUP_TTL / 1000), '1');
-            
-            // Clear on response
-            res.on('finish', () => {
-                redisClient.del(requestKey).catch(() => {});
-            });
-        } catch (err) {
-            console.error('[DEDUP-ERROR]', err);
-        }
-    }
-    
-    next();
-});
 
 
 app.use(compression({
@@ -629,39 +593,33 @@ console.log('[MONGO-INIT] ✅ Snappy compression available');
 console.log('[MONGO-INIT]⚠️ Snappy not available, using zlib compression');
 }
 
-// Add to initMongo() function
-
 client = new MongoClient(MONGODB_URI, {
-    maxPoolSize: 50, // ✅ Reduced from 100
-    minPoolSize: 5,  // ✅ Reduced from 10
-    maxIdleTimeMS: 30000,
-    serverSelectionTimeoutMS: 5000, // ✅ Faster timeout
-    socketTimeoutMS: 30000,
-    readPreference: 'nearest',
-    retryWrites: true,
-    retryReads: true,
-    waitQueueTimeoutMS: 5000, // ✅ Faster timeout
-    directConnection: false,
-    compressors: compressors,
-    maxConnecting: 2,
-    w: 1,
-    journal: false, // ✅ Disable for speed (use with caution)
-    
-    // ✅ CRITICAL: Add connection pooling monitoring
-    monitorCommands: false,
-    autoEncryption: undefined
-});
+maxPoolSize: parseInt(process.env.MONGO_POOL_SIZE || '100', 10), // Reduced from 500
+minPoolSize: 10, // Reduced from 50
+maxIdleTimeMS: 30000,
+serverSelectionTimeoutMS: 10000,
+socketTimeoutMS: 45000,
+readPreference: 'nearest',
+retryWrites: true,
+retryReads: true,
+waitQueueTimeoutMS: 10000,
+directConnection: false,
+compressors: compressors,
 
-// ✅ Add connection pool monitoring
-client.on('connectionPoolCreated', () => {
-    console.log('[MONGO-POOL] Pool created');
-});
+// ADDED: Production-grade settings
+maxConnecting: 2,
+w: 1,
+journal: true,
 
-client.on('connectionCheckOutStarted', () => {
-    const poolSize = client.topology?.s?.pool?.totalConnectionCount || 0;
-    if (poolSize > 40) {
-        console.warn(`[MONGO-POOL-WARNING] Pool size: ${poolSize}/50`);
-    }
+// CRITICAL FIX: Prevent connection pool exhaustion
+maxPoolSize: 100, // Lower limit for stability
+minPoolSize: 10,
+connectTimeoutMS: 10000,
+heartbeatFrequencyMS: 10000,
+
+// ADDED: Prevent memory leaks
+monitorCommands: false, // Disable command monitoring in production
+autoEncryption: undefined // Explicitly disable if not needed
 });
 
 console.log(`[MONGO-INIT] Compression: ${compressors.join(', ')}`);
@@ -707,35 +665,6 @@ console.error('[PERIODIC-SYNC-ERROR]', error);
 await createUltraFastRetentionIndexes();
 
 
-
-// Inside initMongo() after existing indexes:
-const contributionLikeIndexes = [
-    { 
-        collection: 'contributionToLike', 
-        index: { userId: 1, postId: 1 }, 
-        options: { unique: true, background: true } 
-    },
-    { 
-        collection: 'contributionToLike', 
-        index: { postId: 1 }, 
-        options: { background: true } 
-    },
-    { 
-        collection: 'contributionToLike', 
-        index: { userId: 1 }, 
-        options: { background: true } 
-    }
-];
-
-for (const { collection, index, options } of contributionLikeIndexes) {
-    try {
-        await db.collection(collection).createIndex(index, options);
-        log('info', `Created index for ${collection}`);
-    } catch (e) {
-        log('warn', `Index error for ${collection}: ${e.message}`);
-    }
-}
-    
 
 
 // ADD to initMongo() function
@@ -1138,113 +1067,234 @@ class DatabaseManager {
 constructor(db) { this.db = db; }
 
 
-async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_CONTENT_FOR_FEED) {
-    const start = Date.now();
-    const isReel = contentType === 'reels';
-    const collection = isReel ? 'reels' : 'posts';
-    const listKey = isReel ? 'reelsList' : 'postList';
-    
-    // ✅ CRITICAL: Cache user status + content in single key
-    const cacheKey = `feedData:${userId}:${contentType}`;
-    const cached = await getCache(cacheKey);
-    
-    if (cached) {
-        console.log(`[FEED-CACHE-HIT] ✅ ${contentType} for ${userId} (0 DB reads)`);
-        return cached;
-    }
-    
-    console.log(`[FEED-START] ${contentType} | userId=${userId} | min=${minContentRequired}`);
-    
-    // ✅ SINGLE AGGREGATION combining user_status lookup + content fetch
-    const pipeline = [
-        {
-            $facet: {
-                userStatus: [
-                    { $limit: 1 },
-                    {
-                        $lookup: {
-                            from: 'user_status',
-                            pipeline: [{ $match: { _id: userId } }],
-                            as: 'status'
-                        }
-                    }
-                ],
-                contentSlots: [
-                    { $match: { count: { $gt: 0 } } },
-                    { $sort: { index: -1 } },
-                    { $limit: 2 }, // ✅ Only fetch 2 latest slots
-                    {
-                        $lookup: {
-                            from: `contrib_${collection}`,
-                            let: { slotContent: `$${listKey}` },
-                            pipeline: [
-                                { $match: { userId: userId } },
-                                { $limit: 1 }, // ✅ Only need existence check
-                                { $project: { ids: 1, _id: 0 } }
-                            ],
-                            as: 'viewedData'
-                        }
-                    },
-                    { $limit: minContentRequired * 2 }, // ✅ Limit early
-                    {
-                        $project: {
-                            _id: 1,
-                            index: 1,
-                            count: 1,
-                            [listKey]: {
-                                $slice: [`$${listKey}`, minContentRequired * 2] // ✅ Slice array
-                            },
-                            viewedIds: { $ifNull: [{ $arrayElemAt: ['$viewedData.ids', 0] }, []] }
-                        }
-                    }
-                ]
-            }
-        }
-    ];
-    
-    const aggregateStart = Date.now();
-    const results = await this.db.collection(collection).aggregate(pipeline, { maxTimeMS: 2000 }).toArray();
-    logDbOp('aggregate', collection, { pipeline: 'fixed_reads_cached' }, results, Date.now() - aggregateStart);
-    
-    let userStatus = null;
-    let contentSlots = [];
-    
-    if (results.length > 0) {
-        const facetResult = results[0];
-        if (facetResult.userStatus?.[0]?.status?.[0]) {
-            userStatus = facetResult.userStatus[0].status[0];
-        }
-        contentSlots = facetResult.contentSlots || [];
-    }
-    
-    const viewedIds = new Set(contentSlots[0]?.viewedIds || []);
-    let content = [];
-    
-    // Process content
-    for (const slot of contentSlots) {
-        const slotContent = slot[listKey] || [];
-        for (const item of slotContent) {
-            if (content.length >= minContentRequired) break;
-            if (item.postId && !viewedIds.has(item.postId)) {
-                content.push(item);
-            }
-        }
-        if (content.length >= minContentRequired) break;
-    }
-    
-    const result = {
-        content: content.slice(0, minContentRequired),
-        latestDocumentId: contentSlots[0]?._id || null,
-        normalDocumentId: contentSlots[1]?._id || contentSlots[0]?._id || null,
-        isNewUser: !userStatus
-    };
-    
-    // ✅ Cache result for 30 seconds
-    await setCache(cacheKey, result, 30000);
-    
-    console.log(`[FEED-COMPLETE] ${contentType} | ${result.content.length} items | ${Date.now() - start}ms | DB reads: ${dbOpCounters.reads}`);
-    
-    return result;
+// Add this new method to DatabaseManager class
+async getOptimizedFeedFixedReads(userId, contentType,minContentRequired = MIN_CONTENT_FOR_FEED) {
+const start = Date.now();
+const isReel = contentType === 'reels';
+const collection = isReel ? 'reels' : 'posts';
+const statusField = isReel ? 'latestReelSlotId' : 'latestPostSlotId';
+const normalField = isReel ? 'normalReelSlotId' : 'normalPostSlotId';
+const listKey = isReel ? 'reelsList' : 'postList';
+
+console.log(`[FIXED-READS-START] ${contentType} for ${userId}, required: ${minContentRequired}`);
+
+const pipeline = [
+{
+$facet: {
+userStatus: [
+{ $match: { _id: "user_status_lookup" } },
+{
+$lookup: {
+from: 'user_status',
+pipeline: [{ $match: { _id: userId } }],
+as: 'status'
+}
+},
+{ $limit: 1 }
+],
+contentSlots: [
+{ $match: { count: { $gt: 0 } } },
+{ $sort: { index: -1 } },
+{ $limit: 3 },
+{
+$lookup: {
+from: `contrib_${collection}`,
+let: { slotContent: `$${listKey}` },
+pipeline: [
+{ $match: { userId: userId } },
+{ $project: { ids: 1, _id: 0 } }
+],
+as: 'viewedData'
+}
+},
+{
+$project: {
+_id: 1,
+index: 1,
+count: 1,
+[listKey]: {
+$map: {
+input: `$${listKey}`,
+as: 'item',
+in: {
+postId: '$$item.postId',
+userId: '$$item.userId',
+username: '$$item.username',
+imageUrl: '$$item.imageUrl',
+videoUrl: '$$item.videoUrl',
+caption: '$$item.caption',
+description: '$$item.description',
+profile_picture_url: '$$item.profile_picture_url',
+timestamp: '$$item.timestamp',
+likeCount: '$$item.likeCount',
+commentCount: '$$item.commentCount',
+viewCount: '$$item.viewCount',
+retention: '$$item.retention',
+ratio: { $ifNull: ['$$item.ratio', isReel ? '9:16' : 'original'] }, // **CRITICAL FIX**
+category: '$$item.category'
+}
+}
+},
+viewedIds: { $ifNull: [{ $arrayElemAt: ['$viewedData.ids', 0] }, []] }
+}
+}
+]
+}
+}
+];
+
+const aggregateStart = Date.now();
+const results = await this.db.collection(collection).aggregate(pipeline).toArray();
+logDbOp('aggregate', collection, { pipeline: 'fixed_reads_optimized_with_ratio' }, results, Date.now() - aggregateStart);
+
+let userStatus = null;
+let contentSlots = [];
+
+if (results.length > 0) {
+const facetResult = results[0];
+
+if (facetResult.userStatus && facetResult.userStatus.length > 0 &&
+facetResult.userStatus[0].status && facetResult.userStatus[0].status.length > 0) {
+userStatus = facetResult.userStatus[0].status[0];
+}
+
+contentSlots = facetResult.contentSlots || [];
+}
+
+console.log(`[FIXED-READS-DATA] User status found: ${!!userStatus}, Content slots: ${contentSlots.length}`);
+
+const viewedIds = new Set(contentSlots.length > 0 ? contentSlots[0].viewedIds || [] : []);
+const isNewUser = !userStatus || !userStatus[statusField];
+
+let content = [];
+let newLatestSlot = null;
+let normalDocId = null;
+
+if (isNewUser) {
+console.log(`[NEW-USER-FIXED] ${userId} - ${contentType}`);
+
+let itemsNeeded = minContentRequired;
+for (const slot of contentSlots) {
+if (itemsNeeded <= 0) break;
+
+const slotContent = slot[listKey] || [];
+for (const item of slotContent) {
+if (itemsNeeded <= 0) break;
+
+if (item.postId && !viewedIds.has(item.postId)) {
+// **CRITICAL DEBUG: Log ratio**
+console.log(`[RATIO-LOADED] postId=${item.postId.substring(0, 8)} | ratio=${item.ratio || 'MISSING'}`);
+content.push(item);
+itemsNeeded--;
+}
+}
+}
+
+if (contentSlots.length > 0) {
+newLatestSlot = contentSlots[0]._id;
+normalDocId = contentSlots.length > 1 ? contentSlots[1]._id : contentSlots[0]._id;
+
+this.updateUserStatus(userId, {
+[statusField]: newLatestSlot,
+[normalField]: normalDocId
+}).catch(console.error);
+}
+
+} else {
+console.log(`[RETURNING-USER-FIXED] ${userId} - ${contentType}`);
+
+const currentLatest = userStatus[statusField];
+const currentNormal = userStatus[normalField];
+
+const match = currentLatest.match(/_(\d+)$/);
+const currentIndex = match ? parseInt(match[1]) : 0;
+
+let hasNewContent = false;
+for (const slot of contentSlots) {
+if (slot.index > currentIndex) {
+const slotContent = slot[listKey] || [];
+const freshContent = slotContent.filter(item =>
+item.postId && !viewedIds.has(item.postId)
+);
+
+if (freshContent.length > 0) {
+content.push(...freshContent);
+newLatestSlot = slot._id;
+hasNewContent = true;
+
+// **LOG RATIOS**
+freshContent.forEach(item => {
+console.log(`[RATIO-NEW-CONTENT] postId=${item.postId.substring(0, 8)} | ratio=${item.ratio || 'MISSING'}`);
+});
+break;
+}
+}
+}
+
+if (!hasNewContent) {
+const currentSlots = contentSlots.filter(slot =>
+slot._id === currentLatest || slot._id === currentNormal
+);
+
+let itemsNeeded = minContentRequired;
+for (const slot of currentSlots) {
+if (itemsNeeded <= 0) break;
+
+const slotContent = slot[listKey] || [];
+for (const item of slotContent) {
+if (itemsNeeded <= 0) break;
+
+if (item.postId && !viewedIds.has(item.postId)) {
+content.push(item);
+itemsNeeded--;
+}
+}
+}
+
+newLatestSlot = currentLatest;
+normalDocId = currentNormal;
+} else {
+normalDocId = currentNormal;
+
+this.updateUserStatus(userId, {
+[statusField]: newLatestSlot,
+[normalField]: normalDocId
+}).catch(console.error);
+}
+}
+
+if (content.length < minContentRequired && contentSlots.length > 0) {
+let itemsNeeded = minContentRequired - content.length;
+const existingIds = new Set(content.map(item => item.postId));
+
+for (const slot of contentSlots) {
+if (itemsNeeded <= 0) break;
+
+const slotContent = slot[listKey] || [];
+for (const item of slotContent) {
+if (itemsNeeded <= 0) break;
+
+if (item.postId &&
+!viewedIds.has(item.postId) &&
+!existingIds.has(item.postId)) {
+content.push(item);
+existingIds.add(item.postId);
+itemsNeeded--;
+}
+}
+}
+}
+
+const result = {
+content: content.slice(0, minContentRequired * 2),
+latestDocumentId: newLatestSlot,
+normalDocumentId: normalDocId,
+isNewUser,
+hasNewContent: newLatestSlot !== (userStatus ? userStatus[statusField] : null)
+};
+
+console.log(`[FIXED-READS-COMPLETE] ${userId} - ${contentType}: ${result.content.length} items | Total DB Reads: ${dbOpCounters.reads} | Time: ${Date.now() - start}ms`);
+return result;
 }
 
 
@@ -2346,87 +2396,8 @@ return res.status(500).json({ error: 'Failed to check retention contribution' })
 }
 });
 
-app.post('/api/interactions/sync-like-immediate', async (req, res) => {
-    try {
-        const { postId, userId, action, isLiked, likeCount, timestamp } = req.body;
 
-        if (!postId || !userId || !action) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'postId, userId, and action required' 
-            });
-        }
 
-        console.log(`[SYNC-LIKE-IMMEDIATE] ${userId} ${action}d ${postId}, count: ${likeCount}`);
-
-        const today = new Date().toISOString().split('T')[0];
-        const cacheKey = `${userId}_session_${today}`;
-
-        // ✅ STEP 1: Update user_interaction_cache (fast lookup)
-        const cacheOperation = isLiked
-            ? { $addToSet: { likedToday: postId } }
-            : { $pull: { likedToday: postId } };
-
-        await db.collection('user_interaction_cache').updateOne(
-            { _id: cacheKey },
-            {
-                ...cacheOperation,
-                $set: { 
-                    ttl: new Date(Date.now() + 24 * 60 * 60 * 1000),
-                    lastSynced: timestamp 
-                }
-            },
-            { upsert: true }
-        );
-
-        // ✅ STEP 2: Update contributionToLike collection (persistent storage)
-        if (isLiked) {
-            // Add like
-            await db.collection('contributionToLike').updateOne(
-                { _id: `${userId}_${postId}` },
-                {
-                    $set: {
-                        userId: userId,
-                        postId: postId,
-                        likedAt: timestamp,
-                        updatedAt: new Date().toISOString()
-                    },
-                    $setOnInsert: {
-                        createdAt: new Date().toISOString()
-                    }
-                },
-                { upsert: true }
-            );
-            console.log(`[CONTRIBUTION-LIKE-ADDED] ${userId} -> ${postId}`);
-        } else {
-            // Remove like
-            await db.collection('contributionToLike').deleteOne({
-                _id: `${userId}_${postId}`
-            });
-            console.log(`[CONTRIBUTION-LIKE-REMOVED] ${userId} -> ${postId}`);
-        }
-
-        console.log(`[SYNC-LIKE-SUCCESS] Cache + contributionToLike updated for ${userId} -> ${postId}`);
-
-        return res.json({
-            success: true,
-            message: 'Like synced successfully',
-            postId,
-            userId,
-            action,
-            likeCount,
-            syncedAt: new Date().toISOString()
-        });
-
-    } catch (error) {
-        console.error('[SYNC-LIKE-IMMEDIATE-ERROR]', error.message);
-        return res.status(500).json({ 
-            success: false, 
-            error: 'Sync failed',
-            details: error.message 
-        });
-    }
-});
 
 
 // ✅ REPLACE - Forward to PORT 4000
@@ -2476,7 +2447,99 @@ return res.status(500).json({ success: false, error: 'Failed to restore like sta
 });
 
 
+// Sync metrics from PORT 4000 to PORT 2000
+app.post('/api/sync/metrics', async (req, res) => {
+try {
+const { postId, metrics, isReel, sourceDocument, userId } = req.body;
 
+if (!postId || !metrics) {
+return res.status(400).json({ error: 'postId and metrics required' });
+}
+
+console.log(`[SYNC-METRICS] Updating ${postId} - isReel: ${isReel}`);
+
+const collection = isReel ? 'reels' : 'posts';
+const arrayField = isReel ? 'reelsList' : 'postList';
+
+// Check if already synced recently (within last 5 seconds to prevent duplicate syncs)
+const recentSync = await db.collection('sync_log').findOne({
+postId: postId,
+syncedAt: { $gte: new Date(Date.now() - 5000) }
+});
+
+if (recentSync) {
+console.log(`[SYNC-SKIP] ${postId} already synced recently`);
+return res.json({
+success: true,
+message: 'Already synced recently',
+postId,
+skipped: true
+});
+}
+
+// Update in the main collection documents
+const updateResult = await db.collection(collection).updateOne(
+{ [`${arrayField}.postId`]: postId },
+{
+$set: {
+[`${arrayField}.$.likeCount`]: metrics.likeCount || 0,
+[`${arrayField}.$.commentCount`]: metrics.commentCount || 0,
+[`${arrayField}.$.viewCount`]: metrics.viewCount || 0,
+[`${arrayField}.$.retention`]: metrics.retention || 0,
+[`${arrayField}.$.lastSynced`]: new Date().toISOString()
+}
+}
+);
+
+if (updateResult.matchedCount === 0) {
+console.warn(`[SYNC-NOT-FOUND] ${postId} not found in ${collection} collection`);
+
+// Try to find in user_slots if not in main collection
+const userSlotUpdate = await db.collection('user_slots').updateOne(
+{ [`${arrayField}.postId`]: postId },
+{
+$set: {
+[`${arrayField}.$.likeCount`]: metrics.likeCount || 0,
+[`${arrayField}.$.commentCount`]: metrics.commentCount || 0,
+[`${arrayField}.$.viewCount`]: metrics.viewCount || 0,
+[`${arrayField}.$.retention`]: metrics.retention || 0,
+[`${arrayField}.$.lastSynced`]: new Date().toISOString()
+}
+}
+);
+
+if (userSlotUpdate.matchedCount === 0) {
+return res.status(404).json({ error: 'Post not found' });
+}
+
+console.log(`[SYNC-SUCCESS-USERSLOT] Updated ${postId} in user_slots`);
+} else {
+console.log(`[SYNC-SUCCESS] Updated ${postId} in ${collection}`);
+}
+
+// Log successful sync to prevent duplicates
+await db.collection('sync_log').insertOne({
+postId: postId,
+syncedAt: new Date(),
+metrics: metrics
+});
+
+// Clean up old sync logs (older than 1 minute)
+await db.collection('sync_log').deleteMany({
+syncedAt: { $lt: new Date(Date.now() - 60000) }
+});
+
+res.json({
+success: true,
+message: 'Metrics synced successfully',
+postId,
+metrics
+});
+} catch (error) {
+console.error('[SYNC-ERROR]', error);
+res.status(500).json({ error: 'Failed to sync metrics' });
+}
+});
 
 
 // Personalized reels feed with interest-based ranking
@@ -3765,233 +3828,454 @@ return null;
 
 
 app.post('/api/feed/instagram-ranked', async (req, res) => {
-    const requestStart = Date.now();
-    const readsBefore = dbOpCounters.reads;
-    
-    try {
-        const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, excludedPostIds = [], excludedReelIds = [] } = req.body;
-        
-        if (!userId) {
-            return res.status(400).json({ success: false, error: 'userId required' });
-        }
-        
-        const limitNum = parseInt(limit, 10) || DEFAULT_CONTENT_BATCH_SIZE;
-        const cacheKey = `feed:${userId}:${limitNum}:${excludedPostIds.length}:${excludedReelIds.length}`;
-        
-        // ✅ CRITICAL: Check Redis cache FIRST (avoid ALL DB reads)
-        if (redisClient) {
-            try {
-                const cached = await redisClient.get(cacheKey);
-                if (cached) {
-                    const cachedData = JSON.parse(cached);
-                    console.log(`[FEED-CACHE-HIT] ✅ ${userId} served from Redis (0 DB reads)`);
-                    return res.json({ ...cachedData, servedFromCache: true, cacheHit: true });
-                }
-            } catch (e) {
-                console.warn('[CACHE-ERROR]', e.message);
-            }
-        }
-        
-        console.log(`[FEED-CACHE-MISS] Executing aggregation for ${userId}`);
-        
-        // Step 1: Get user interests (with timeout)
-        let userInterests = [];
-        try {
-            const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, {
-                timeout: 1000,
-                validateStatus: s => s >= 200 && s < 500
-            });
-            if (userResponse.status === 200 && userResponse.data?.success) {
-                userInterests = userResponse.data.user?.interests || [];
-            }
-        } catch (e) {
-            console.warn(`[USER-INTERESTS-SKIP] ${e.message}`);
-        }
-        
-        // Step 2: Get viewed content (SINGLE query with limit)
-        const [viewedPostsDocs, viewedReelsDocs] = await Promise.all([
-            db.collection('contrib_posts').find({ userId }).limit(10).toArray(), // ✅ LIMIT added
-            db.collection('contrib_reels').find({ userId }).limit(10).toArray()  // ✅ LIMIT added
-        ]);
-        
-        const serverViewedPosts = viewedPostsDocs.flatMap(doc => doc.ids || []);
-        const serverViewedReels = viewedReelsDocs.flatMap(doc => doc.ids || []);
-        
-        const allExcludedPosts = [...new Set([...serverViewedPosts, ...excludedPostIds])];
-        const allExcludedReels = [...new Set([...serverViewedReels, ...excludedReelIds])];
-        
-        console.log(`[EXCLUSION-MERGE] Posts: ${allExcludedPosts.length} | Reels: ${allExcludedReels.length}`);
-        
-        // Step 3: **SINGLE AGGREGATION** for normalization (not separate for posts/reels)
-        const normalizationPipeline = [
-            {
-                $facet: {
-                    postsMax: [
-                        { $match: { 'postList': { $exists: true, $ne: [] } } },
-                        { $unwind: '$postList' },
-                        { $match: { 'postList.postId': { $nin: allExcludedPosts } } },
-                        { $limit: 1000 }, // ✅ LIMIT scan
-                        { $group: {
-                            _id: null,
-                            maxLikes: { $max: { $toInt: { $ifNull: ['$postList.likeCount', 0] } } },
-                            maxComments: { $max: { $toInt: { $ifNull: ['$postList.commentCount', 0] } } }
-                        }}
-                    ],
-                    reelsMax: [
-                        { $match: { 'reelsList': { $exists: true, $ne: [] } } },
-                        { $unwind: '$reelsList' },
-                        { $match: { 'reelsList.postId': { $nin: allExcludedReels } } },
-                        { $limit: 1000 }, // ✅ LIMIT scan
-                        { $group: {
-                            _id: null,
-                            maxLikes: { $max: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } } },
-                            maxComments: { $max: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } } }
-                        }}
-                    ]
-                }
-            }
-        ];
-        
-        const normStart = Date.now();
-        const normResults = await db.collection('posts').aggregate(normalizationPipeline).toArray();
-        console.log(`[NORMALIZATION] Single aggregation: ${Date.now() - normStart}ms`);
-        
-        const globalMaxLikes = Math.max(
-            normResults[0]?.postsMax[0]?.maxLikes || 1,
-            normResults[0]?.reelsMax[0]?.maxLikes || 1
-        );
-        const globalMaxComments = Math.max(
-            normResults[0]?.postsMax[0]?.maxComments || 1,
-            normResults[0]?.reelsMax[0]?.maxComments || 1
-        );
-        
-        // Step 4: Build content aggregation (with INDEX HINTS)
-        const buildPipeline = (collectionName, arrayField, excludedIds) => [
-            { $match: { [arrayField]: { $exists: true, $ne: [] } } },
-            { $unwind: `$${arrayField}` },
-            { $match: { [`${arrayField}.postId`]: { $nin: excludedIds } } },
-            { $limit: limitNum * 2 }, // ✅ EARLY LIMIT
-            {
-                $addFields: {
-                    retentionNum: { $toDouble: { $ifNull: [`$${arrayField}.retention`, 0] } },
-                    likeCountNum: { $toInt: { $ifNull: [`$${arrayField}.likeCount`, 0] } },
-                    commentCountNum: { $toInt: { $ifNull: [`$${arrayField}.commentCount`, 0] } },
-                    interestScore: {
-                        $cond: {
-                            if: { $in: [`$${arrayField}.category`, userInterests] },
-                            then: 100,
-                            else: { $cond: [{ $eq: [{ $size: { $ifNull: [userInterests, []] } }, 0] }, 50, 0] }
-                        }
-                    }
-                }
-            },
-            {
-                $addFields: {
-                    normalizedLikes: { $multiply: [{ $divide: ['$likeCountNum', globalMaxLikes] }, 100] },
-                    normalizedComments: { $multiply: [{ $divide: ['$commentCountNum', globalMaxComments] }, 100] }
-                }
-            },
-            {
-                $addFields: {
-                    compositeScore: {
-                        $add: [
-                            { $multiply: ['$retentionNum', 0.50] },
-                            { $multiply: ['$normalizedLikes', 0.25] },
-                            { $multiply: ['$interestScore', 0.15] },
-                            { $multiply: ['$normalizedComments', 0.10] }
-                        ]
-                    }
-                }
-            },
-            { $sort: { compositeScore: -1 } },
-            { $limit: limitNum },
-            { $project: {
-                postId: `$${arrayField}.postId`,
-                userId: `$${arrayField}.userId`,
-                username: `$${arrayField}.username`,
-                imageUrl: { $ifNull: [`$${arrayField}.imageUrl`, `$${arrayField}.imageUrl1`] },
-                multiple_posts: { $ifNull: [`$${arrayField}.multiple_posts`, false] },
-                media_count: { $ifNull: [`$${arrayField}.media_count`, 1] },
-                imageUrl2: `$${arrayField}.imageUrl2`,
-                imageUrl3: `$${arrayField}.imageUrl3`,
-                profilePicUrl: `$${arrayField}.profile_picture_url`,
-                caption: `$${arrayField}.caption`,
-                category: `$${arrayField}.category`,
-                timestamp: `$${arrayField}.timestamp`,
-                likeCount: '$likeCountNum',
-                commentCount: '$commentCountNum',
-                retention: '$retentionNum',
-                compositeScore: '$compositeScore',
-                sourceDocument: '$_id',
-                ratio: { $ifNull: [`$${arrayField}.ratio`, arrayField === 'reelsList' ? '9:16' : '4:5'] },
-                isReel: { $literal: arrayField === 'reelsList' }
-            }}
-        ];
-        
-        const aggStart = Date.now();
-        const [allPosts, allReels] = await Promise.all([
-            db.collection('posts').aggregate(buildPipeline('posts', 'postList', allExcludedPosts), { maxTimeMS: 2000 }).toArray(),
-            db.collection('reels').aggregate(buildPipeline('reels', 'reelsList', allExcludedReels), { maxTimeMS: 2000 }).toArray()
-        ]);
-        console.log(`[AGGREGATION] ${Date.now() - aggStart}ms | Posts: ${allPosts.length} | Reels: ${allReels.length}`);
-        
-        // Step 5: Deduplicate and merge
-        const seenIds = new Set();
-        const finalContent = [];
-        const allContent = [...allPosts, ...allReels].sort((a, b) => (b.compositeScore || 0) - (a.compositeScore || 0));
-        
-        for (const item of allContent) {
-            if (!item?.postId || seenIds.has(item.postId) || finalContent.length >= limitNum) continue;
-            seenIds.add(item.postId);
-            finalContent.push(item);
-        }
-        
-        // Extract document IDs
-        const sortedPostDocs = [...new Set(allPosts.map(p => p.sourceDocument).filter(Boolean))].sort((a, b) => {
-            const numA = parseInt(a.split('_')[1] || '0', 10);
-            const numB = parseInt(b.split('_')[1] || '0', 10);
-            return numB - numA;
-        });
-        
-        const sortedReelDocs = [...new Set(allReels.map(r => r.sourceDocument).filter(Boolean))].sort((a, b) => {
-            const numA = parseInt(a.split('_')[1] || '0', 10);
-            const numB = parseInt(b.split('_')[1] || '0', 10);
-            return numB - numA;
-        });
-        
-        const latestPostDoc = sortedPostDocs[0] || 'post_0';
-        const latestReelDoc = sortedReelDocs[0] || 'reel_0';
-        
-        const totalReads = dbOpCounters.reads - readsBefore;
-        const totalTime = Date.now() - requestStart;
-        
-        const responseData = {
-            success: true,
-            content: finalContent,
-            hasMore: allContent.length >= limitNum,
-            metadata: {
-                totalReturned: finalContent.length,
-                responseTime: totalTime,
-                documentIds: { latestPost: latestPostDoc, latestReel: latestReelDoc },
-                dbActivity: { totalReads }
-            }
-        };
-        
-        // ✅ Cache response in Redis (30 seconds)
-        if (redisClient && finalContent.length > 0) {
-            redisClient.setex(cacheKey, 30, JSON.stringify(responseData)).catch(e => {
-                console.warn('[CACHE-SET-ERROR]', e.message);
-            });
-        }
-        
-        console.log(`[FEED-COMPLETE] ✅ ${totalReads} reads | ${totalTime}ms | Cached for 30s`);
-        
-        return res.json(responseData);
-        
-    } catch (error) {
-        console.error('[FEED-ERROR]', error);
-        return res.status(500).json({ success: false, error: 'Failed to load feed' });
-    }
+const requestStart = Date.now();
+const readsBefore = dbOpCounters.reads;
+const writesBefore = dbOpCounters.writes;
+
+try {
+const {
+userId,
+limit = DEFAULT_CONTENT_BATCH_SIZE,
+excludedPostIds = [],
+excludedReelIds = []
+} = req.body;
+
+if (!userId) {
+return res.status(400).json({ success: false, error: 'userId required' });
+}
+
+const limitNum = parseInt(limit, 10) || DEFAULT_CONTENT_BATCH_SIZE;
+const hasExclusions = (excludedPostIds && excludedPostIds.length > 0) || (excludedReelIds && excludedReelIds.length > 0);
+const cacheKey = hasExclusions ? null : `feed:${userId}:${limitNum}:initial`;
+
+console.log(`\n========== [FEED-REQUEST-START] ==========`);
+console.log(`User: ${userId} | Limit: ${limitNum} | Excluded: ${excludedPostIds.length}P + ${excludedReelIds.length}R`);
+console.log(`DB State BEFORE: Reads=${dbOpCounters.reads}, Writes=${dbOpCounters.writes}`);
+
+// Cache check
+if (cacheKey && redisClient) {
+try {
+const cached = await redisClient.get(cacheKey);
+if (cached) {
+const cachedData = JSON.parse(cached);
+const cacheTime = Date.now() - requestStart;
+console.log(`[CACHE-HIT] ${userId} served in ${cacheTime}ms`);
+return res.json({ ...cachedData, servedFromCache: true, responseTime: cacheTime });
+}
+} catch (e) {
+console.warn('[CACHE-ERROR]', e && e.message ? e.message : e);
+}
+}
+
+console.log('[CACHE-MISS] Fetching fresh content');
+
+// STEP 1: Fetch user interests
+let userInterests = [];
+const interestFetchStart = Date.now();
+try {
+console.log(`[USER-INTERESTS-FETCH-START] Requesting from https://server1-ki1x.onrender.com/api/users/${userId}`);
+const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, {
+timeout: 3000,
+validateStatus: function(status) {
+return status >= 200 && status < 500;
+}
+});
+
+const fetchTime = Date.now() - interestFetchStart;
+console.log(`[USER-INTERESTS-RESPONSE] Status: ${userResponse.status} | Time: ${fetchTime}ms`);
+
+if (userResponse.status === 200 && userResponse.data) {
+console.log('[USER-INTERESTS-DATA] Raw response preview:', JSON.stringify(userResponse.data).substring(0, 200));
+if (userResponse.data.success && userResponse.data.user && userResponse.data.user.interests) {
+userInterests = userResponse.data.user.interests;
+console.log(`[USER-INTERESTS-LOADED] ${userId}: [${userInterests.join(', ')}] (${userInterests.length} interests)`);
+} else {
+console.warn('[USER-INTERESTS-MISSING] Structure invalid or no interests field');
+}
+} else {
+console.warn(`[USER-INTERESTS-HTTP-ERROR] HTTP ${userResponse.status}`);
+}
+} catch (e) {
+const fetchTime = Date.now() - interestFetchStart;
+console.error(`[USER-INTERESTS-ERROR] Failed after ${fetchTime}ms | Error: ${e && e.message ? e.message : e}`);
+}
+
+if (userInterests.length === 0) {
+console.warn('[USER-INTERESTS-FINAL] ⚠️ No interests loaded - all content will get neutral interest score (50)');
+} else {
+console.log(`[USER-INTERESTS-FINAL] Using ${userInterests.length} interests for ranking`);
+}
+
+// STEP 2: Fetch metadata
+console.log('[METADATA-FETCH-START] Querying contrib_posts, contrib_reels, following...');
+
+const [viewedPostsDocs, viewedReelsDocs, followResponse] = await Promise.all([
+db.collection('contrib_posts').find({ userId }).toArray(),
+db.collection('contrib_reels').find({ userId }).toArray(),
+axios.get(`http://127.0.0.1:5000/api/users/${userId}/following`, { timeout: 1000, validateStatus: () => true })
+.catch(err => {
+console.warn('[FOLLOWING-FETCH-ERROR]', err && err.message ? err.message : err);
+return { data: { following: [] } };
+})
+]);
+
+const metadataReads = dbOpCounters.reads - readsBefore;
+
+const serverViewedPosts = [];
+const serverViewedReels = [];
+
+viewedPostsDocs.forEach(doc => {
+if (doc.ids && Array.isArray(doc.ids)) {
+serverViewedPosts.push(...doc.ids);
+console.log(`[postId_debug] [METADATA-POSTS-DOC] _id=${doc._id} | count=${doc.ids.length}`);
+}
+});
+
+viewedReelsDocs.forEach(doc => {
+if (doc.ids && Array.isArray(doc.ids)) {
+serverViewedReels.push(...doc.ids);
+console.log(`[postId_debug] [METADATA-REELS-DOC] _id=${doc._id} | count=${doc.ids.length}`);
+}
+});
+
+console.log(`[postId_debug] [METADATA-COMPLETE] Total viewed: ${serverViewedPosts.length} posts + ${serverViewedReels.length} reels from ${viewedPostsDocs.length} post docs + ${viewedReelsDocs.length} reel docs`);
+
+const allExcludedPosts = [...new Set([...serverViewedPosts, ...(excludedPostIds || [])])];
+const allExcludedReels = [...new Set([...serverViewedReels, ...(excludedReelIds || [])])];
+const followedUserIds = followResponse.data?.following || [];
+
+console.log(`[EXCLUSION-MERGE] Posts: ${allExcludedPosts.length} | Reels: ${allExcludedReels.length} | Following: ${followedUserIds.length}`);
+
+// STEP 3: Get max values for normalization
+console.log('[NORMALIZATION-START] Aggregating max values from posts & reels...');
+const normReadsBefore = dbOpCounters.reads;
+
+const [postsMaxValues, reelsMaxValues] = await Promise.all([
+db.collection('posts').aggregate([
+{ $match: { 'postList': { $exists: true, $ne: [] } } },
+{ $unwind: '$postList' },
+{ $match: { 'postList.postId': { $nin: allExcludedPosts } } },
+{
+$group: {
+_id: null,
+maxLikes: { $max: { $toInt: { $ifNull: ['$postList.likeCount', 0] } } },
+maxComments: { $max: { $toInt: { $ifNull: ['$postList.commentCount', 0] } } },
+docsProcessed: { $sum: 1 }
+}
+}
+]).toArray(),
+db.collection('reels').aggregate([
+{ $match: { 'reelsList': { $exists: true, $ne: [] } } },
+{ $unwind: '$reelsList' },
+{ $match: { 'reelsList.postId': { $nin: allExcludedReels } } },
+{
+$group: {
+_id: null,
+maxLikes: { $max: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } } },
+maxComments: { $max: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } } },
+docsProcessed: { $sum: 1 }
+}
+}
+]).toArray()
+]);
+
+const normReads = dbOpCounters.reads - normReadsBefore;
+const postsScanned = postsMaxValues[0]?.docsProcessed || 0;
+const reelsScanned = reelsMaxValues[0]?.docsProcessed || 0;
+
+console.log(`[NORMALIZATION-COMPLETE] Posts scanned: ${postsScanned}, Reels scanned: ${reelsScanned} | DB Reads: ${normReads}`);
+
+const globalMaxLikes = Math.max(
+postsMaxValues[0]?.maxLikes || 1,
+reelsMaxValues[0]?.maxLikes || 1
+);
+const globalMaxComments = Math.max(
+postsMaxValues[0]?.maxComments || 1,
+reelsMaxValues[0]?.maxComments || 1
+);
+
+console.log(`[NORMALIZATION] maxLikes=${globalMaxLikes}, maxComments=${globalMaxComments}, userInterests=${userInterests.length}`);
+
+// STEP 4: Build aggregation pipeline
+console.log('[MAIN-AGGREGATION-START] Fetching ranked content...');
+const aggReadsBefore = dbOpCounters.reads;
+
+const buildPipeline = (collectionName, arrayField, excludedIds) => [
+{ $match: { [arrayField]: { $exists: true, $ne: [] } } },
+{ $unwind: `$${arrayField}` },
+{ $match: { [`${arrayField}.postId`]: { $nin: excludedIds } } },
+{
+$addFields: {
+isFollowing: {
+$cond: {
+if: { $in: [`$${arrayField}.userId`, followedUserIds] },
+then: 1,
+else: 0
+}
+},
+retentionNum: { $toDouble: { $ifNull: [`$${arrayField}.retention`, 0] } },
+likeCountNum: { $toInt: { $ifNull: [`$${arrayField}.likeCount`, 0] } },
+commentCountNum: { $toInt: { $ifNull: [`$${arrayField}.commentCount`, 0] } },
+categoryField: { $ifNull: [`$${arrayField}.category`, ""] },
+interestScore: {
+$cond: {
+if: {
+$and: [
+{ $gt: [{ $size: { $ifNull: [userInterests, []] } }, 0] },
+{ $in: [`$${arrayField}.category`, userInterests] }
+]
+},
+then: 100,
+else: {
+$cond: {
+if: { $eq: [{ $size: { $ifNull: [userInterests, []] } }, 0] },
+then: 50,
+else: 0
+}
+}
+}
+}
+}
+},
+{
+$addFields: {
+normalizedLikes: {
+$multiply: [
+{ $cond: [{ $eq: [globalMaxLikes, 0] }, 0, { $divide: ['$likeCountNum', globalMaxLikes] }] },
+100
+]
+},
+normalizedComments: {
+$multiply: [
+{ $cond: [{ $eq: [globalMaxComments, 0] }, 0, { $divide: ['$commentCountNum', globalMaxComments] }] },
+100
+]
+}
+}
+},
+{
+$addFields: {
+compositeScore: {
+$cond: {
+if: { $eq: ['$isFollowing', 1] },
+then: {
+$add: [
+{ $multiply: ['$retentionNum', 0.45] },
+{ $multiply: ['$normalizedLikes', 0.25] },
+{ $multiply: ['$interestScore', 0.15] },
+{ $multiply: ['$normalizedComments', 0.10] },
+{ $literal: 5 }
+]
+},
+else: {
+$add: [
+{ $multiply: ['$retentionNum', 0.50] },
+{ $multiply: ['$normalizedLikes', 0.25] },
+{ $multiply: ['$interestScore', 0.15] },
+{ $multiply: ['$normalizedComments', 0.10] }
+]
+}
+}
+}
+}
+},
+{ $sort: { compositeScore: -1 } },
+{ $limit: limitNum * 3 },
+{
+$project: {
+postId: `$${arrayField}.postId`,
+userId: `$${arrayField}.userId`,
+username: `$${arrayField}.username`,
+imageUrl: { $ifNull: [`$${arrayField}.imageUrl`, `$${arrayField}.imageUrl1`, ""] },
+multiple_posts: { $ifNull: [`$${arrayField}.multiple_posts`, false] },
+media_count: { $ifNull: [`$${arrayField}.media_count`, 1] },
+imageUrl1: { $ifNull: [`$${arrayField}.imageUrl1`, `$${arrayField}.imageUrl`] },
+imageUrl2: `$${arrayField}.imageUrl2`,
+imageUrl3: `$${arrayField}.imageUrl3`,
+imageUrl4: `$${arrayField}.imageUrl4`,
+imageUrl5: `$${arrayField}.imageUrl5`,
+imageUrl6: `$${arrayField}.imageUrl6`,
+imageUrl7: `$${arrayField}.imageUrl7`,
+imageUrl8: `$${arrayField}.imageUrl8`,
+imageUrl9: `$${arrayField}.imageUrl9`,
+imageUrl10: `$${arrayField}.imageUrl10`,
+imageUrl11: `$${arrayField}.imageUrl11`,
+imageUrl12: `$${arrayField}.imageUrl12`,
+imageUrl13: `$${arrayField}.imageUrl13`,
+imageUrl14: `$${arrayField}.imageUrl14`,
+imageUrl15: `$${arrayField}.imageUrl15`,
+imageUrl16: `$${arrayField}.imageUrl16`,
+imageUrl17: `$${arrayField}.imageUrl17`,
+imageUrl18: `$${arrayField}.imageUrl18`,
+imageUrl19: `$${arrayField}.imageUrl19`,
+imageUrl20: `$${arrayField}.imageUrl20`,
+profilePicUrl: `$${arrayField}.profile_picture_url`,
+caption: `$${arrayField}.caption`,
+category: '$categoryField',
+timestamp: `$${arrayField}.timestamp`,
+likeCount: '$likeCountNum',
+commentCount: '$commentCountNum',
+retention: '$retentionNum',
+interestScore: '$interestScore',
+normalizedLikes: '$normalizedLikes',
+normalizedComments: '$normalizedComments',
+compositeScore: '$compositeScore',
+sourceDocument: '$_id',
+ratio: { $ifNull: [`$${arrayField}.ratio`, arrayField === 'reelsList' ? '9:16' : '4:5'] },
+isReel: { $literal: arrayField === 'reelsList' },
+isFollowing: '$isFollowing'
+}
+}
+];
+
+const [allPosts, allReels] = await Promise.all([
+db.collection('posts').aggregate(buildPipeline('posts', 'postList', allExcludedPosts), { maxTimeMS: 3000 }).toArray(),
+db.collection('reels').aggregate(buildPipeline('reels', 'reelsList', allExcludedReels), { maxTimeMS: 3000 }).toArray()
+]);
+
+const aggReads = dbOpCounters.reads - aggReadsBefore;
+console.log(`[MAIN-AGGREGATION-COMPLETE] Posts: ${allPosts.length}, Reels: ${allReels.length} | DB Reads: ${aggReads}`);
+
+// STEP 5: Merge, sort, deduplicate
+const seenIds = new Set();
+const finalContent = [];
+
+const allContent = [...allPosts, ...allReels].sort((a, b) => (b.compositeScore || 0) - (a.compositeScore || 0));
+console.log(`[RANKING-START] Sorting ${allContent.length} candidates by composite score`);
+
+for (const item of allContent) {
+if (!item || !item.postId) continue;
+if (!seenIds.has(item.postId) && finalContent.length < limitNum) {
+seenIds.add(item.postId);
+
+const retention = typeof item.retention === 'number' ? item.retention : Number(item.retention) || 0;
+const likeCount = typeof item.likeCount === 'number' ? item.likeCount : Number(item.likeCount) || 0;
+const commentCount = typeof item.commentCount === 'number' ? item.commentCount : Number(item.commentCount) || 0;
+
+const retentionContribution = retention * 0.50;
+const likesContribution = (globalMaxLikes ? (likeCount / globalMaxLikes) * 100 * 0.25 : 0);
+const interestContribution = (item.interestScore || 0) * 0.15;
+const commentsContribution = (globalMaxComments ? (commentCount / globalMaxComments) * 100 * 0.10 : 0);
+
+console.log(`[CONTENT-${finalContent.length}] ${String(item.postId).substring(0, 8)} | ` +
+`SCORE=${(item.compositeScore || 0).toFixed(2)} | ` +
+`RET=${retention.toFixed(1)}%(${retentionContribution.toFixed(1)}) | ` +
+`LIKE=${likeCount}(${likesContribution.toFixed(1)}) | ` +
+`INT=${item.interestScore || 0}(${interestContribution.toFixed(1)}) | ` +
+`COM=${commentCount}(${commentsContribution.toFixed(1)}) | ` +
+`cat=${item.category || 'none'} | ` +
+`follow=${item.isFollowing} | ` +
+`reel=${item.isReel}`);
+
+finalContent.push(item);
+}
+}
+
+const uniqueDocs = new Set([
+...allPosts.map(p => p.sourceDocument),
+...allReels.map(r => r.sourceDocument)
+].filter(Boolean));
+console.log(`[DOCUMENTS-SCANNED] ${uniqueDocs.size} unique documents`);
+
+// ✅ CRITICAL FIX: Extract and standardize document IDs (SINGULAR format: reel_ not reels_)
+const postsDocIds = new Set();
+const reelsDocIds = new Set();
+
+for (const item of finalContent) {
+let docId = item.sourceDocument;
+if (docId) {
+// ✅ STANDARDIZE: Convert "reels_X" to "reel_X" if needed
+if (docId.startsWith('reels_')) {
+docId = docId.replace('reels_', 'reel_');
+console.log(`[postId_debug] [DOC-ID-STANDARDIZED] ${item.sourceDocument} -> ${docId}`);
+}
+
+if (item.isReel) {
+reelsDocIds.add(docId);
+} else {
+postsDocIds.add(docId);
+}
+}
+}
+
+// Sort and get the LATEST (highest numbered) document ID
+const sortDocIds = (docIds) => {
+return Array.from(docIds).sort((a, b) => {
+const numA = parseInt((a.split('_')[1] || '0'), 10);
+const numB = parseInt((b.split('_')[1] || '0'), 10);
+return numB - numA;
+});
+};
+
+const sortedPostDocs = sortDocIds(postsDocIds);
+const sortedReelDocs = sortDocIds(reelsDocIds);
+
+const latestPostDoc = sortedPostDocs.length > 0 ? sortedPostDocs[0] : 'post_0';
+const latestReelDoc = sortedReelDocs.length > 0 ? sortedReelDocs[0] : 'reel_0'; // ✅ SINGULAR
+
+console.log(`[postId_debug] [FEED-RESPONSE-DOCS] latestPost=${latestPostDoc} (from ${sortedPostDocs.length} docs) | latestReel=${latestReelDoc} (from ${sortedReelDocs.length} docs)`);
+
+// Final response
+const totalReads = dbOpCounters.reads - readsBefore;
+const totalWrites = dbOpCounters.writes - writesBefore;
+const totalTime = Date.now() - requestStart;
+
+console.log(`\n========== [FEED-REQUEST-COMPLETE] ==========`);
+console.log(`User: ${userId} | Returned: ${finalContent.length} items | Time: ${totalTime}ms`);
+console.log(`DB Activity: ${totalReads} reads (${(totalReads / totalTime * 1000).toFixed(1)} reads/sec), ${totalWrites} writes`);
+console.log(`Breakdown: Metadata=${metadataReads}, Normalization=${normReads}, Aggregation=${aggReads}`);
+if (totalReads > 50) {
+console.warn(`⚠️ [OPTIMIZATION-NEEDED] Query used ${totalReads} reads - consider caching or better indexing!`);
+}
+console.log(`=============================================\n`);
+
+const responseData = {
+success: true,
+content: finalContent,
+hasMore: (allContent.length >= limitNum),
+metadata: {
+totalReturned: finalContent.length,
+excludedPosts: allExcludedPosts.length,
+excludedReels: allExcludedReels.length,
+candidatesFound: allContent.length,
+requestedLimit: limitNum,
+responseTime: Date.now() - requestStart,
+userInterests,
+interestsCount: userInterests.length,
+normalization: { globalMaxLikes, globalMaxComments },
+documentIds: {
+latestPost: latestPostDoc,
+latestReel: latestReelDoc // ✅ Always singular format
+},
+algorithmWeights: {
+following: { retention: 45, likes: 25, interest: 15, comments: 10, bonus: 5 },
+global: { retention: 50, likes: 25, interest: 15, comments: 10 }
+},
+dbActivity: {
+totalReads,
+totalWrites,
+readsPerSecond: (totalReads / totalTime * 1000).toFixed(1),
+documentsScanned: uniqueDocs.size,
+breakdown: { metadata: metadataReads, normalization: normReads, aggregation: aggReads }
+}
+}
+};
+
+if (cacheKey && redisClient && finalContent.length > 0) {
+redisClient.setex(cacheKey, 30, JSON.stringify(responseData)).catch(e => {
+console.warn('[CACHE-SET-ERROR]', e && e.message ? e.message : e);
+});
+}
+
+return res.json(responseData);
+
+} catch (error) {
+const errorReads = dbOpCounters.reads - readsBefore;
+const errorWrites = dbOpCounters.writes - writesBefore;
+console.error(`[FEED-ERROR] After ${Date.now() - requestStart}ms | Reads: ${errorReads}, Writes: ${errorWrites} | ${error && error.message ? error.message : error}`);
+if (error && error.stack) console.error(error.stack);
+return res.status(500).json({ success: false, error: 'Failed to load feed' });
+}
 });
 
 // Instagram feed builder (same as before)
