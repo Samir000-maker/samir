@@ -3675,7 +3675,265 @@ return null;
 
 
 
-// REPLACE /api/feed/instagram-ranked endpoint (starting ~line 2920)
+
+app.post('/api/feed/reels-personalized', async (req, res) => {
+    const requestStart = Date.now();
+    const readsBefore = dbOpCounters.reads;
+    
+    try {
+        const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, offset = 0 } = req.body;
+
+        if (!userId || userId === 'undefined' || userId === 'null') {
+            return res.status(400).json({ success: false, error: 'Valid userId required' });
+        }
+
+        const limitNum = parseInt(limit, 10) || DEFAULT_CONTENT_BATCH_SIZE;
+        const offsetNum = parseInt(offset, 10) || 0;
+
+        log('info', `[REELS-PERSONALIZED] userId=${userId}, limit=${limitNum}, offset=${offsetNum}`);
+
+        // ✅ Cache key includes offset for pagination
+        const cacheKey = `reels:personalized:${userId}:${limitNum}:${offsetNum}`;
+        
+        if (redisClient) {
+            try {
+                const cached = await redisClient.get(cacheKey);
+                if (cached) {
+                    const cachedData = JSON.parse(cached);
+                    console.log(`[REELS-CACHE-HIT] ✅ ${userId} offset=${offsetNum} (0 DB reads)`);
+                    return res.json({ ...cachedData, servedFromCache: true });
+                }
+            } catch (e) {
+                console.warn('[CACHE-ERROR]', e.message);
+            }
+        }
+
+        // ✅ STEP 1: Get user's current reel slots
+        const userStatus = await db.collection('user_status').findOne(
+            { _id: userId },
+            { projection: { latestReelSlotId: 1 } }
+        );
+
+        let reelSlotIds = ['reel_0'];
+        
+        if (userStatus) {
+            const reelNum = parseInt(userStatus.latestReelSlotId?.match(/_(\d+)$/)?.[1] || '0');
+            reelSlotIds = [
+                `reel_${reelNum}`,
+                reelNum > 0 ? `reel_${reelNum - 1}` : null,
+                reelNum > 1 ? `reel_${reelNum - 2}` : null
+            ].filter(Boolean);
+        }
+
+        // ✅ STEP 2: Fetch user interests
+        let userInterests = [];
+        try {
+            const userResponse = await axios.get(
+                `https://server1-ki1x.onrender.com/api/users/${userId}`,
+                { timeout: 1000, validateStatus: s => s >= 200 && s < 500 }
+            );
+            if (userResponse.status === 200 && userResponse.data?.success) {
+                userInterests = userResponse.data.user?.interests || [];
+            }
+        } catch (e) {
+            console.warn(`[INTERESTS-SKIP] ${e.message}`);
+        }
+
+        // ✅ STEP 3: Get viewed reels
+        const viewedReelsDocs = await db.collection('contrib_reels').find(
+            { userId },
+            { projection: { ids: 1 }, limit: 5 }
+        ).toArray();
+
+        const viewedReelIds = viewedReelsDocs.flatMap(doc => doc.ids || []);
+        
+        log('info', `[REELS-EXCLUSIONS] Excluding ${viewedReelIds.length} viewed reels`);
+
+        // ✅ STEP 4: Get max values for normalization (from targeted slots only)
+        const maxValues = await db.collection('reels').aggregate([
+            { $match: { _id: { $in: reelSlotIds } } },
+            { $unwind: '$reelsList' },
+            { $match: { 'reelsList.postId': { $nin: viewedReelIds } } },
+            {
+                $group: {
+                    _id: null,
+                    maxLikes: { $max: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } } },
+                    maxComments: { $max: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } } }
+                }
+            }
+        ]).toArray();
+
+        const maxLikes = maxValues[0]?.maxLikes || 1;
+        const maxComments = maxValues[0]?.maxComments || 1;
+
+        log('info', `[NORMALIZATION] maxLikes=${maxLikes}, maxComments=${maxComments}`);
+
+        // ✅ STEP 5: TARGETED aggregation with pagination
+        const pipeline = [
+            // ✅ CRITICAL FIX: Target specific slot documents only
+            { $match: { _id: { $in: reelSlotIds } } },
+            { $unwind: '$reelsList' },
+            { $match: { 'reelsList.postId': { $nin: viewedReelIds } } },
+            {
+                $addFields: {
+                    retentionNum: { $toDouble: { $ifNull: ['$reelsList.retention', 0] } },
+                    likeCountNum: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } },
+                    commentCountNum: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } },
+                    interestScore: {
+                        $cond: {
+                            if: {
+                                $and: [
+                                    { $gt: [{ $size: { $ifNull: [userInterests, []] } }, 0] },
+                                    { $in: ['$reelsList.category', userInterests] }
+                                ]
+                            },
+                            then: 100,
+                            else: {
+                                $cond: {
+                                    if: { $eq: [{ $size: { $ifNull: [userInterests, []] } }, 0] },
+                                    then: 50,
+                                    else: 0
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                $addFields: {
+                    normalizedLikes: {
+                        $multiply: [
+                            { $divide: ['$likeCountNum', maxLikes] },
+                            100
+                        ]
+                    },
+                    normalizedComments: {
+                        $multiply: [
+                            { $divide: ['$commentCountNum', maxComments] },
+                            100
+                        ]
+                    }
+                }
+            },
+            {
+                $addFields: {
+                    compositeScore: {
+                        $add: [
+                            { $multiply: ['$retentionNum', 0.50] },
+                            { $multiply: ['$normalizedLikes', 0.25] },
+                            { $multiply: ['$interestScore', 0.15] },
+                            { $multiply: ['$normalizedComments', 0.10] }
+                        ]
+                    }
+                }
+            },
+            { $sort: { compositeScore: -1 } },
+            { $skip: offsetNum },
+            { $limit: limitNum * 2 },
+            {
+                $project: {
+                    postId: '$reelsList.postId',
+                    userId: '$reelsList.userId',
+                    username: '$reelsList.username',
+                    imageUrl: {
+                        $cond: {
+                            if: { $ifNull: ['$reelsList.videoUrl', false] },
+                            then: '$reelsList.videoUrl',
+                            else: '$reelsList.imageUrl'
+                        }
+                    },
+                    videoUrl: '$reelsList.videoUrl',
+                    caption: '$reelsList.caption',
+                    description: '$reelsList.description',
+                    category: '$reelsList.category',
+                    hashtag: '$reelsList.hashtag',
+                    profilePicUrl: { $ifNull: ['$reelsList.profile_picture_url', ''] },
+                    timestamp: '$reelsList.timestamp',
+                    likeCount: '$likeCountNum',
+                    commentCount: '$commentCountNum',
+                    viewCount: { $toInt: { $ifNull: ['$reelsList.viewCount', 0] } },
+                    retention: '$retentionNum',
+                    interestScore: '$interestScore',
+                    compositeScore: '$compositeScore',
+                    sourceDocument: '$_id',
+                    isReel: { $literal: true }
+                }
+            }
+        ];
+
+        const startAgg = Date.now();
+        const reels = await db.collection('reels').aggregate(pipeline, { maxTimeMS: 3000 }).toArray();
+        const aggTime = Date.now() - startAgg;
+
+        log('info', `[AGGREGATION-COMPLETE] ${reels.length} reels in ${aggTime}ms`);
+
+        // ✅ STEP 6: Client-side deduplication
+        const seenIds = new Set();
+        const uniqueReels = [];
+
+        for (const reel of reels) {
+            if (!seenIds.has(reel.postId)) {
+                seenIds.add(reel.postId);
+
+                log('info', `[REEL-RANKED] ${reel.postId.substring(0, 8)} | ` +
+                    `SCORE=${reel.compositeScore.toFixed(2)} | ` +
+                    `retention=${reel.retention.toFixed(1)}% | ` +
+                    `likes=${reel.likeCount} | ` +
+                    `category=${reel.category || 'none'}`);
+
+                uniqueReels.push(reel);
+
+                if (uniqueReels.length >= limitNum) break;
+            }
+        }
+
+        const totalReads = dbOpCounters.reads - readsBefore;
+        const totalTime = Date.now() - requestStart;
+
+        const responseData = {
+            success: true,
+            content: uniqueReels,
+            hasMore: reels.length >= limitNum,
+            metadata: {
+                totalReturned: uniqueReels.length,
+                userInterests: userInterests,
+                viewedReelsFiltered: viewedReelIds.length,
+                aggregationTimeMs: aggTime,
+                offset: offsetNum,
+                normalization: { maxLikes, maxComments },
+                algorithmWeights: {
+                    retention: 50,
+                    likes: 25,
+                    interest: 15,
+                    comments: 10
+                },
+                slotsQueried: reelSlotIds,
+                dbActivity: { totalReads }
+            }
+        };
+
+        // ✅ Cache for 30 seconds
+        if (redisClient && uniqueReels.length > 0) {
+            redisClient.setex(cacheKey, 30, JSON.stringify(responseData)).catch(e => {
+                console.warn('[CACHE-SET-ERROR]', e.message);
+            });
+        }
+
+        log('info', `[REELS-PERSONALIZED-COMPLETE] ${totalReads} reads | ${totalTime}ms | Returned ${uniqueReels.length} reels`);
+
+        return res.json(responseData);
+
+    } catch (error) {
+        log('error', '[REELS-PERSONALIZED-ERROR]', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to load personalized reels',
+            details: error.message
+        });
+    }
+});
+
+
 
 app.post('/api/feed/instagram-ranked', async (req, res) => {
     const requestStart = Date.now();
