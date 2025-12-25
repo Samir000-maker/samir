@@ -55,6 +55,10 @@ ttl: 30000 // Increased to 30 seconds
 };
 
 
+        // Default to latest slots if user is new
+let reelSlotIds = ['reel_0'];
+let postSlotIds = ['post_0'];
+
 class LRUCache {
     constructor(maxSize = MAX_CACHE_SIZE) {
         this.maxSize = maxSize;
@@ -4352,9 +4356,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
             { projection: { latestReelSlotId: 1, latestPostSlotId: 1 } }
         );
         
-        // Default to latest slots if user is new
-        let reelSlotIds = ['reel_0'];
-        let postSlotIds = ['post_0'];
+
         
         if (userStatus) {
             const reelNum = parseInt(userStatus.latestReelSlotId?.match(/_(\d+)$/)?.[1] || '0');
@@ -4381,8 +4383,8 @@ const userSlots = await db.collection('user_status').findOne(
     { projection: { latestReelSlotId: 1, latestPostSlotId: 1 } }
 );
 
-const postSlotIds = [];
-const reelSlotIds = [];
+// const postSlotIds = [];
+// const reelSlotIds = [];
 
 if (userSlots) {
     // Generate exact slot IDs (last 5 slots)
