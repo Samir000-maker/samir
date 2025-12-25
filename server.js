@@ -10,25 +10,27 @@ console.log(' REDIS_URL:', process.env.REDIS_URL ? '✅ Loaded' : '❌ Missing')
 console.log(' DB_NAME:', process.env.DB_NAME ? '✅ Loaded' : '❌ Missing');
 console.log(' CLUSTER_WORKERS:', process.env.CLUSTER_WORKERS || 'Not set');
 
+import compression from 'compression';
+import { promisify } from 'util';
+import express from 'express';
+import { MongoClient } from 'mongodb';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import axios from 'axios';
+import Redis from 'ioredis';
+import crypto from 'crypto';
 
-const express = require('express');
-const { MongoClient } = require('mongodb');
-const cors = require('cors');
-const rateLimit = require('express-rate-limit');
-const activeRequests = new Map();
-const app = express();
-const PORT = process.env.PORT || 7000;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
-const DB_NAME = process.env.DB_NAME || 'appdb';
-const axios = require('axios');
-const Redis = require('ioredis');
 // const activeRequestsWithTimestamp = new Map();
 // const requestDeduplication = new Map();
 const DEDUP_WINDOW = 5000; // 5 seconds
 
 const RESULT_CACHE_TTL = 30000; // 30 seconds
 
-const crypto = require('crypto');
+const activeRequests = new Map();
+const app = express();
+const PORT = process.env.PORT || 7000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
+const DB_NAME = process.env.DB_NAME || 'appdb';
 
 const CACHE_TTL_SHORT = 15000; // 15 seconds
 const CACHE_TTL_MEDIUM = 60000; // 1 minute
@@ -169,12 +171,6 @@ const dedupMiddleware = async (req, res, next) => {
 
 
 
-
-// const processedRequests = new Map();
-
-
-const compression = require('compression');
-const { promisify } = require('util');
 
 
 console.log('[CONFIG] System Configuration:');
