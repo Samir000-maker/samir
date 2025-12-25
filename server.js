@@ -1,5 +1,7 @@
 'use strict';
-require('dotenv').config();
+import dotenv from 'dotenv';
+dotenv.config();
+
 
 
 console.log('[DEBUG] Environment Variables:');
