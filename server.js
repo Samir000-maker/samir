@@ -1068,9 +1068,6 @@ async function createContribCollectionIndexes() {
     }
 }
 
-// Call in initMongo() after line ~655
-await createContribCollectionIndexes();
-
 
 
 async function createRetentionOptimizedIndexes() {
