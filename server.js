@@ -1276,60 +1276,57 @@ async function initMongo() {
         }
     });
 
-    const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
+    const MONGODB_URI =
+        process.env.MONGODB_URI ||
+        'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
 
-    // ✅ PRODUCTION CONFIG: Handles 50K+ concurrent requests
+    // ✅ PRODUCTION CONFIG (MongoDB Node Driver v4+ compatible)
     const mongoOptions = {
-        // Connection Pool - CRITICAL for high concurrency
-        maxPoolSize: 500,              // Increased from 200 (supports 50K+ req/sec)
-        minPoolSize: 50,               // Keep warm connections
-        maxIdleTimeMS: 300000,         // 5 minutes (prevent premature closure)
-        
-        // Timeouts - Optimized for fast queries
+        // Connection Pool
+        maxPoolSize: 500,
+        minPoolSize: 50,
+        maxIdleTimeMS: 300000,
+
+        // Timeouts
         serverSelectionTimeoutMS: 10000,
-        socketTimeoutMS: 60000,        // 1 minute for complex aggregations
+        socketTimeoutMS: 60000,
         connectTimeoutMS: 15000,
-        
-        // Connection Strategy
-        readPreference: 'secondaryPreferred',  // Offload reads to replicas
-        readConcern: { level: 'majority' },    // Consistency guarantee
-        writeConcern: { w: 'majority', j: false }, // Fast writes with durability
-        
+
+        // Read / Write strategy
+        readPreference: 'secondaryPreferred',
+        readConcern: { level: 'majority' },
+        writeConcern: { w: 'majority', j: false },
+
         retryWrites: true,
         retryReads: true,
-        
-        // Queue Management - CRITICAL
-        waitQueueTimeoutMS: 30000,     // Wait up to 30s for connection
-        maxConnecting: 20,             // Parallel connection establishment
-        
+
+        // Queue management
+        waitQueueTimeoutMS: 30000,
+        maxConnecting: 20,
+
         // Compression
         compressors: ['snappy', 'zlib'],
-        
-        // Health Monitoring
+
+        // Monitoring
         heartbeatFrequencyMS: 10000,
-        serverSelectionRetryFrequencyMS: 5000,
-        
-        // Performance
-        monitorCommands: false,        // Disable in production
-        autoEncryption: undefined,
-        
-        // Prevent common issues
+        monitorCommands: false,
+
+        // Misc
         directConnection: false,
         appName: 'instagram-clone-prod',
-        
-        // ✅ NEW: Connection recovery
-        maxStalenessSeconds: 90,
-        reconnect: true,
-        reconnectTries: Number.MAX_VALUE,
-        reconnectInterval: 1000
+
+        // Read freshness
+        maxStalenessSeconds: 90
     };
 
     try {
         client = new MongoClient(MONGODB_URI, mongoOptions);
-        
-        // ✅ CRITICAL: Enhanced connection pool monitoring
+
+        // Pool lifecycle logs
         client.on('connectionPoolCreated', (event) => {
-            console.log(`[MONGO-POOL] ✅ Created | max=${event.options.maxPoolSize} | min=${event.options.minPoolSize}`);
+            console.log(
+                `[MONGO-POOL] ✅ Created | max=${event.options.maxPoolSize} | min=${event.options.minPoolSize}`
+            );
         });
 
         client.on('connectionPoolReady', () => {
@@ -1339,53 +1336,59 @@ async function initMongo() {
         client.on('connectionCheckOutStarted', () => {
             const poolStats = getPoolStats();
             if (poolStats.available < 50) {
-                console.warn(`[MONGO-POOL] ⚠️ Low availability: ${poolStats.available} connections`);
+                console.warn(
+                    `[MONGO-POOL] ⚠️ Low availability: ${poolStats.available} connections`
+                );
             }
         });
 
         client.on('connectionCheckOutFailed', (event) => {
-            console.error(`[MONGO-POOL] ❌ Checkout failed: ${event.reason}`);
-            // ✅ Alert your monitoring system here
+            console.error(
+                `[MONGO-POOL] ❌ Checkout failed: ${event.reason}`
+            );
         });
 
         client.on('connectionPoolCleared', (event) => {
-            console.error(`[MONGO-POOL] 🚨 Pool cleared: ${event.reason}`);
+            console.error(
+                `[MONGO-POOL] 🚨 Pool cleared: ${event.reason}`
+            );
         });
 
-        // ✅ Connection with retry logic
+        // Connection retry loop (driver-safe)
         let retries = 3;
         while (retries > 0) {
             try {
                 await client.connect();
                 db = client.db(DB_NAME);
-                
-                // Verify connection
+
                 await db.admin().ping();
                 console.log(`[MONGO-INIT] ✅ Connected to ${DB_NAME}`);
                 break;
             } catch (err) {
                 retries--;
-                console.error(`[MONGO-INIT] Connection attempt failed (${3 - retries}/3):`, err.message);
+                console.error(
+                    `[MONGO-INIT] Connection attempt failed (${3 - retries}/3):`,
+                    err.message
+                );
                 if (retries === 0) throw err;
-                await new Promise(resolve => setTimeout(resolve, 5000));
+                await new Promise((r) => setTimeout(r, 5000));
             }
         }
 
-        // Initialize collections and indexes
+        // Init collections / indexes
         await initializeSlots();
         await ensurePostIdUniqueness();
         await createAllProductionIndexes();
 
-        // Start pool monitoring
         startPoolMonitoring();
 
         console.log('[MONGO-INIT] 🚀 Production-ready');
-
     } catch (error) {
         console.error('[MONGO-INIT] ❌ FATAL:', error);
         process.exit(1);
     }
 }
+
 
 // ✅ Helper: Get pool statistics
 function getPoolStats() {
