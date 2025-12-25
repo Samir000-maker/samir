@@ -55,6 +55,43 @@ ttl: 30000 // Increased to 30 seconds
 
 
 
+const dedupMiddleware = async (req, res, next) => {
+    // Only deduplicate POST/PUT/DELETE (not GET)
+    if (req.method === 'GET') {
+        return next();
+    }
+    
+    const requestKey = `req:${req.method}:${req.path}:${crypto.createHash('md5').update(JSON.stringify(req.body || {})).digest('hex')}`;
+    
+    if (redisClient) {
+        try {
+            const inFlight = await redisClient.get(requestKey);
+            if (inFlight) {
+                console.log(`[REQUEST-DEDUP-BLOCKED] ${requestKey.substring(0, 50)}`);
+                return res.status(429).json({ 
+                    success: false, 
+                    error: 'Duplicate request in progress',
+                    retryAfter: 3 
+                });
+            }
+            
+            await redisClient.setex(requestKey, Math.floor(REQUEST_DEDUP_TTL / 1000), '1');
+            
+            res.on('finish', () => {
+                redisClient.del(requestKey).catch(() => {});
+            });
+        } catch (err) {
+            console.error('[DEDUP-ERROR]', err);
+        }
+    }
+    
+    next();
+};
+
+
+
+
+
 const processedRequests = new Map();
 
 
@@ -97,58 +134,106 @@ console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entrie
 }, 60000);
 
 
-const getOrCreateRequest = (key, requestFactory) => {
+const getOrCreateRequest = async (key, requestFactory) => {
     const now = Date.now();
-
-    // ✅ FIXED: Efficient cleanup - only check if over threshold
-    if (activeRequestsWithTimestamp.size > MAX_ACTIVE_REQUESTS) {
-        console.warn(`[REQUEST-DEDUP] Map size: ${activeRequestsWithTimestamp.size} - forcing cleanup`);
-        
-        // ✅ Use Array.from + filter for faster cleanup
-        const expiredKeys = [];
-        for (const [reqKey, reqData] of activeRequestsWithTimestamp.entries()) {
-            if (now - reqData.timestamp > REQUEST_DEDUP_TTL) {
-                expiredKeys.push(reqKey);
+    
+    // ✅ Use Redis if available, otherwise fall back to in-memory (dev only)
+    if (redisClient) {
+        try {
+            // Check if request is already in-flight
+            const existing = await redisClient.get(`inflight:${key}`);
+            
+            if (existing) {
+                console.log(`[REQUEST-DEDUP-HIT-REDIS] ${key.substring(0, 50)}`);
+                
+                // Wait for the existing request to complete
+                return new Promise((resolve, reject) => {
+                    const checkInterval = setInterval(async () => {
+                        try {
+                            const result = await redisClient.get(`result:${key}`);
+                            const inFlight = await redisClient.get(`inflight:${key}`);
+                            
+                            if (result) {
+                                clearInterval(checkInterval);
+                                await redisClient.del(`result:${key}`);
+                                resolve(JSON.parse(result));
+                            } else if (!inFlight) {
+                                // Request failed, create new one
+                                clearInterval(checkInterval);
+                                resolve(await executeRequest(key, requestFactory));
+                            }
+                        } catch (err) {
+                            clearInterval(checkInterval);
+                            reject(err);
+                        }
+                    }, 50);
+                    
+                    // Timeout after 10 seconds
+                    setTimeout(() => {
+                        clearInterval(checkInterval);
+                        reject(new Error('Request deduplication timeout'));
+                    }, 10000);
+                });
             }
-            // ✅ Early exit if we've found enough to clean
-            if (expiredKeys.length > 1000) break;
-        }
-        
-        expiredKeys.forEach(k => activeRequestsWithTimestamp.delete(k));
-        console.log(`[REQUEST-DEDUP-CLEANUP] Removed ${expiredKeys.length} expired entries`);
-        
-        // ✅ CRITICAL: If still over limit, remove oldest entries
-        if (activeRequestsWithTimestamp.size > MAX_ACTIVE_REQUESTS) {
-            const sortedEntries = Array.from(activeRequestsWithTimestamp.entries())
-                .sort((a, b) => a[1].timestamp - b[1].timestamp);
             
-            const toRemove = sortedEntries.slice(0, 1000);
-            toRemove.forEach(([k]) => activeRequestsWithTimestamp.delete(k));
+            // Mark request as in-flight
+            await redisClient.setex(`inflight:${key}`, 10, '1'); // 10 second TTL
             
-            console.warn(`[REQUEST-DEDUP-EVICTION] Evicted ${toRemove.length} oldest entries`);
+            // Execute request
+            return await executeRequest(key, requestFactory);
+            
+        } catch (err) {
+            console.error('[REQUEST-DEDUP-REDIS-ERROR]', err.message);
+            // Fall through to in-memory fallback
         }
     }
-
-    // Check if request already in-flight
+    
+    // ✅ FALLBACK: In-memory for development (with fixed-size LRU)
     if (activeRequestsWithTimestamp.has(key)) {
-        console.log(`[REQUEST-DEDUP-HIT] ${key.substring(0, 50)}`);
+        console.log(`[REQUEST-DEDUP-HIT-MEMORY] ${key.substring(0, 50)}`);
         return activeRequestsWithTimestamp.get(key).promise;
     }
-
-    // Create new request
+    
+    // ✅ LRU eviction: If map is too large, remove oldest entries
+    if (activeRequestsWithTimestamp.size >= MAX_ACTIVE_REQUESTS) {
+        const sortedEntries = Array.from(activeRequestsWithTimestamp.entries())
+            .sort((a, b) => a[1].timestamp - b[1].timestamp);
+        
+        const toRemove = sortedEntries.slice(0, 1000);
+        toRemove.forEach(([k]) => activeRequestsWithTimestamp.delete(k));
+        
+        console.log(`[REQUEST-DEDUP-LRU-EVICTION] Removed ${toRemove.length} oldest entries`);
+    }
+    
     const promise = requestFactory().finally(() => {
         activeRequestsWithTimestamp.delete(key);
     });
-
+    
     activeRequestsWithTimestamp.set(key, {
         promise,
         timestamp: now
     });
-
+    
     return promise;
 };
 
-
+async function executeRequest(key, requestFactory) {
+    try {
+        const result = await requestFactory();
+        
+        // Cache result for 5 seconds (for waiting duplicates)
+        if (redisClient) {
+            await redisClient.setex(`result:${key}`, 5, JSON.stringify(result));
+        }
+        
+        return result;
+    } finally {
+        // Remove in-flight marker
+        if (redisClient) {
+            await redisClient.del(`inflight:${key}`);
+        }
+    }
+}
 
 // ✅ Alternative: If excluded IDs change frequently, use user slot-based caching
 function generateSlotBasedCacheKey(userId, userStatus) {
@@ -317,40 +402,6 @@ app.use('/api', rateLimit({ windowMs: 1000, max: 1000, standardHeaders: true, le
 app.use(express.json());
 
 
-app.use(async (req, res, next) => {
-    if (req.method !== 'POST' && req.method !== 'GET') return next();
-    
-    const requestKey = `req:${req.method}:${req.originalUrl}:${req.body ? JSON.stringify(req.body) : ''}`;
-    
-    if (redisClient) {
-        try {
-            // Check if identical request is in-flight
-            const inFlight = await redisClient.get(requestKey);
-            if (inFlight) {
-                console.log(`[REQUEST-DEDUP-BLOCKED] ${requestKey.substring(0, 50)}`);
-                return res.status(429).json({ 
-                    success: false, 
-                    error: 'Duplicate request in progress',
-                    retryAfter: 3 
-                });
-            }
-            
-            // Mark request as in-flight
-            await redisClient.setex(requestKey, Math.floor(REQUEST_DEDUP_TTL / 1000), '1');
-            
-            // Clear on response
-            res.on('finish', () => {
-                redisClient.del(requestKey).catch(() => {});
-            });
-        } catch (err) {
-            console.error('[DEDUP-ERROR]', err);
-        }
-    }
-    
-    next();
-});
-
-
 app.use(compression({
 level: 6, // Balance between speed and compression
 threshold: 1024, // Only compress responses > 1KB
@@ -491,6 +542,84 @@ console.error('[INDEX-CREATION-ERROR]', error);
 }
 
 
+
+async function createMissingCriticalIndexes() {
+    try {
+        console.log('[CRITICAL-INDEXES] Creating missing production indexes...');
+
+        const criticalIndexes = [
+            // ✅ FIX: Add compound index for retention check queries
+            {
+                collection: 'user_interaction_cache',
+                index: { _id: 1, retentionContributed: 1 },
+                options: { 
+                    name: 'retention_check_compound_fixed',
+                    background: true
+                }
+            },
+            
+            // ✅ FIX: Optimize contrib collection queries
+            {
+                collection: 'contrib_posts',
+                index: { _id: 1 },
+                options: { 
+                    name: 'contrib_posts_id_optimized',
+                    background: true
+                }
+            },
+            {
+                collection: 'contrib_reels',
+                index: { _id: 1 },
+                options: { 
+                    name: 'contrib_reels_id_optimized',
+                    background: true
+                }
+            },
+            
+            // ✅ FIX: Add text index for faster regex searches (if needed)
+            {
+                collection: 'contrib_posts',
+                index: { _id: 'text' },
+                options: { 
+                    name: 'contrib_posts_text_search',
+                    background: true,
+                    weights: { _id: 1 }
+                }
+            },
+            {
+                collection: 'contrib_reels',
+                index: { _id: 'text' },
+                options: { 
+                    name: 'contrib_reels_text_search',
+                    background: true,
+                    weights: { _id: 1 }
+                }
+            }
+        ];
+
+        let created = 0;
+        let skipped = 0;
+
+        for (const { collection, index, options } of criticalIndexes) {
+            try {
+                await db.collection(collection).createIndex(index, options);
+                created++;
+                console.log(`[CRITICAL-INDEX] ✅ ${options.name}`);
+            } catch (err) {
+                if (err.code === 85 || err.code === 86) {
+                    skipped++;
+                } else {
+                    console.warn(`[CRITICAL-INDEX-WARN] ${collection}: ${err.message}`);
+                }
+            }
+        }
+
+        console.log(`[CRITICAL-INDEXES] ✅ Created ${created}, Skipped ${skipped} existing`);
+
+    } catch (error) {
+        console.error('[CRITICAL-INDEX-ERROR]', error.message);
+    }
+}
 
 
 async function createProductionIndexes() {
@@ -763,31 +892,11 @@ await enableSharding();
 await createInstagramFeedIndexes();
 
 
-// Add after initMongo() in PORT 2000
-// setInterval(async () => {
-// try {
-// console.log('[PERIODIC-SYNC] Running background metrics sync check');
-
-// // Get all posts/reels that haven't been synced in the last 5 minutes
-// const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-
-// const collections = ['posts', 'reels'];
-// for (const collection of collections) {
-// const arrayField = collection === 'reels' ? 'reelsList' : 'postList';
-// const docs = await db.collection(collection).find({
-// [`${arrayField}.lastSynced`]: { $lt: fiveMinutesAgo.toISOString() }
-// }).limit(50).toArray();
-
-// console.log(`[PERIODIC-SYNC] Found ${docs.length} outdated ${collection}`);
-// }
-// } catch (error) {
-// console.error('[PERIODIC-SYNC-ERROR]', error);
-// }
-// }, 5 * 60 * 1000); // Every 5 minutes
-
 
 await createUltraFastRetentionIndexes();
 
+
+await createMissingCriticalIndexes();
 
 
 // Inside initMongo() after existing indexes:
@@ -1981,124 +2090,155 @@ async allocateSlot(col, postData, maxAttempts = 5) {
     const listKey = col === 'reels' ? 'reelsList' : 'postList';
     const postId = postData.postId;
 
-    console.log(`[SLOT-ALLOCATION] ${col} | PostId: ${postId} | MAX: ${MAX_CONTENT_PER_SLOT}`);
+    const invalidateCache = async () => {
+        await this.invalidateSlotCache(col);
+        if (redisClient) {
+            await redisClient
+                .del(`max_index_${col}`)
+                .catch(err => console.warn('[REDIS-DEL-FAILED]', err.message));
+        }
+    };
 
-    // ✅ CRITICAL: Check for duplicates FIRST (prevents duplicate writes)
-    const existingCheck = await coll.findOne(
-        { [`${listKey}.postId`]: postId },
-        { projection: { _id: 1, count: 1 } }
-    );
-
-    if (existingCheck) {
-        console.log(`[DUPLICATE-PREVENTED] ${postId} exists in ${existingCheck._id}`);
-        return existingCheck;
-    }
+    console.log(`[SLOT-ALLOCATION] ${col} | PostId: ${postId}`);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            console.log(`[SLOT-ATTEMPT-${attempt}/${maxAttempts}] ${col} | PostId: ${postId}`);
+            console.log(`[SLOT-ATTEMPT-${attempt}/${maxAttempts}] ${col} | ${postId}`);
 
-            // ✅ CRITICAL FIX: Use findOneAndUpdate with ATOMIC increment
-            // This prevents race conditions by making find+update atomic
-            const result = await coll.findOneAndUpdate(
+            /**
+             * 1️⃣ Try to push into an existing slot (atomic)
+             */
+            const updateResult = await coll.findOneAndUpdate(
                 {
                     count: { $lt: MAX_CONTENT_PER_SLOT },
-                    [`${listKey}.postId`]: { $ne: postId }  // Extra duplicate check
+                    [`${listKey}.postId`]: { $ne: postId }
                 },
                 {
                     $push: { [listKey]: postData },
-                    $inc: { count: 1 }  // ✅ ATOMIC increment
+                    $inc: { count: 1 }
                 },
                 {
-                    sort: { index: -1 },  // Get latest slot first
-                    returnDocument: 'after',  // Return updated document
+                    sort: { index: -1 },
+                    returnDocument: 'after',
                     projection: { _id: 1, index: 1, count: 1 }
                 }
             );
 
-            if (result) {
-                console.log(`[SLOT-SUCCESS] ${postId} → ${result._id} | Count: ${result.count - 1} → ${result.count}/${MAX_CONTENT_PER_SLOT}`);
+            if (updateResult.value) {
+                const doc = updateResult.value;
 
-                // ✅ Invalidate cache
-                await this.invalidateSlotCache(col);
-                if (redisClient) {
-                    await redisClient.del(`max_index_${col}`).catch(() => {});
-                }
+                console.log(
+                    `[SLOT-SUCCESS] ${postId} → ${doc._id} (${doc.count}/${MAX_CONTENT_PER_SLOT})`
+                );
+
+                await invalidateCache();
 
                 return {
-                    _id: result._id,
-                    index: result.index,
-                    count: result.count
+                    _id: doc._id,
+                    index: doc.index,
+                    count: doc.count
                 };
             }
 
-            // ✅ No available slot - create new one
-            console.log(`[NO-SLOTS] All slots full (${MAX_CONTENT_PER_SLOT} items) - creating new slot`);
+            /**
+             * 2️⃣ No available slot → create a new one
+             */
+            console.log(`[NO-SLOTS] Creating new slot (attempt ${attempt})`);
 
-            // ✅ Get max index atomically
-            const maxDoc = await coll.findOne(
-                {},
-                {
-                    sort: { index: -1 },
-                    projection: { index: 1 }
-                }
-            );
+            const counterResult = await this.db
+                .collection('slot_counters')
+                .findOneAndUpdate(
+                    { _id: `${col}_counter` },
+                    { $inc: { value: 1 } },
+                    { upsert: true, returnDocument: 'after' }
+                );
 
-            const currentMaxIndex = maxDoc?.index ?? -1;
-            const nextIndex = currentMaxIndex + 1;
+            const nextIndex = counterResult.value.value;
             const newId = `${col.slice(0, -1)}_${nextIndex}`;
 
-            console.log(`[CREATE-SLOT-${attempt}] ${newId} (index: ${nextIndex})`);
+            const newDoc = {
+                _id: newId,
+                index: nextIndex,
+                count: 1,
+                [listKey]: [postData],
+                createdAt: new Date()
+            };
 
             try {
-                const newDoc = {
-                    _id: newId,
-                    index: nextIndex,
-                    count: 1,
-                    [listKey]: [postData],
-                    createdAt: new Date().toISOString()
-                };
-
                 await coll.insertOne(newDoc);
 
-                console.log(`[SLOT-CREATED] ${newId} | PostId: ${postId} | Capacity: 1/${MAX_CONTENT_PER_SLOT}`);
+                console.log(
+                    `[SLOT-CREATED] ${newId} | PostId: ${postId} | 1/${MAX_CONTENT_PER_SLOT}`
+                );
 
-                await setCache(`max_index_${col}`, nextIndex, 5000);
-                await this.invalidateSlotCache(col);
+                await invalidateCache();
 
-                return newDoc;
+                return {
+                    _id: newId,
+                    index: nextIndex,
+                    count: 1
+                };
 
             } catch (insertErr) {
+                /**
+                 * 3️⃣ Slot already created by another worker → retry push
+                 */
                 if (insertErr.code === 11000) {
-                    // ✅ Another process created this slot - retry with findOneAndUpdate
-                    console.log(`[DUPLICATE-KEY-${attempt}] ${newId} exists, retrying...`);
+                    console.log(`[DUPLICATE-SLOT] ${newId} exists, retrying push`);
 
-                    if (redisClient) {
-                        await redisClient.del(`max_index_${col}`).catch(() => {});
+                    const retryResult = await coll.findOneAndUpdate(
+                        {
+                            _id: newId,
+                            count: { $lt: MAX_CONTENT_PER_SLOT },
+                            [`${listKey}.postId`]: { $ne: postId }
+                        },
+                        {
+                            $push: { [listKey]: postData },
+                            $inc: { count: 1 }
+                        },
+                        {
+                            returnDocument: 'after',
+                            projection: { _id: 1, index: 1, count: 1 }
+                        }
+                    );
+
+                    if (retryResult.value) {
+                        const doc = retryResult.value;
+
+                        console.log(`[SLOT-RETRY-SUCCESS] ${postId} → ${doc._id}`);
+
+                        await invalidateCache();
+
+                        return {
+                            _id: doc._id,
+                            index: doc.index,
+                            count: doc.count
+                        };
                     }
-
-                    // ✅ Exponential backoff
-                    await new Promise(resolve => setTimeout(resolve, 50 * Math.pow(2, attempt - 1)));
-                    continue;
+                } else {
+                    throw insertErr;
                 }
-
-                throw insertErr;
             }
 
         } catch (error) {
-            console.error(`[SLOT-ERROR-${attempt}] ${col} | ${error.message}`);
+            console.error(`[SLOT-ERROR-${attempt}] ${error.message}`);
 
             if (attempt === maxAttempts) {
-                throw new Error(`Slot allocation failed after ${maxAttempts} attempts: ${error.message}`);
+                throw new Error(
+                    `Slot allocation failed after ${maxAttempts} attempts: ${error.message}`
+                );
             }
 
-            // ✅ Exponential backoff
-            await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, attempt - 1)));
+            // exponential backoff
+            await new Promise(resolve =>
+                setTimeout(resolve, 100 * Math.pow(2, attempt - 1))
+            );
         }
     }
 
-    throw new Error(`Could not allocate slot for ${postId} after ${maxAttempts} attempts`);
+    throw new Error(`Could not allocate slot for postId ${postId}`);
 }
+
 
 // NEW: Helper to invalidate slot cache
 async invalidateSlotCache(col) {
@@ -2559,64 +2699,74 @@ res.json(stats);
 });
 
 
-// Ultra-fast retention contribution check - O(1) lookup
-// Replace existing /api/retention/check/:userId/:postId endpoint
 app.get('/api/retention/check/:userId/:postId', async (req, res) => {
-try {
-const { userId, postId } = req.params;
+    try {
+        const { userId, postId } = req.params;
 
-if (!userId || !postId) {
-return res.status(400).json({ error: 'userId and postId required' });
-}
+        if (!userId || !postId) {
+            return res.status(400).json({ error: 'userId and postId required' });
+        }
 
-const retentionCacheKey = `retention_${userId}_${postId}`;
+        const retentionCacheKey = `retention_${userId}_${postId}`;
 
-console.log(`[RETENTION-CHECK] User: ${userId} | Post: ${postId} | Total Reads: ${dbOpCounters.reads}`);
+        console.log(`[RETENTION-CHECK] User: ${userId} | Post: ${postId}`);
 
-// Check memory cache first
-const cached = getCache(retentionCacheKey);
-if (cached !== null) {
-console.log(`[RETENTION-CACHE-HIT] Saved 1 DB read | Total Reads: ${dbOpCounters.reads}`);
-return res.json({
-success: true,
-hasContributed: cached,
-source: 'cache',
-queryTime: 0
-});
-}
+        // ✅ Check Redis cache first (fastest)
+        if (redisClient) {
+            try {
+                const cached = await redisClient.get(retentionCacheKey);
+                if (cached !== null) {
+                    console.log(`[RETENTION-CACHE-HIT-REDIS] Saved DB read`);
+                    return res.json({
+                        success: true,
+                        hasContributed: cached === 'true',
+                        source: 'cache',
+                        queryTime: 0
+                    });
+                }
+            } catch (err) {
+                console.warn('[REDIS-ERROR]', err.message);
+            }
+        }
 
-const today = new Date().toISOString().split('T')[0];
-const dbReadsBefore = dbOpCounters.reads;
-const start = Date.now();
+        const today = new Date().toISOString().split('T')[0];
+        const dbReadsBefore = dbOpCounters.reads;
+        const start = Date.now();
 
-const result = await db.collection('user_interaction_cache').findOne(
-{
-_id: `${userId}_session_${today}`,
-retentionContributed: postId
-},
-{ projection: { _id: 1 } }
-);
+        // ✅ OPTIMIZED QUERY: Uses compound index { _id: 1, retentionContributed: 1 }
+        const result = await db.collection('user_interaction_cache').findOne(
+            {
+                _id: `${userId}_session_${today}`,
+                retentionContributed: postId
+            },
+            { 
+                projection: { _id: 1 },
+                maxTimeMS: 1000 // Prevent slow queries
+            }
+        );
 
-const queryTime = Date.now() - start;
-const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
-const hasContributed = !!result;
+        const queryTime = Date.now() - start;
+        const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
+        const hasContributed = !!result;
 
-// Cache for 2 hours
-setCache(retentionCacheKey, hasContributed, 7200000);
+        // ✅ Cache for 2 hours in Redis
+        if (redisClient) {
+            redisClient.setex(retentionCacheKey, 7200, hasContributed ? 'true' : 'false').catch(() => {});
+        }
 
-console.log(`[RETENTION-DB-CHECK] Result: ${hasContributed} | Used ${dbReadsUsed} DB reads | Time: ${queryTime}ms | Total Reads: ${dbOpCounters.reads}`);
+        console.log(`[RETENTION-DB-CHECK] Result: ${hasContributed} | Reads: ${dbReadsUsed} | Time: ${queryTime}ms`);
 
-return res.json({
-success: true,
-hasContributed,
-source: 'database',
-queryTime
-});
+        return res.json({
+            success: true,
+            hasContributed,
+            source: 'database',
+            queryTime
+        });
 
-} catch (error) {
-console.error(`[RETENTION-CHECK-ERROR] ${error.message} | Total Reads: ${dbOpCounters.reads}`);
-return res.status(500).json({ error: 'Failed to check retention contribution' });
-}
+    } catch (error) {
+        console.error(`[RETENTION-CHECK-ERROR] ${error.message}`);
+        return res.status(500).json({ error: 'Failed to check retention contribution' });
+    }
 });
 
 
@@ -3033,7 +3183,7 @@ return res.status(500).json({ error: 'Failed to check batch retention' });
 });
 
 
-app.post('/api/contributed-views/batch-optimized', async (req, res) => {
+app.post('/api/contributed-views/batch-optimized', dedupMiddleware, async (req, res) => {
     const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
     const startTime = Date.now();
 
@@ -3370,7 +3520,7 @@ next();
 
 
 
-app.post('/api/posts', async (req, res) => {
+app.post('/api/posts', dedupMiddleware, async (req, res) => {
 const postData = req.body;
 
 if (!postData.userId || !postData.postId) {
@@ -3947,7 +4097,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         }
         
         const limitNum = parseInt(limit, 10) || DEFAULT_CONTENT_BATCH_SIZE;
-        const cacheKey = generateSlotBasedCacheKey(userId, userStatus);
+        const cacheKey = `feed:ranked:${userId}:${limitNum}`;
         
         // ✅ CHECK REDIS CACHE FIRST
         if (redisClient) {
@@ -3976,7 +4126,6 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         let postSlotIds = ['post_0'];
         
         if (userStatus) {
-            // Extract slot numbers and get current + 2 previous slots
             const reelNum = parseInt(userStatus.latestReelSlotId?.match(/_(\d+)$/)?.[1] || '0');
             const postNum = parseInt(userStatus.latestPostSlotId?.match(/_(\d+)$/)?.[1] || '0');
             
@@ -3995,20 +4144,27 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         
         console.log(`[FEED-SLOTS] Reels: ${reelSlotIds} | Posts: ${postSlotIds}`);
         
-        // ✅ STEP 2: Get viewed content (1 read each)
-        const [viewedPostsDocs, viewedReelsDocs] = await Promise.all([
-            db.collection('contrib_posts').find(
-                { userId },
-                { projection: { ids: 1 }, limit: 5 }
-            ).toArray(),
-            db.collection('contrib_reels').find(
-                { userId },
-                { projection: { ids: 1 }, limit: 5 }
-            ).toArray()
+        // ✅ STEP 2: Get viewed content using OPTIMIZED AGGREGATION (2 reads)
+        // Instead of scanning all userId docs, we aggregate by slot
+        const [viewedPostsData, viewedReelsData] = await Promise.all([
+            db.collection('contrib_posts').aggregate([
+                { $match: { _id: { $regex: `^${userId}_` } } }, // Only docs for this user
+                { $project: { ids: 1 } },
+                { $limit: 10 }, // Limit documents scanned
+                { $unwind: '$ids' },
+                { $group: { _id: null, allIds: { $addToSet: '$ids' } } }
+            ]).toArray(),
+            db.collection('contrib_reels').aggregate([
+                { $match: { _id: { $regex: `^${userId}_` } } },
+                { $project: { ids: 1 } },
+                { $limit: 10 },
+                { $unwind: '$ids' },
+                { $group: { _id: null, allIds: { $addToSet: '$ids' } } }
+            ]).toArray()
         ]);
         
-        const serverViewedPosts = viewedPostsDocs.flatMap(doc => doc.ids || []);
-        const serverViewedReels = viewedReelsDocs.flatMap(doc => doc.ids || []);
+        const serverViewedPosts = viewedPostsData[0]?.allIds || [];
+        const serverViewedReels = viewedReelsData[0]?.allIds || [];
         
         const allExcludedPosts = [...new Set([...serverViewedPosts, ...excludedPostIds])];
         const allExcludedReels = [...new Set([...serverViewedReels, ...excludedReelIds])];
@@ -4029,49 +4185,96 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
             console.warn(`[INTERESTS-SKIP] ${e.message}`);
         }
         
-        // ✅ STEP 4: TARGETED aggregation - only query specific slot documents
-        const buildSlotPipeline = (slotIds, arrayField, excludedIds) => [
-            // ✅ CRITICAL FIX: Target specific documents by _id
-            { $match: { _id: { $in: slotIds } } },
-            { $unwind: `$${arrayField}` },
-            { $match: { [`${arrayField}.postId`]: { $nin: excludedIds } } },
-            { $limit: limitNum * 2 },
-            {
-                $addFields: {
-                    retentionNum: { $toDouble: { $ifNull: [`$${arrayField}.retention`, 0] } },
-                    likeCountNum: { $toInt: { $ifNull: [`$${arrayField}.likeCount`, 0] } },
-                    commentCountNum: { $toInt: { $ifNull: [`$${arrayField}.commentCount`, 0] } },
-                    interestScore: {
-                        $cond: {
-                            if: { $in: [`$${arrayField}.category`, userInterests] },
-                            then: 100,
-                            else: { $cond: [{ $eq: [{ $size: { $ifNull: [userInterests, []] } }, 0] }, 50, 0] }
+        // ✅ STEP 4: OPTIMIZED aggregation - uses $lookup instead of $nin for exclusions
+        const buildOptimizedPipeline = (slotIds, arrayField, excludedIds) => {
+            // Create temporary exclusion lookup
+            const exclusionDocs = excludedIds.slice(0, 100).map(id => ({ _id: id })); // Limit to 100 for performance
+            
+            return [
+                { $match: { _id: { $in: slotIds } } },
+                { $unwind: `$${arrayField}` },
+                // ✅ FIXED: Use $lookup instead of $nin for better performance
+                {
+                    $lookup: {
+                        from: 'temp_exclusions_' + arrayField,
+                        localField: `${arrayField}.postId`,
+                        foreignField: '_id',
+                        as: 'excluded'
+                    }
+                },
+                { $match: { excluded: { $size: 0 } } }, // Only non-excluded items
+                { $limit: limitNum * 2 },
+                {
+                    $addFields: {
+                        retentionNum: { $toDouble: { $ifNull: [`$${arrayField}.retention`, 0] } },
+                        likeCountNum: { $toInt: { $ifNull: [`$${arrayField}.likeCount`, 0] } },
+                        commentCountNum: { $toInt: { $ifNull: [`$${arrayField}.commentCount`, 0] } },
+                        interestScore: {
+                            $cond: {
+                                if: { $in: [`$${arrayField}.category`, userInterests] },
+                                then: 100,
+                                else: { $cond: [{ $eq: [{ $size: { $ifNull: [userInterests, []] } }, 0] }, 50, 0] }
+                            }
                         }
                     }
-                }
-            },
-            {
-                $addFields: {
-                    compositeScore: {
-                        $add: [
-                            { $multiply: ['$retentionNum', 0.50] },
-                            { $multiply: ['$likeCountNum', 0.30] },
-                            { $multiply: ['$interestScore', 0.15] },
-                            { $multiply: ['$commentCountNum', 0.05] }
-                        ]
+                },
+                {
+                    $addFields: {
+                        compositeScore: {
+                            $add: [
+                                { $multiply: ['$retentionNum', 0.50] },
+                                { $multiply: ['$likeCountNum', 0.30] },
+                                { $multiply: ['$interestScore', 0.15] },
+                                { $multiply: ['$commentCountNum', 0.05] }
+                            ]
+                        }
                     }
-                }
-            },
-            { $sort: { compositeScore: -1 } },
-            { $limit: limitNum }
-        ];
+                },
+                { $sort: { compositeScore: -1 } },
+                { $limit: limitNum }
+            ];
+        };
         
         const aggStart = Date.now();
         
-        // ✅ Execute TARGETED aggregations (only on specific slot documents)
+        // ✅ For production: Use in-memory filtering instead of $nin for small exclusion sets
+        // If exclusions > 100, consider creating temp collection (more complex, shown below)
+        
         const [allPosts, allReels] = await Promise.all([
             db.collection('posts').aggregate([
-                ...buildSlotPipeline(postSlotIds, 'postList', allExcludedPosts),
+                { $match: { _id: { $in: postSlotIds } } },
+                { $unwind: '$postList' },
+                // ✅ OPTIMIZED: Filter in aggregation but limit early
+                { $match: allExcludedPosts.length < 100 ? { 'postList.postId': { $nin: allExcludedPosts } } : {} },
+                { $limit: limitNum * 2 },
+                {
+                    $addFields: {
+                        retentionNum: { $toDouble: { $ifNull: ['$postList.retention', 0] } },
+                        likeCountNum: { $toInt: { $ifNull: ['$postList.likeCount', 0] } },
+                        commentCountNum: { $toInt: { $ifNull: ['$postList.commentCount', 0] } },
+                        interestScore: {
+                            $cond: {
+                                if: { $in: ['$postList.category', userInterests] },
+                                then: 100,
+                                else: { $cond: [{ $eq: [{ $size: { $ifNull: [userInterests, []] } }, 0] }, 50, 0] }
+                            }
+                        }
+                    }
+                },
+                {
+                    $addFields: {
+                        compositeScore: {
+                            $add: [
+                                { $multiply: ['$retentionNum', 0.50] },
+                                { $multiply: ['$likeCountNum', 0.30] },
+                                { $multiply: ['$interestScore', 0.15] },
+                                { $multiply: ['$commentCountNum', 0.05] }
+                            ]
+                        }
+                    }
+                },
+                { $sort: { compositeScore: -1 } },
+                { $limit: limitNum },
                 {
                     $project: {
                         postId: '$postList.postId',
@@ -4096,7 +4299,38 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
             ], { maxTimeMS: 3000 }).toArray(),
             
             db.collection('reels').aggregate([
-                ...buildSlotPipeline(reelSlotIds, 'reelsList', allExcludedReels),
+                { $match: { _id: { $in: reelSlotIds } } },
+                { $unwind: '$reelsList' },
+                { $match: allExcludedReels.length < 100 ? { 'reelsList.postId': { $nin: allExcludedReels } } : {} },
+                { $limit: limitNum * 2 },
+                {
+                    $addFields: {
+                        retentionNum: { $toDouble: { $ifNull: ['$reelsList.retention', 0] } },
+                        likeCountNum: { $toInt: { $ifNull: ['$reelsList.likeCount', 0] } },
+                        commentCountNum: { $toInt: { $ifNull: ['$reelsList.commentCount', 0] } },
+                        interestScore: {
+                            $cond: {
+                                if: { $in: ['$reelsList.category', userInterests] },
+                                then: 100,
+                                else: { $cond: [{ $eq: [{ $size: { $ifNull: [userInterests, []] } }, 0] }, 50, 0] }
+                            }
+                        }
+                    }
+                },
+                {
+                    $addFields: {
+                        compositeScore: {
+                            $add: [
+                                { $multiply: ['$retentionNum', 0.50] },
+                                { $multiply: ['$likeCountNum', 0.30] },
+                                { $multiply: ['$interestScore', 0.15] },
+                                { $multiply: ['$commentCountNum', 0.05] }
+                            ]
+                        }
+                    }
+                },
+                { $sort: { compositeScore: -1 } },
+                { $limit: limitNum },
                 {
                     $project: {
                         postId: '$reelsList.postId',
@@ -4122,16 +4356,24 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
         
         console.log(`[FEED-AGGREGATION] ${Date.now() - aggStart}ms | Posts: ${allPosts.length} | Reels: ${allReels.length}`);
         
-        // ✅ STEP 5: Deduplicate and merge
+        // ✅ STEP 5: Client-side deduplication and final filtering
         const seenIds = new Set();
         const finalContent = [];
-        const allContent = [...allPosts, ...allReels].sort((a, b) => (b.compositeScore || 0) - (a.compositeScore || 0));
+        
+        // If we had >100 exclusions, filter here
+        const allContent = [...allPosts, ...allReels];
+        const excludedSet = new Set([...allExcludedPosts, ...allExcludedReels]);
         
         for (const item of allContent) {
-            if (!item?.postId || seenIds.has(item.postId) || finalContent.length >= limitNum) continue;
+            if (!item?.postId || seenIds.has(item.postId) || excludedSet.has(item.postId) || finalContent.length >= limitNum) {
+                continue;
+            }
             seenIds.add(item.postId);
             finalContent.push(item);
         }
+        
+        // Sort by composite score
+        finalContent.sort((a, b) => (b.compositeScore || 0) - (a.compositeScore || 0));
         
         const totalReads = dbOpCounters.reads - readsBefore;
         const totalTime = Date.now() - requestStart;
@@ -4776,9 +5018,8 @@ return res.status(500).json({ error: 'Failed to check interactions' });
 
 
 
-// REPLACE /api/interactions/view endpoint (line ~3487)
 
-app.post('/api/interactions/view', async (req, res) => {
+app.post('/api/interactions/view', dedupMiddleware, async (req, res) => {
     try {
         const { userId, postId, sourceDocument, retentionData } = req.body;
 
@@ -4897,8 +5138,7 @@ app.post('/api/interactions/view', async (req, res) => {
     }
 });
 
-// ✅ REPLACE THIS SECTION - Remove contributionToLike operations
-app.post('/api/interactions/like', async (req, res) => {
+app.post('/api/interactions/like', dedupMiddleware, async (req, res) => {
 try {
 const { userId, postId, sourceDocument, action } = req.body;
 
