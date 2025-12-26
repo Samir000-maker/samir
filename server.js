@@ -805,6 +805,91 @@ console.error('[INDEX-CREATION-ERROR]', error);
 
 
 
+
+
+
+
+async function allocateSlot(col, postData, maxAttempts = 10) {
+    let result;
+
+    return await sessionManager.withSession(async (session) => {
+        await session.withTransaction(
+            async () => {
+                const lockKey = `slot_allocation:${col}`;
+                let lockValue;
+
+                try {
+                    lockValue = await acquireDistributedLock(lockKey, 15);
+
+                    if (!lockValue) {
+                        throw new Error('Failed to acquire lock');
+                    }
+
+                    // 1️⃣ Try to append to an existing slot
+                    const updateResult = await this.db
+                        .collection(col)
+                        .findOneAndUpdate(
+                            {
+                                count: { $lt: MAX_CONTENT_PER_SLOT },
+                                [`${listKey}.postId`]: { $ne: postData.postId }
+                            },
+                            {
+                                $push: { [listKey]: postData },
+                                $inc: { count: 1 }
+                            },
+                            {
+                                sort: { index: -1 },
+                                returnDocument: 'after',
+                                session
+                            }
+                        );
+
+                    if (updateResult.value) {
+                        result = {
+                            _id: updateResult.value._id,
+                            index: updateResult.value.index,
+                            count: updateResult.value.count
+                        };
+                        return;
+                    }
+
+                    // 2️⃣ Create a new slot
+                    const nextIndex = await getNextSlotIndex(col);
+                    const newId = `${col.slice(0, -1)}_${nextIndex}`;
+
+                    await this.db.collection(col).insertOne(
+                        {
+                            _id: newId,
+                            index: nextIndex,
+                            count: 1,
+                            [listKey]: [postData],
+                            createdAt: new Date()
+                        },
+                        { session }
+                    );
+
+                    result = {
+                        _id: newId,
+                        index: nextIndex,
+                        count: 1
+                    };
+                } finally {
+                    if (lockValue) {
+                        await releaseDistributedLock(lockKey, lockValue);
+                    }
+                }
+            },
+            {
+                readConcern: { level: 'snapshot' },
+                writeConcern: { w: 'majority' },
+                readPreference: 'primary'
+            }
+        );
+
+        return result;
+    });
+}
+
 async function createMissingCriticalIndexes() {
     try {
         console.log('[CRITICAL-INDEXES] Creating missing production indexes...');
@@ -2228,87 +2313,6 @@ return maxIndex;
 }
 
 
-
-async function allocateSlot(col, postData, maxAttempts = 10) {
-    let result;
-
-    return await sessionManager.withSession(async (session) => {
-        await session.withTransaction(
-            async () => {
-                const lockKey = `slot_allocation:${col}`;
-                let lockValue;
-
-                try {
-                    lockValue = await acquireDistributedLock(lockKey, 15);
-
-                    if (!lockValue) {
-                        throw new Error('Failed to acquire lock');
-                    }
-
-                    // 1️⃣ Try to append to an existing slot
-                    const updateResult = await this.db
-                        .collection(col)
-                        .findOneAndUpdate(
-                            {
-                                count: { $lt: MAX_CONTENT_PER_SLOT },
-                                [`${listKey}.postId`]: { $ne: postData.postId }
-                            },
-                            {
-                                $push: { [listKey]: postData },
-                                $inc: { count: 1 }
-                            },
-                            {
-                                sort: { index: -1 },
-                                returnDocument: 'after',
-                                session
-                            }
-                        );
-
-                    if (updateResult.value) {
-                        result = {
-                            _id: updateResult.value._id,
-                            index: updateResult.value.index,
-                            count: updateResult.value.count
-                        };
-                        return;
-                    }
-
-                    // 2️⃣ Create a new slot
-                    const nextIndex = await getNextSlotIndex(col);
-                    const newId = `${col.slice(0, -1)}_${nextIndex}`;
-
-                    await this.db.collection(col).insertOne(
-                        {
-                            _id: newId,
-                            index: nextIndex,
-                            count: 1,
-                            [listKey]: [postData],
-                            createdAt: new Date()
-                        },
-                        { session }
-                    );
-
-                    result = {
-                        _id: newId,
-                        index: nextIndex,
-                        count: 1
-                    };
-                } finally {
-                    if (lockValue) {
-                        await releaseDistributedLock(lockKey, lockValue);
-                    }
-                }
-            },
-            {
-                readConcern: { level: 'snapshot' },
-                writeConcern: { w: 'majority' },
-                readPreference: 'primary'
-            }
-        );
-
-        return result;
-    });
-}
 
 
 
