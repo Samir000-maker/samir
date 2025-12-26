@@ -417,24 +417,52 @@ console.error(`🚨 [CRITICAL-SCAN] ${col}.${op} performed COLLECTION SCAN on ${
 }
 }
 
-// ===== PRODUCTION CACHE HELPERS =====
+let redisFailureCount = 0;
+let redisCircuitOpen = false;
+const REDIS_FAILURE_THRESHOLD = 10;
+const REDIS_CIRCUIT_RESET_TIME = 60000; // 1 minute
+
 const setCache = async (key, value, ttl = 30000) => {
-    // ✅ CRITICAL: Always use Redis in production
+    // ✅ Circuit breaker check
+    if (redisCircuitOpen) {
+        console.warn('[CACHE] Circuit breaker open - skipping Redis');
+        return false;
+    }
+
     if (redisClient) {
         try {
             const ttlSeconds = Math.floor(ttl / 1000);
             await redisClient.setex(key, ttlSeconds, JSON.stringify(value));
-            console.log(`[CACHE-SET] ${key} | TTL: ${ttl}ms`);
+            
+            // ✅ Reset failure count on success
+            if (redisFailureCount > 0) {
+                redisFailureCount = 0;
+                console.log('[CACHE] Redis recovered');
+            }
+            
             return true;
         } catch (err) {
             console.error('[CACHE-SET-ERROR]', key, err.message);
+            
+            // ✅ Track failures
+            redisFailureCount++;
+            
+            if (redisFailureCount >= REDIS_FAILURE_THRESHOLD) {
+                redisCircuitOpen = true;
+                console.error('[CACHE] 🚨 Circuit breaker OPEN - too many Redis failures');
+                
+                // Auto-reset after timeout
+                setTimeout(() => {
+                    redisCircuitOpen = false;
+                    redisFailureCount = 0;
+                    console.log('[CACHE] Circuit breaker CLOSED - retrying Redis');
+                }, REDIS_CIRCUIT_RESET_TIME);
+            }
+            
             return false;
         }
-    } else {
-        // ✅ FAIL: No fallback in production
-        console.error('[CACHE-ERROR] Redis not available - REQUIRED for production');
-        return false;
     }
+    return false;
 };
 
 const getCache = async (key) => {
@@ -594,8 +622,6 @@ console.log(`[RESPONSE] ${endpoint} | Time: ${duration}ms | Avg: ${requestMetric
 
 next();
 });
-
-app.use('/api', rateLimit({ windowMs: 1000, max: 1000, standardHeaders: true, legacyHeaders: false }));
 
 
 
@@ -3075,6 +3101,33 @@ app.post('/api/interactions/sync-from-port4000', async (req, res) => {
         return res.status(500).json({ error: 'Sync failed' });
     }
 });
+
+
+
+app.get('/metrics', (req, res) => {
+    const metrics = {
+        process: {
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            cpu: process.cpuUsage()
+        },
+        mongodb: {
+            pool: getPoolStats(),
+            operations: dbOpCounters
+        },
+        redis: {
+            connected: redisClient?.status === 'ready'
+        },
+        requests: requestMetrics,
+        caches: {
+            active: activeRequestsWithTimestamp.size,
+            processed: processedRequests.size
+        }
+    };
+    
+    res.json(metrics);
+});
+
 
 
 // Sync metrics from PORT 4000 to PORT 2000
