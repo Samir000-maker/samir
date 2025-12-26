@@ -93,6 +93,32 @@ ttl: 30000 // Increased to 30 seconds
 let reelSlotIds = ['reel_0'];
 let postSlotIds = ['post_0'];
 
+
+class SessionManager {
+    constructor(client) {
+        this.client = client;
+        this.activeSessions = new Set();
+    }
+
+    async withSession(operation) {
+        const session = this.client.startSession();
+        this.activeSessions.add(session);
+
+        try {
+            return await operation(session);
+        } finally {
+            this.activeSessions.delete(session);
+            await session.endSession().catch(err => {
+                console.error('[SESSION-CLEANUP-ERROR]', err);
+            });
+        }
+    }
+
+    getActiveSessionCount() {
+        return this.activeSessions.size;
+    }
+}
+
 class LRUCache {
     constructor(maxSize = MAX_CACHE_SIZE) {
         this.maxSize = maxSize;
@@ -2199,33 +2225,6 @@ console.log(`[MAX-INDEX-COMPUTED] ${collection} = ${maxIndex} | DB Reads: ${dbOp
 return maxIndex;
 }
 
-
-
-
-class SessionManager {
-    constructor(client) {
-        this.client = client;
-        this.activeSessions = new Set();
-    }
-
-    async withSession(operation) {
-        const session = this.client.startSession();
-        this.activeSessions.add(session);
-
-        try {
-            return await operation(session);
-        } finally {
-            this.activeSessions.delete(session);
-            await session.endSession().catch(err => {
-                console.error('[SESSION-CLEANUP-ERROR]', err);
-            });
-        }
-    }
-
-    getActiveSessionCount() {
-        return this.activeSessions.size;
-    }
-}
 
 
 
