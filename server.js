@@ -120,7 +120,7 @@ db = client.db(DB_NAME);
 let reelSlotIds = ['reel_0'];
 let postSlotIds = ['post_0'];
 let sessionManager;
-
+const intervals = [];
 class SessionManager {
     constructor(client) {
         this.client = client;
