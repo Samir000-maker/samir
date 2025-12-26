@@ -49,7 +49,7 @@ app.use((req, res, next) => {
     next();
 });
 
-
+let client, db, dbManager;
 
 // const activeRequestsWithTimestamp = new Map();
 // const requestDeduplication = new Map();
@@ -768,7 +768,7 @@ next();
 
 
 
-let client, db, dbManager;
+
 
 
 // ---------- logger shim (place near the top of server.js, after imports) ----------
