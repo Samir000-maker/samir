@@ -614,24 +614,6 @@ const setCache = async (key, value, ttl = 30000) => {
     }
 };
 
-const getCache = async (key) => {
-    // ✅ Connection check
-    if (!redisClient || redisClient.status !== 'ready') {
-        return null;
-    }
-
-    try {
-        const value = await redisClient.get(key);
-        if (value) {
-            return JSON.parse(value);
-        }
-    } catch (err) {
-        console.error('[CACHE-GET-ERROR]', key, err.message);
-        // ✅ Delete corrupted cache entry
-        await redisClient.del(key).catch(() => {});
-    }
-    return null;
-};
 
 const getCache = async (key) => {
     if (redisClient) {
