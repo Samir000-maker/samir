@@ -19,6 +19,7 @@ import rateLimit from 'express-rate-limit';
 import axios from 'axios';
 import Redis from 'ioredis';
 import crypto from 'crypto';
+const app = express();
 
 
 import helmet from 'helmet';
@@ -57,7 +58,6 @@ const DEDUP_WINDOW = 5000; // 5 seconds
 const RESULT_CACHE_TTL = 30000; // 30 seconds
 
 const activeRequests = new Map();
-const app = express();
 const PORT = process.env.PORT || 7000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
 const DB_NAME = process.env.DB_NAME || 'appdb';
