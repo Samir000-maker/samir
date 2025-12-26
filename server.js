@@ -72,8 +72,6 @@ app.use((req, res, next) => {
     next();
 });
 
-const postId = req.body.postId;
-
 
 
 // const activeRequestsWithTimestamp = new Map();
