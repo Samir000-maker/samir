@@ -624,27 +624,28 @@ async function invalidateCachePattern(pattern) {
 
 // Middleware
 
-const corsOptions = {
-    origin: (origin, callback) => {
-        const whitelist = [
-            'https://samir-hgr9.onrender.com',
-            'https://samir000-maker.github.io/ping/',
-            process.env.NODE_ENV === 'development' ? 'http://localhost:12312' : null
-        ].filter(Boolean);
+// const corsOptions = {
+//     origin: (origin, callback) => {
+//         const whitelist = [
+//             'https://samir-hgr9.onrender.com',
+//             'https://samir000-maker.github.io/ping/',
+//             process.env.NODE_ENV === 'development' ? 'http://localhost:12312' : null
+//         ].filter(Boolean);
         
-        if (!origin || whitelist.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
-    maxAge: 86400 // 24 hours
-};
+//         if (!origin || whitelist.includes(origin)) {
+//             callback(null, true);
+//         } else {
+//             callback(new Error('Not allowed by CORS'));
+//         }
+//     },
+//     credentials: true,
+//     methods: ['GET', 'POST', 'PUT', 'DELETE'],
+//     allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
+//     maxAge: 86400 // 24 hours
+// };
 
-app.use(cors(corsOptions));
+// app.use(cors(corsOptions));
+app.use(cors());
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => { console.log(`[HTTP] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`); next(); });
