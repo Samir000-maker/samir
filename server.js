@@ -119,7 +119,7 @@ class SessionManager {
     }
 }
 
-const sessionManager = new SessionManager(this.db.client);
+
 
 class LRUCache {
     constructor(maxSize = MAX_CACHE_SIZE) {
@@ -807,7 +807,7 @@ console.error('[INDEX-CREATION-ERROR]', error);
 
 
 
-
+ const sessionManager = new SessionManager(this.db.client);
 
 async function allocateSlot(col, postData, maxAttempts = 10) {
     let result;
@@ -1372,7 +1372,6 @@ async function createContribCollectionIndexes() {
 // ===== PRODUCTION-READY MONGODB CONNECTION =====
 async function initMongo() {
     console.log('[MONGO-INIT] Starting production connection...');
-
     // Suppress unnecessary warnings
     process.removeAllListeners('warning');
     process.on('warning', (warning) => {
@@ -1480,6 +1479,8 @@ async function initMongo() {
             }
         }
 
+
+        
         // Init collections / indexes
         await initializeSlots();
         await ensurePostIdUniqueness();
