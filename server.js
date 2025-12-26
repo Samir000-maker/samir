@@ -5272,7 +5272,7 @@ async function cleanupOldInteractions() {
 // Initialize the interaction system
 async function initializeInteractionSystem() {
 try {
-await createOptimizedIndexes();
+
 
 // Schedule cleanup to run daily at 2 AM
 setInterval(cleanupOldInteractions, 24 * 60 * 60 * 1000);
@@ -5283,8 +5283,6 @@ console.error('[INTERACTION-SYSTEM-ERROR]', error);
 }
 }
 
-// Call this during server startup
-initializeInteractionSystem();
 
 
 
