@@ -119,6 +119,8 @@ class SessionManager {
     }
 }
 
+const sessionManager = new SessionManager(this.db.client);
+
 class LRUCache {
     constructor(maxSize = MAX_CACHE_SIZE) {
         this.maxSize = maxSize;
@@ -2226,9 +2228,6 @@ return maxIndex;
 }
 
 
-
-
-const sessionManager = new SessionManager(this.db.client);
 
 async function allocateSlot(col, postData, maxAttempts = 10) {
     let result;
