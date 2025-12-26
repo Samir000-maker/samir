@@ -917,19 +917,28 @@ async function createAllProductionIndexes() {
         let failed = 0;
 
         for (const { collection, index, options } of indexes) {
-            try {
-                await db.collection(collection).createIndex(index, options);
-                created++;
-                console.log(`[INDEX] ✅ ${collection}.${options.name}`);
-            } catch (err) {
-                if (err.code === 85 || err.code === 86) {
-                    skipped++;
-                } else {
-                    failed++;
-                    console.error(`[INDEX] ❌ ${collection}.${options.name}:`, err.message);
-                }
-            }
+    try {
+        await db.collection(collection).createIndex(index, options);
+        created++;
+        console.log(`[INDEX] ✅ ${collection}.${options.name}`);
+    } catch (err) {
+        if (err.code === 85 || err.code === 86) {
+            skipped++;
+        } else if (err.message.includes('not valid for an _id index')) {
+            // ✅ Ignore _id index unique constraint errors
+            skipped++;
+            console.log(`[INDEX] ⚠️ ${collection}.${options.name} - _id already unique (expected)`);
+        } else {
+            failed++;
+            console.error(`[INDEX] ❌ ${collection}.${options.name}:`, err.message);
         }
+    }
+}
+
+// Only fail if non-_id indexes failed
+if (failed > 0) {
+    throw new Error(`CRITICAL: ${failed} indexes failed - cannot start safely`);
+}
 
         console.log(`[INDEXES] Summary: ${created} created, ${skipped} existing, ${failed} failed`);
         
