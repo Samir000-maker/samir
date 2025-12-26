@@ -88,8 +88,10 @@ maxIndexes: new Map(),
 ttl: 30000 // Increased to 30 seconds
 };
 let client, db, dbManager;
-
+client = new MongoClient(MONGODB_URI, mongoOptions);
+await client.connect();
 db = client.db(DB_NAME);
+
 
         // Default to latest slots if user is new
 let reelSlotIds = ['reel_0'];
