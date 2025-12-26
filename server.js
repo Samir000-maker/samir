@@ -43,7 +43,7 @@ const mongoOptions = {
     appName: 'instagram-clone-prod',
     maxStalenessSeconds: 90
 };
-const postId = req.body.postId;
+
 
 import helmet from 'helmet';
 
@@ -71,6 +71,8 @@ app.use((req, res, next) => {
     res.setHeader('X-XSS-Protection', '1; mode=block');
     next();
 });
+
+const postId = req.body.postId;
 
 
 
