@@ -19,7 +19,6 @@ import rateLimit from 'express-rate-limit';
 import axios from 'axios';
 import Redis from 'ioredis';
 import crypto from 'crypto';
-const app = express();
 
 
 import helmet from 'helmet';
@@ -49,7 +48,7 @@ app.use((req, res, next) => {
     next();
 });
 
-let client, db, dbManager;
+
 
 // const activeRequestsWithTimestamp = new Map();
 // const requestDeduplication = new Map();
@@ -58,6 +57,7 @@ const DEDUP_WINDOW = 5000; // 5 seconds
 const RESULT_CACHE_TTL = 30000; // 30 seconds
 
 const activeRequests = new Map();
+const app = express();
 const PORT = process.env.PORT || 7000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
 const DB_NAME = process.env.DB_NAME || 'appdb';
@@ -87,7 +87,9 @@ userStatus: new Map(),
 maxIndexes: new Map(),
 ttl: 30000 // Increased to 30 seconds
 };
+let client, db, dbManager;
 
+db = client.db(DB_NAME);
 
         // Default to latest slots if user is new
 let reelSlotIds = ['reel_0'];
@@ -119,7 +121,7 @@ class SessionManager {
     }
 }
 
-
+const sessionManager = new SessionManager(this.db.client);
 
 class LRUCache {
     constructor(maxSize = MAX_CACHE_SIZE) {
@@ -807,7 +809,7 @@ console.error('[INDEX-CREATION-ERROR]', error);
 
 
 
- const sessionManager = new SessionManager(this.db.client);
+
 
 async function allocateSlot(col, postData, maxAttempts = 10) {
     let result;
@@ -1372,6 +1374,7 @@ async function createContribCollectionIndexes() {
 // ===== PRODUCTION-READY MONGODB CONNECTION =====
 async function initMongo() {
     console.log('[MONGO-INIT] Starting production connection...');
+
     // Suppress unnecessary warnings
     process.removeAllListeners('warning');
     process.on('warning', (warning) => {
@@ -1479,8 +1482,6 @@ async function initMongo() {
             }
         }
 
-
-        
         // Init collections / indexes
         await initializeSlots();
         await ensurePostIdUniqueness();
