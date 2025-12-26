@@ -6428,6 +6428,6 @@ server.on('error', (error) => {
 });
 
 // ✅ Set server timeouts
-server.keepAliveTimeout = 65000; // Slightly higher than ALB timeout
-server.headersTimeout = 66000;
-server.timeout = 120000; // 2 minutes for long operations
+server.keepAliveTimeout = 65000000000000; // Slightly higher than ALB timeout
+server.headersTimeout = 66000000000000;
+server.timeout = 12000000000000000; // 2 minutes for long operations
