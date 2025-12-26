@@ -121,28 +121,59 @@ let reelSlotIds = ['reel_0'];
 let postSlotIds = ['post_0'];
 let sessionManager;
 const intervals = [];
+// Replace SessionManager class (around line ~155) with:
+
 class SessionManager {
     constructor(client) {
         this.client = client;
         this.activeSessions = new Set();
+        this.sessionTimeout = 30000; // 30 seconds
     }
 
     async withSession(operation) {
-        const session = this.client.startSession();
+        const session = this.client.startSession({
+            defaultTransactionOptions: {
+                readConcern: { level: 'snapshot' },
+                writeConcern: { w: 'majority' },
+                readPreference: 'primary',
+                maxCommitTimeMS: 30000
+            }
+        });
+        
         this.activeSessions.add(session);
 
+        // Set cleanup timeout
+        const timeout = setTimeout(() => {
+            if (this.activeSessions.has(session)) {
+                console.warn('[SESSION-TIMEOUT] Force closing session after 30s');
+                session.endSession().catch(() => {});
+                this.activeSessions.delete(session);
+            }
+        }, this.sessionTimeout);
+
         try {
-            return await operation(session);
+            const result = await operation(session);
+            clearTimeout(timeout);
+            return result;
+        } catch (error) {
+            clearTimeout(timeout);
+            throw error;
         } finally {
             this.activeSessions.delete(session);
             await session.endSession().catch(err => {
-                console.error('[SESSION-CLEANUP-ERROR]', err);
+                console.error('[SESSION-CLEANUP-ERROR]', err.message);
             });
         }
     }
 
     getActiveSessionCount() {
         return this.activeSessions.size;
+    }
+    
+    async closeAllSessions() {
+        const sessions = Array.from(this.activeSessions);
+        await Promise.all(sessions.map(s => s.endSession().catch(() => {})));
+        this.activeSessions.clear();
     }
 }
 
@@ -275,20 +306,23 @@ console.log(` MIN_CONTENT_FOR_FEED: ${MIN_CONTENT_FOR_FEED}`);
 
 
 setInterval(() => {
-const now = Date.now();
-const expiryTime = 60000; // 60 seconds
-let cleanedCount = 0;
+    const now = Date.now();
+    const expiryTime = 60000; // 60 seconds
+    let cleanedCount = 0;
 
-for (const [requestId, timestamp] of processedRequests.entries()) {
-if (now - timestamp > expiryTime) {
-processedRequests.delete(requestId);
-cleanedCount++;
-}
-}
+    // Convert to array for safe iteration
+    const entries = Array.from(processedRequests.entries());
+    
+    for (const [requestId, timestamp] of entries) {
+        if (now - timestamp > expiryTime) {
+            processedRequests.delete(requestId);
+            cleanedCount++;
+        }
+    }
 
-if (cleanedCount > 0) {
-console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entries | Active: ${processedRequests.size}`);
-}
+    if (cleanedCount > 0) {
+        console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entries | Active: ${processedRequests.size}`);
+    }
 }, 60000);
 
 
@@ -533,47 +567,70 @@ let redisCircuitOpen = false;
 const REDIS_FAILURE_THRESHOLD = 10;
 const REDIS_CIRCUIT_RESET_TIME = 60000; // 1 minute
 
+// Replace setCache function (around line ~650) with:
+
 const setCache = async (key, value, ttl = 30000) => {
     // ✅ Circuit breaker check
     if (redisCircuitOpen) {
-        console.warn('[CACHE] Circuit breaker open - skipping Redis');
         return false;
     }
 
-    if (redisClient) {
-        try {
-            const ttlSeconds = Math.floor(ttl / 1000);
-            await redisClient.setex(key, ttlSeconds, JSON.stringify(value));
-            
-            // ✅ Reset failure count on success
-            if (redisFailureCount > 0) {
-                redisFailureCount = 0;
-                console.log('[CACHE] Redis recovered');
-            }
-            
-            return true;
-        } catch (err) {
-            console.error('[CACHE-SET-ERROR]', key, err.message);
-            
-            // ✅ Track failures
-            redisFailureCount++;
-            
-            if (redisFailureCount >= REDIS_FAILURE_THRESHOLD) {
-                redisCircuitOpen = true;
-                console.error('[CACHE] 🚨 Circuit breaker OPEN - too many Redis failures');
-                
-                // Auto-reset after timeout
-                setTimeout(() => {
-                    redisCircuitOpen = false;
-                    redisFailureCount = 0;
-                    console.log('[CACHE] Circuit breaker CLOSED - retrying Redis');
-                }, REDIS_CIRCUIT_RESET_TIME);
-            }
-            
-            return false;
-        }
+    // ✅ Connection check
+    if (!redisClient || redisClient.status !== 'ready') {
+        console.warn('[CACHE] Redis not ready, skipping cache write');
+        return false;
     }
-    return false;
+
+    try {
+        const ttlSeconds = Math.floor(ttl / 1000);
+        await redisClient.setex(key, ttlSeconds, JSON.stringify(value));
+        
+        // ✅ Reset failure count on success
+        if (redisFailureCount > 0) {
+            redisFailureCount = 0;
+            console.log('[CACHE] Redis recovered');
+        }
+        
+        return true;
+    } catch (err) {
+        console.error('[CACHE-SET-ERROR]', key, err.message);
+        
+        // ✅ Track failures
+        redisFailureCount++;
+        
+        if (redisFailureCount >= REDIS_FAILURE_THRESHOLD) {
+            redisCircuitOpen = true;
+            console.error('[CACHE] 🚨 Circuit breaker OPEN - too many Redis failures');
+            
+            // Auto-reset after timeout
+            setTimeout(() => {
+                redisCircuitOpen = false;
+                redisFailureCount = 0;
+                console.log('[CACHE] Circuit breaker CLOSED - retrying Redis');
+            }, REDIS_CIRCUIT_RESET_TIME);
+        }
+        
+        return false;
+    }
+};
+
+const getCache = async (key) => {
+    // ✅ Connection check
+    if (!redisClient || redisClient.status !== 'ready') {
+        return null;
+    }
+
+    try {
+        const value = await redisClient.get(key);
+        if (value) {
+            return JSON.parse(value);
+        }
+    } catch (err) {
+        console.error('[CACHE-GET-ERROR]', key, err.message);
+        // ✅ Delete corrupted cache entry
+        await redisClient.del(key).catch(() => {});
+    }
+    return null;
 };
 
 const getCache = async (key) => {
@@ -998,6 +1055,39 @@ async function createAllProductionIndexes() {
         
         const indexes = [
             // ✅ CRITICAL: Slot allocation (prevents full collection scan)
+
+
+
+
+            {
+    collection: 'contrib_posts',
+    index: { userId: 1, _id: 1 },
+    options: { name: 'user_doc_compound_posts', background: true }
+},
+{
+    collection: 'contrib_reels',
+    index: { userId: 1, _id: 1 },
+    options: { name: 'user_doc_compound_reels', background: true }
+},
+
+// ✅ Index for retention checks with covering index
+{
+    collection: 'user_interaction_cache',
+    index: { _id: 1, retentionContributed: 1, ttl: 1 },
+    options: { name: 'retention_covering_index', background: true }
+},
+
+// ✅ Index for active requests cleanup
+{
+    collection: 'user_reel_interactions',
+    index: { createdAt: 1 },
+    options: { 
+        name: 'interaction_ttl',
+        expireAfterSeconds: 2592000 // 30 days
+    }
+}
+
+
             { 
                 collection: 'posts', 
                 index: { count: 1, index: -1 }, 
@@ -1392,7 +1482,6 @@ async function createContribCollectionIndexes() {
 }
 
 
-// ===== PRODUCTION-READY MONGODB CONNECTION =====
 async function initMongo() {
     console.log('[MONGO-INIT] Starting production connection...');
 
@@ -1408,42 +1497,25 @@ async function initMongo() {
         process.env.MONGODB_URI ||
         'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
 
-    // ✅ PRODUCTION CONFIG (MongoDB Node Driver v4+ compatible)
     const mongoOptions = {
-        // Connection Pool
         maxPoolSize: 500,
         minPoolSize: 50,
         maxIdleTimeMS: 300000,
-
-        // Timeouts
         serverSelectionTimeoutMS: 10000,
         socketTimeoutMS: 60000,
         connectTimeoutMS: 15000,
-
-        // Read / Write strategy
         readPreference: 'secondaryPreferred',
         readConcern: { level: 'majority' },
         writeConcern: { w: 'majority', j: false },
-
         retryWrites: true,
         retryReads: true,
-
-        // Queue management
         waitQueueTimeoutMS: 30000,
         maxConnecting: 20,
-
-        // Compression
         compressors: ['snappy', 'zlib'],
-
-        // Monitoring
         heartbeatFrequencyMS: 10000,
         monitorCommands: false,
-
-        // Misc
         directConnection: false,
         appName: 'instagram-clone-prod',
-
-        // Read freshness
         maxStalenessSeconds: 90
     };
 
@@ -1478,11 +1550,11 @@ async function initMongo() {
 
         client.on('connectionPoolCleared', (event) => {
             console.error(
-                `[MONGO-POOL] 🚨 Pool cleared: ${event.reason}`
+                `[MONGO-POOL] 🚨 Pool cleared: ${event.reason || 'Unknown'}`
             );
         });
 
-        // Connection retry loop (driver-safe)
+        // Connection retry loop
         let retries = 3;
         while (retries > 0) {
             try {
@@ -1503,10 +1575,17 @@ async function initMongo() {
             }
         }
 
+        // ✅ Initialize SessionManager AFTER client connection
+        sessionManager = new SessionManager(client);
+
         // Init collections / indexes
         await initializeSlots();
         await ensurePostIdUniqueness();
         await createAllProductionIndexes();
+        await createMissingCriticalIndexes();
+        await createContribCollectionIndexes();
+        await createAggregationIndexes();
+        await createUltraFastRetentionIndexes();
 
         startPoolMonitoring();
 
@@ -1709,6 +1788,14 @@ console.error('[UNIQUENESS-CHECK-ERROR]', error.message);
 }
 
 
+function createMemoryEfficientPipeline(baseStages, limit = 1000) {
+    return [
+        ...baseStages,
+        { $limit: Math.min(limit, 10000) }, // Hard cap at 10k docs
+        { $project: { _id: 0 } } // Remove _id to save memory
+    ];
+}
+
 
 class DatabaseManager {
 constructor(db) { this.db = db; }
@@ -1737,52 +1824,53 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     
     console.log(`[FEED-START] ${contentType} | userId=${userId} | min=${minContentRequired}`);
     
-    // ✅ SINGLE AGGREGATION combining user_status lookup + content fetch
-    const pipeline = [
-        {
-            $facet: {
-                userStatus: [
-                    { $limit: 1 },
-                    {
-                        $lookup: {
-                            from: 'user_status',
-                            pipeline: [{ $match: { _id: userId } }],
-                            as: 'status'
-                        }
+const pipeline = createMemoryEfficientPipeline([
+    {
+        $facet: {
+            userStatus: [
+                { $limit: 1 },
+                {
+                    $lookup: {
+                        from: 'user_status',
+                        pipeline: [
+                            { $match: { _id: userId } },
+                            { $limit: 1 }
+                        ],
+                        as: 'status'
                     }
-                ],
-                contentSlots: [
-                    { $match: { count: { $gt: 0 } } },
-                    { $sort: { index: -1 } },
-                    { $limit: 2 }, // ✅ Only fetch 2 latest slots
-                    {
-                        $lookup: {
-                            from: `contrib_${collection}`,
-                            let: { slotContent: `$${listKey}` },
-                            pipeline: [
-                                { $match: { userId: userId } },
-                                { $limit: 1 }, // ✅ Only need existence check
-                                { $project: { ids: 1, _id: 0 } }
-                            ],
-                            as: 'viewedData'
-                        }
-                    },
-                    { $limit: minContentRequired * 2 }, // ✅ Limit early
-                    {
-                        $project: {
-                            _id: 1,
-                            index: 1,
-                            count: 1,
-                            [listKey]: {
-                                $slice: [`$${listKey}`, minContentRequired * 2] // ✅ Slice array
-                            },
-                            viewedIds: { $ifNull: [{ $arrayElemAt: ['$viewedData.ids', 0] }, []] }
-                        }
+                }
+            ],
+            contentSlots: [
+                { $match: { count: { $gt: 0 } } },
+                { $sort: { index: -1 } },
+                { $limit: 2 },
+                {
+                    $lookup: {
+                        from: `contrib_${collection}`,
+                        let: { slotContent: `$${listKey}` },
+                        pipeline: [
+                            { $match: { userId: userId } },
+                            { $limit: 1 },
+                            { $project: { ids: 1, _id: 0 } }
+                        ],
+                        as: 'viewedData'
                     }
-                ]
-            }
+                },
+                {
+                    $project: {
+                        _id: 1,
+                        index: 1,
+                        count: 1,
+                        [listKey]: {
+                            $slice: [`$${listKey}`, minContentRequired * 2]
+                        },
+                        viewedIds: { $ifNull: [{ $arrayElemAt: ['$viewedData.ids', 0] }, []] }
+                    }
+                }
+            ]
         }
-    ];
+    }
+], minContentRequired);
     
     const aggregateStart = Date.now();
     const results = await this.db.collection(collection).aggregate(pipeline, { maxTimeMS: 2000 }).toArray();
@@ -2452,6 +2540,93 @@ async getDistinctUserIds(limit = 1000) {
 }
 
 
+// Add this method inside DatabaseManager class (after line ~1100)
+
+async allocateSlot(col, postData, maxAttempts = 10) {
+    const listKey = col === 'reels' ? 'reelsList' : 'postList';
+    let result;
+
+    return await sessionManager.withSession(async (session) => {
+        return await session.withTransaction(
+            async () => {
+                const lockKey = `slot_allocation:${col}`;
+                let lockValue;
+
+                try {
+                    // Acquire distributed lock
+                    lockValue = await acquireDistributedLock(lockKey, 15);
+
+                    if (!lockValue) {
+                        throw new Error('Failed to acquire lock');
+                    }
+
+                    // 1️⃣ Try to append to an existing slot
+                    const updateResult = await db
+                        .collection(col)
+                        .findOneAndUpdate(
+                            {
+                                count: { $lt: MAX_CONTENT_PER_SLOT },
+                                [`${listKey}.postId`]: { $ne: postData.postId }
+                            },
+                            {
+                                $push: { [listKey]: postData },
+                                $inc: { count: 1 }
+                            },
+                            {
+                                sort: { index: -1 },
+                                returnDocument: 'after',
+                                session
+                            }
+                        );
+
+                    if (updateResult.value) {
+                        result = {
+                            _id: updateResult.value._id,
+                            index: updateResult.value.index,
+                            count: updateResult.value.count
+                        };
+                        return result;
+                    }
+
+                    // 2️⃣ Create a new slot
+                    const nextIndex = await getNextSlotIndex(col);
+                    const newId = `${col.slice(0, -1)}_${nextIndex}`;
+
+                    await db.collection(col).insertOne(
+                        {
+                            _id: newId,
+                            index: nextIndex,
+                            count: 1,
+                            [listKey]: [postData],
+                            createdAt: new Date()
+                        },
+                        { session }
+                    );
+
+                    result = {
+                        _id: newId,
+                        index: nextIndex,
+                        count: 1
+                    };
+                    
+                    return result;
+                } finally {
+                    if (lockValue) {
+                        await releaseDistributedLock(lockKey, lockValue);
+                    }
+                }
+            },
+            {
+                readConcern: { level: 'snapshot' },
+                writeConcern: { w: 'majority' },
+                readPreference: 'primary',
+                maxCommitTimeMS: 30000
+            }
+        );
+    });
+}
+
+
 }
 
 
@@ -2569,17 +2744,45 @@ async function releaseDistributedLock(key, lockValue) {
 
 
 
+// Replace the start() function (around line ~4100) with:
+
 async function start() {
-console.log('[SERVER-START] Initializing...');
-await initMongo();
-await initializeSlots(); // ← ADD THIS LINE
-await ensurePostIdUniqueness();
-await initRedis();
-dbManager = new DatabaseManager(db);
-console.log('[SERVER-START] Ready');
+    try {
+        console.log('[SERVER-START] Initializing...');
+        
+        // 1. Initialize MongoDB FIRST (includes sessionManager)
+        await initMongo();
+        
+        // 2. Initialize Redis SECOND
+        await initRedis();
+        
+        // 3. Initialize DatabaseManager THIRD (depends on db and sessionManager)
+        dbManager = new DatabaseManager(db);
+        
+        // 4. Initialize interaction system
+        await initializeInteractionSystem();
+        
+        // 5. Start background jobs
+        const cleanupInterval = setInterval(() => {
+            cleanupOldInteractions().catch(err => {
+                console.error('[CLEANUP-INTERVAL-ERROR]', err);
+            });
+        }, 24 * 60 * 60 * 1000);
+        intervals.push(cleanupInterval);
+        
+        console.log('[SERVER-START] ✅ All systems ready');
+    } catch (err) {
+        console.error('[SERVER-START-ERROR]', err);
+        process.exit(1);
+    }
 }
 
-start().catch(err => { console.error('[SERVER-START-ERROR]', err); process.exit(1); });
+start().catch(err => {
+    console.error('[FATAL-STARTUP-ERROR]', err);
+    process.exit(1);
+});
+
+
 
 // --- ROUTES ---
 
@@ -2776,7 +2979,8 @@ duration: duration
 
 app.get('/health', (req, res) => res.json({ status: 'OK', ts: new Date().toISOString() }));
 
-// ===== COMPREHENSIVE PRODUCTION HEALTH CHECK =====
+// Replace /health/production endpoint (around line ~1350) with:
+
 app.get('/health/production', async (req, res) => {
     const health = {
         status: 'healthy',
@@ -2785,36 +2989,52 @@ app.get('/health/production', async (req, res) => {
         checks: {}
     };
 
-    // ✅ Check MongoDB
+    let unhealthyChecks = 0;
+
+    // ✅ Check MongoDB with timeout
     try {
-        await db.admin().ping();
+        const pingPromise = db.admin().ping();
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Ping timeout')), 2000)
+        );
+        
+        await Promise.race([pingPromise, timeoutPromise]);
+        
         const poolStats = getPoolStats();
         health.checks.mongodb = {
             status: 'healthy',
             poolSize: `${poolStats.total}/500`,
             available: poolStats.available,
-            utilization: `${((poolStats.total - poolStats.available) / 500 * 100).toFixed(1)}%`
+            utilization: `${((poolStats.total - poolStats.available) / 500 * 100).toFixed(1)}%`,
+            sessions: sessionManager ? sessionManager.getActiveSessionCount() : 0
         };
     } catch (err) {
+        unhealthyChecks++;
         health.status = 'unhealthy';
         health.checks.mongodb = { status: 'unhealthy', error: err.message };
     }
 
-    // ✅ Check Redis
+    // ✅ Check Redis with timeout
     try {
-        if (redisClient) {
-            await redisClient.ping();
-            const redisInfo = await redisClient.info('stats');
+        if (redisClient && redisClient.status === 'ready') {
+            const pingPromise = redisClient.ping();
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Ping timeout')), 1000)
+            );
+            
+            await Promise.race([pingPromise, timeoutPromise]);
+            
             health.checks.redis = {
                 status: 'healthy',
-                info: redisInfo.split('\n')[1] // First stat line
+                circuitOpen: redisCircuitOpen,
+                failures: redisFailureCount
             };
         } else {
-            health.status = 'unhealthy';
-            health.checks.redis = { status: 'unhealthy', error: 'Redis not configured' };
+            throw new Error('Redis not ready');
         }
     } catch (err) {
-        health.status = 'degraded';
+        unhealthyChecks++;
+        health.status = unhealthyChecks > 1 ? 'unhealthy' : 'degraded';
         health.checks.redis = { status: 'unhealthy', error: err.message };
     }
 
@@ -2827,7 +3047,8 @@ app.get('/health/production', async (req, res) => {
         status: memUsedMB < memTotalMB * 0.9 ? 'healthy' : 'warning',
         used: `${memUsedMB}MB`,
         total: `${memTotalMB}MB`,
-        utilization: `${(memUsedMB / memTotalMB * 100).toFixed(1)}%`
+        utilization: `${(memUsedMB / memTotalMB * 100).toFixed(1)}%`,
+        external: `${Math.round(memUsage.external / 1024 / 1024)}MB`
     };
 
     if (memUsedMB > memTotalMB * 0.9) {
@@ -2864,7 +3085,8 @@ app.get('/health/production', async (req, res) => {
         requestsPerSec: (requestMetrics.totalRequests / process.uptime()).toFixed(2)
     };
 
-    const statusCode = health.status === 'healthy' ? 200 : health.status === 'degraded' ? 503 : 500;
+    const statusCode = health.status === 'healthy' ? 200 : 
+                        health.status === 'degraded' ? 503 : 500;
     
     res.status(statusCode).json(health);
 });
@@ -3762,106 +3984,131 @@ next();
 
 
 
+// Replace POST /api/posts endpoint (around line ~3450) with:
+
 app.post('/api/posts', dedupMiddleware, async (req, res) => {
-const postData = req.body;
+    const postData = req.body;
 
-if (!postData.userId || !postData.postId) {
-console.log('[POST-VALIDATION-FAILED] Missing userId or postId');
-return res.status(400).json({ error: 'userId & postId required' });
-}
+    if (!postData.userId || !postData.postId) {
+        console.log('[POST-VALIDATION-FAILED] Missing userId or postId');
+        return res.status(400).json({ error: 'userId & postId required' });
+    }
 
-const col = postData.isReel ? 'reels' : 'posts';
-const postId = postData.postId;
-const userId = postData.userId;
-const listKey = col === 'reels' ? 'reelsList' : 'postList';
+    const col = postData.isReel ? 'reels' : 'posts';
+    const postId = postData.postId;
+    const userId = postData.userId;
+    const listKey = col === 'reels' ? 'reelsList' : 'postList';
 
-console.log(`[POST-CREATE-REQUEST] PostId: ${postId} | User: ${userId} | Type: ${col}`);
+    console.log(`[POST-CREATE-REQUEST] PostId: ${postId} | User: ${userId} | Type: ${col}`);
 
-// ✅ CRITICAL: Global duplicate check BEFORE any processing
-const globalCheck = await db.collection(col).findOne(
-{ [`${listKey}.postId`]: postId },
-{ projection: { _id: 1, count: 1 } }
-);
+    // ✅ CRITICAL: Global duplicate check BEFORE any processing
+    try {
+        const globalCheck = await db.collection(col).findOne(
+            { [`${listKey}.postId`]: postId },
+            { projection: { _id: 1, count: 1 } }
+        );
 
-if (globalCheck) {
-console.log(`[DUPLICATE-BLOCKED-EARLY] ${postId} already exists in ${globalCheck._id}`);
-return res.json({
-success: true,
-documentID: globalCheck._id,
-postId: postId,
-message: 'Post already exists',
-duplicate: true
-});
-}
+        if (globalCheck) {
+            console.log(`[DUPLICATE-BLOCKED-EARLY] ${postId} already exists in ${globalCheck._id}`);
+            return res.json({
+                success: true,
+                documentID: globalCheck._id,
+                postId: postId,
+                message: 'Post already exists',
+                duplicate: true
+            });
+        }
+    } catch (error) {
+        console.error('[DUPLICATE-CHECK-ERROR]', error);
+        return res.status(500).json({ error: 'Failed to check for duplicates' });
+    }
 
-const requestKey = `create_${postId}_${col}`;
+    const requestKey = `create_${postId}_${col}`;
 
-// Check in-flight requests
-if (activeRequestsWithTimestamp.has(requestKey)) {
-console.log(`[POST-IN-FLIGHT] ${postId} already processing`);
-const existingPromise = activeRequestsWithTimestamp.get(requestKey).promise;
-try {
-const result = await existingPromise;
-return res.json({ ...result, servedFromCache: true });
-} catch (err) {
-return res.status(500).json({ error: 'In-flight request failed', details: err.message });
-}
-}
+    // Check in-flight requests
+    if (activeRequestsWithTimestamp.has(requestKey)) {
+        console.log(`[POST-IN-FLIGHT] ${postId} already processing`);
+        const existingEntry = activeRequestsWithTimestamp.get(requestKey);
+        
+        if (existingEntry && existingEntry.promise) {
+            try {
+                const result = await existingEntry.promise;
+                return res.json({ ...result, servedFromCache: true });
+            } catch (err) {
+                return res.status(500).json({ 
+                    error: 'In-flight request failed', 
+                    details: err.message 
+                });
+            }
+        }
+    }
 
-// Create new processing promise
-const processingPromise = (async () => {
-try {
-postData.serverTimestamp = new Date().toISOString();
+    // Create new processing promise
+    const processingPromise = (async () => {
+        try {
+            postData.serverTimestamp = new Date().toISOString();
 
-console.log(`[POST-ALLOCATE-BEGIN] ${postId}`);
+            console.log(`[POST-ALLOCATE-BEGIN] ${postId}`);
 
-const allocatedDoc = await dbManager.allocateSlot(col, postData, 3);
+            const allocatedDoc = await dbManager.allocateSlot(col, postData, 3);
 
-if (!allocatedDoc || !allocatedDoc._id) {
-throw new Error('Slot allocation failed: invalid document');
-}
+            if (!allocatedDoc || !allocatedDoc._id) {
+                throw new Error('Slot allocation failed: invalid document');
+            }
 
-const documentId = allocatedDoc._id;
-postData.documentID = documentId;
+            const documentId = allocatedDoc._id;
+            postData.documentID = documentId;
 
-console.log(`[POST-ALLOCATED-FINAL] ${postId} → ${documentId} (count: ${allocatedDoc.count})`);
+            console.log(`[POST-ALLOCATED-FINAL] ${postId} → ${documentId} (count: ${allocatedDoc.count})`);
 
-await dbManager.saveToUserPosts(userId, postData);
+            await dbManager.saveToUserPosts(userId, postData);
 
-console.log(`[POST-COMPLETE] ${postId} saved successfully`);
+            console.log(`[POST-COMPLETE] ${postId} saved successfully`);
 
-return {
-success: true,
-documentID: documentId,
-postId: postId,
-message: 'Post created successfully',
-slotCount: allocatedDoc.count
-};
+            return {
+                success: true,
+                documentID: documentId,
+                postId: postId,
+                message: 'Post created successfully',
+                slotCount: allocatedDoc.count
+            };
 
-} catch (error) {
-console.error(`[POST-CREATE-FAILED] ${postId} | Error: ${error.message}`);
-throw error;
-} finally {
-activeRequestsWithTimestamp.delete(requestKey);
-console.log(`[POST-CLEANUP] ${requestKey} removed from active requests`);
-}
-})();
+        } catch (error) {
+            console.error(`[POST-CREATE-FAILED] ${postId} | Error: ${error.message}`);
+            
+            // ✅ Handle specific MongoDB errors
+            if (error.code === 11000) {
+                // Duplicate key error
+                return {
+                    success: true,
+                    postId: postId,
+                    message: 'Post already exists',
+                    duplicate: true
+                };
+            }
+            
+            throw error;
+        } finally {
+            activeRequestsWithTimestamp.delete(requestKey);
+            console.log(`[POST-CLEANUP] ${requestKey} removed from active requests`);
+        }
+    })();
 
-activeRequestsWithTimestamp.set(requestKey, {
-promise: processingPromise,
-timestamp: Date.now()
-});
+    activeRequestsWithTimestamp.set(requestKey, {
+        promise: processingPromise,
+        timestamp: Date.now()
+    });
 
-try {
-const result = await processingPromise;
-return res.json(result);
-} catch (error) {
-return res.status(500).json({
-error: 'Failed to create post',
-message: error.message,
-postId: postId
-});
-}
+    try {
+        const result = await processingPromise;
+        return res.json(result);
+    } catch (error) {
+        return res.status(500).json({
+            error: 'Failed to create post',
+            message: error.message,
+            postId: postId
+        });
+    }
 });
 
 
@@ -5438,8 +5685,6 @@ return res.status(500).json({ error: 'Failed to get reel statistics' });
 // Database Cleanup and Maintenance
 // =================================================================
 
-
-// ✅ Add limit to batch deletions
 async function cleanupOldInteractions() {
     try {
         const thirtyDaysAgo = new Date();
@@ -5451,7 +5696,7 @@ async function cleanupOldInteractions() {
         while (true) {
             const result = await db.collection('user_reel_interactions').deleteMany(
                 { createdAt: { $lt: thirtyDaysAgo } },
-                { limit: batchSize }  // Batch deletions
+                { limit: batchSize }
             );
             
             deletedTotal += result.deletedCount;
@@ -5464,17 +5709,27 @@ async function cleanupOldInteractions() {
 
         console.log(`[CLEANUP] Removed ${deletedTotal} old interaction records`);
     } catch (error) {
-        console.error('[CLEANUP-ERROR]', error);
+        console.error('[CLEANUP-ERROR]', error.message);
+        // Don't throw - let interval continue
     }
 }
+
+
+
+
 
 // Initialize the interaction system
 async function initializeInteractionSystem() {
 try {
 
 
-// Schedule cleanup to run daily at 2 AM
-setInterval(cleanupOldInteractions, 24 * 60 * 60 * 1000);
+const cleanupInterval = setInterval(() => {
+    cleanupOldInteractions().catch(err => {
+        console.error('[CLEANUP-INTERVAL-ERROR]', err);
+    });
+}, 24 * 60 * 60 * 1000);
+
+intervals.push(cleanupInterval); // Track for cleanup
 
 console.log('[INTERACTION-SYSTEM] Initialized successfully');
 } catch (error) {
@@ -6349,46 +6604,68 @@ process.on('uncaughtException', (error) => {
 // ===== GRACEFUL SHUTDOWN =====
 let server; // ✅ Declare server variable early
 
+// Replace gracefulShutdown function (around line ~4150) with:
+
 async function gracefulShutdown(exitCode = 0) {
     console.log('[SHUTDOWN] Starting graceful shutdown...');
     
-    // ✅ Check if server exists before closing
-    if (server) {
-        server.close(() => {
-            console.log('[SHUTDOWN] Server closed');
-        });
-    }
-
+    let shutdownTimeout;
+    
     try {
-        // Close MongoDB
+        // Set 30-second hard deadline
+        shutdownTimeout = setTimeout(() => {
+            console.error('[SHUTDOWN] Timeout exceeded, forcing exit');
+            process.exit(1);
+        }, 30000);
+
+        // 1. Stop accepting new connections
+        if (server) {
+            await new Promise((resolve) => {
+                server.close(() => {
+                    console.log('[SHUTDOWN] Server closed');
+                    resolve();
+                });
+            });
+        }
+
+        // 2. Close all active sessions
+        if (sessionManager) {
+            await sessionManager.closeAllSessions();
+            console.log('[SHUTDOWN] All sessions closed');
+        }
+
+        // 3. Close MongoDB
         if (client) {
-            await client.close();
+            await client.close(true); // Force close
             console.log('[SHUTDOWN] MongoDB closed');
         }
 
-        // Close Redis
-        if (redisClient) {
+        // 4. Close Redis
+        if (redisClient && redisClient.status === 'ready') {
             await redisClient.quit();
             console.log('[SHUTDOWN] Redis closed');
         }
 
-        // ✅ Clear all intervals (fix #49)
+        // 5. Clear all intervals
         intervals.forEach(interval => clearInterval(interval));
         intervals.length = 0;
+        console.log('[SHUTDOWN] Background jobs stopped');
 
-        // Log final stats
+        // 6. Log final stats
         console.log(`[SHUTDOWN] Final stats - Reads: ${dbOpCounters.reads}, Writes: ${dbOpCounters.writes}`);
         
+        clearTimeout(shutdownTimeout);
         process.exit(exitCode);
     } catch (err) {
         console.error('[SHUTDOWN-ERROR]', err);
+        clearTimeout(shutdownTimeout);
         process.exit(1);
     }
 }
 
-// ===== SIGNAL HANDLERS (Single handler only) =====
-['SIGTERM', 'SIGINT'].forEach(signal => {
-    process.on(signal, () => {
+// ✅ Single signal handler
+['SIGTERM', 'SIGINT', 'SIGUSR2'].forEach(signal => {
+    process.once(signal, () => {
         console.log(`[${signal}] Received shutdown signal`);
         gracefulShutdown(0);
     });
