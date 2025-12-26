@@ -677,7 +677,8 @@ app.use('/api', rateLimit({
     skip: (req) => req.ip === '127.0.0.1'  // Skip localhost
 }));
 
-const { v4: uuidv4 } = require('uuid');
+import { v4 as uuidv4 } from 'uuid'; // ✅ ES Module syntax
+
 
 app.use((req, res, next) => {
     req.requestId = req.headers['x-request-id'] || uuidv4();
