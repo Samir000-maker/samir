@@ -20,6 +20,36 @@ import axios from 'axios';
 import Redis from 'ioredis';
 import crypto from 'crypto';
 
+
+import helmet from 'helmet';
+
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrc: ["'self'"],
+            imgSrc: ["'self'", "data:", "https:"],
+        }
+    },
+    hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
+    },
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
+}));
+
+// Rate limiting headers
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    next();
+});
+
+
+
 // const activeRequestsWithTimestamp = new Map();
 // const requestDeduplication = new Map();
 const DEDUP_WINDOW = 5000; // 5 seconds
@@ -309,6 +339,37 @@ async function executeRequest(key, requestFactory) {
     }
 }
 
+
+
+
+// ✅ Add retry wrapper
+async function withRetry(operation, maxRetries = 3, delay = 1000) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await operation();
+        } catch (error) {
+            // Retry only on transient errors
+            const isTransient = error.code === 'ECONNRESET' || 
+                                error.code === 'ETIMEDOUT' ||
+                                error.name === 'MongoNetworkError';
+            
+            if (!isTransient || attempt === maxRetries) {
+                throw error;
+            }
+            
+            console.log(`[RETRY] Attempt ${attempt}/${maxRetries} failed, retrying in ${delay}ms`);
+            await new Promise(resolve => setTimeout(resolve, delay * attempt));
+        }
+    }
+}
+
+// Usage
+const result = await withRetry(async () => {
+    return await db.collection('posts').findOne({ _id: postId });
+});
+
+
+
 // ✅ Alternative: If excluded IDs change frequently, use user slot-based caching
 function generateSlotBasedCacheKey(userId, userStatus) {
     // Cache based on current slots - invalidates when user moves to new slot
@@ -470,19 +531,15 @@ const getCache = async (key) => {
         try {
             const value = await redisClient.get(key);
             if (value) {
-                console.log(`[CACHE-HIT] ${key}`);
                 return JSON.parse(value);
             }
-            console.log(`[CACHE-MISS] ${key}`);
-            return null;
         } catch (err) {
             console.error('[CACHE-GET-ERROR]', key, err.message);
-            return null;
+            // ✅ Delete corrupted cache entry
+            await redisClient.del(key).catch(() => {});
         }
-    } else {
-        console.error('[CACHE-ERROR] Redis not available');
-        return null;
     }
+    return null;
 };
 
 const deleteCache = async (key) => {
@@ -514,11 +571,69 @@ async function invalidateCachePattern(pattern) {
     }
 }
 
+
 // Middleware
-app.use(cors());
+
+const corsOptions = {
+    origin: (origin, callback) => {
+        const whitelist = [
+            'https://samir-hgr9.onrender.com',
+            'https://app.yourdomain.com',
+            process.env.NODE_ENV === 'development' ? 'http://localhost:12312' : null
+        ].filter(Boolean);
+        
+        if (!origin || whitelist.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
+    maxAge: 86400 // 24 hours
+};
+
+app.use(cors(corsOptions));
+
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => { console.log(`[HTTP] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`); next(); });
-app.use('/api', rateLimit({ windowMs: 1000, max: 1000, standardHeaders: true, legacyHeaders: false }));
+// ✅ Add per-user rate limiting
+const userRateLimiter = rateLimit({
+    windowMs: 60000, // 1 minute
+    max: 100, // 100 requests per minute per user
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        // Use userId from request if available
+        return req.body?.userId || req.query?.userId || req.ip;
+    },
+    handler: (req, res) => {
+        console.warn(`[RATE-LIMIT] User ${req.body?.userId || req.ip} exceeded limit`);
+        res.status(429).json({
+            error: 'Too many requests',
+            retryAfter: 60
+        });
+    }
+});
+
+
+app.use('/api', userRateLimiter);
+
+// Keep global limit as backup
+app.use('/api', rateLimit({ 
+    windowMs: 1000, 
+    max: 5000,  // Increased for total capacity
+    skip: (req) => req.ip === '127.0.0.1'  // Skip localhost
+}));
+
+const { v4: uuidv4 } = require('uuid');
+
+app.use((req, res, next) => {
+    req.requestId = req.headers['x-request-id'] || uuidv4();
+    res.setHeader('X-Request-ID', req.requestId);
+    next();
+});
 
 app.use(express.json());
 
@@ -1427,6 +1542,12 @@ console.error('[UNIQUENESS-CHECK-ERROR]', error.message);
 class DatabaseManager {
 constructor(db) { this.db = db; }
 
+ ensureConnected() {
+        if (!this.db || !client.topology || !client.topology.isConnected()) {
+            throw new Error('Database not connected - cannot perform operation');
+        }
+    }
+
 
 async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_CONTENT_FOR_FEED) {
     const start = Date.now();
@@ -1542,6 +1663,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
 
 
 async getUserStatus(userId) {
+  this.ensureConnected();
 const cacheKey = `user_status_${userId}`;
 const cached = await getCache(cacheKey);
 if (cached) {
@@ -2042,175 +2164,154 @@ console.log(`[MAX-INDEX-COMPUTED] ${collection} = ${maxIndex} | DB Reads: ${dbOp
 return maxIndex;
 }
 
-async allocateSlot(col, postData, maxAttempts = 10) {
-    const coll = this.db.collection(col);
-    const listKey = col === 'reels' ? 'reelsList' : 'postList';
-    const postId = postData.postId;
 
-    console.log(`[SLOT-ALLOCATION] ${col} | PostId: ${postId}`);
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+// ✅ ATOMIC counter with retry
+async function getNextSlotIndex(col, maxRetries = 5) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            // ✅ CRITICAL: Acquire distributed lock
-            const lockKey = `slot_allocation:${col}`;
-            const lockValue = await acquireDistributedLock(lockKey, 15);
+            const counterResult = await db.collection('slot_counters').findOneAndUpdate(
+                { _id: `${col}_counter` },
+                { 
+                    $inc: { value: 1 },
+                    $setOnInsert: { createdAt: new Date() }
+                },
+                { 
+                    upsert: true, 
+                    returnDocument: 'after',
+                    // ✅ Add write concern for safety
+                    writeConcern: { w: 'majority', j: true }
+                }
+            );
             
-            if (!lockValue) {
-                console.log(`[SLOT-LOCK-WAIT] Attempt ${attempt} - waiting for lock`);
-                await new Promise(resolve => setTimeout(resolve, 100 * attempt));
-                continue;
+            if (!counterResult.value) {
+                throw new Error('Counter increment failed');
             }
+            
+            return counterResult.value.value;
+            
+        } catch (error) {
+            if (attempt === maxRetries) {
+                throw new Error(`Failed to get slot counter after ${maxRetries} attempts: ${error.message}`);
+            }
+            
+            console.warn(`[COUNTER-RETRY] Attempt ${attempt} failed, retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+        }
+    }
+}
 
-            try {
-                // ✅ STEP 1: Check for existing duplicate (prevent data corruption)
-                const existingDoc = await coll.findOne(
-                    { [`${listKey}.postId`]: postId },
-                    { projection: { _id: 1, count: 1 } }
-                );
 
-                if (existingDoc) {
-                    console.log(`[SLOT-DUPLICATE] ${postId} already exists in ${existingDoc._id}`);
-                    return {
-                        _id: existingDoc._id,
-                        index: parseInt(existingDoc._id.match(/_(\d+)$/)?.[1] || '0'),
-                        count: existingDoc.count,
-                        duplicate: true
-                    };
-                }
+class SessionManager {
+    constructor(client) {
+        this.client = client;
+        this.activeSessions = new Set();
+    }
 
-                // ✅ STEP 2: Try to insert into existing slot (atomic operation)
-                const updateResult = await coll.findOneAndUpdate(
-                    {
-                        count: { $lt: MAX_CONTENT_PER_SLOT },
-                        [`${listKey}.postId`]: { $ne: postId }
-                    },
-                    {
-                        $push: { [listKey]: postData },
-                        $inc: { count: 1 },
-                        $set: { updatedAt: new Date() }
-                    },
-                    {
-                        sort: { index: -1 },
-                        returnDocument: 'after',
-                        projection: { _id: 1, index: 1, count: 1 }
-                    }
-                );
+    async withSession(operation) {
+        const session = this.client.startSession();
+        this.activeSessions.add(session);
 
-                if (updateResult.value) {
-                    const doc = updateResult.value;
-                    console.log(`[SLOT-SUCCESS] ${postId} → ${doc._id} (${doc.count}/${MAX_CONTENT_PER_SLOT})`);
-                    
-                    await this.invalidateSlotCache(col);
-                    
-                    return {
-                        _id: doc._id,
-                        index: doc.index,
-                        count: doc.count
-                    };
-                }
+        try {
+            return await operation(session);
+        } finally {
+            this.activeSessions.delete(session);
+            await session.endSession().catch(err => {
+                console.error('[SESSION-CLEANUP-ERROR]', err);
+            });
+        }
+    }
 
-                // ✅ STEP 3: No available slot - create new one
-                console.log(`[SLOT-CREATE] Creating new slot (attempt ${attempt})`);
+    getActiveSessionCount() {
+        return this.activeSessions.size;
+    }
+}
 
-                // Use findOneAndUpdate with upsert for atomic counter increment
-                const counterResult = await this.db.collection('slot_counters').findOneAndUpdate(
-                    { _id: `${col}_counter` },
-                    { 
-                        $inc: { value: 1 },
-                        $setOnInsert: { createdAt: new Date() }
-                    },
-                    { 
-                        upsert: true, 
-                        returnDocument: 'after',
-                        projection: { value: 1 }
-                    }
-                );
 
-                const nextIndex = counterResult.value.value;
-                const newId = `${col.slice(0, -1)}_${nextIndex}`;
 
-                const newDoc = {
-                    _id: newId,
-                    index: nextIndex,
-                    count: 1,
-                    [listKey]: [postData],
-                    createdAt: new Date(),
-                    updatedAt: new Date()
-                };
+const sessionManager = new SessionManager(this.db.client);
+
+async function allocateSlot(col, postData, maxAttempts = 10) {
+    let result;
+
+    return await sessionManager.withSession(async (session) => {
+        await session.withTransaction(
+            async () => {
+                const lockKey = `slot_allocation:${col}`;
+                let lockValue;
 
                 try {
-                    await coll.insertOne(newDoc);
-                    
-                    console.log(`[SLOT-CREATED] ${newId} | PostId: ${postId}`);
-                    
-                    await this.invalidateSlotCache(col);
-                    
-                    return {
+                    lockValue = await acquireDistributedLock(lockKey, 15);
+
+                    if (!lockValue) {
+                        throw new Error('Failed to acquire lock');
+                    }
+
+                    // 1️⃣ Try to append to an existing slot
+                    const updateResult = await this.db
+                        .collection(col)
+                        .findOneAndUpdate(
+                            {
+                                count: { $lt: MAX_CONTENT_PER_SLOT },
+                                [`${listKey}.postId`]: { $ne: postData.postId }
+                            },
+                            {
+                                $push: { [listKey]: postData },
+                                $inc: { count: 1 }
+                            },
+                            {
+                                sort: { index: -1 },
+                                returnDocument: 'after',
+                                session
+                            }
+                        );
+
+                    if (updateResult.value) {
+                        result = {
+                            _id: updateResult.value._id,
+                            index: updateResult.value.index,
+                            count: updateResult.value.count
+                        };
+                        return;
+                    }
+
+                    // 2️⃣ Create a new slot
+                    const nextIndex = await getNextSlotIndex(col);
+                    const newId = `${col.slice(0, -1)}_${nextIndex}`;
+
+                    await this.db.collection(col).insertOne(
+                        {
+                            _id: newId,
+                            index: nextIndex,
+                            count: 1,
+                            [listKey]: [postData],
+                            createdAt: new Date()
+                        },
+                        { session }
+                    );
+
+                    result = {
                         _id: newId,
                         index: nextIndex,
                         count: 1
                     };
-
-                } catch (insertErr) {
-                    // ✅ Handle race condition: slot created by another process
-                    if (insertErr.code === 11000) {
-                        console.log(`[SLOT-RACE] ${newId} created by another process - retrying push`);
-                        
-                        const retryResult = await coll.findOneAndUpdate(
-                            {
-                                _id: newId,
-                                count: { $lt: MAX_CONTENT_PER_SLOT },
-                                [`${listKey}.postId`]: { $ne: postId }
-                            },
-                            {
-                                $push: { [listKey]: postData },
-                                $inc: { count: 1 },
-                                $set: { updatedAt: new Date() }
-                            },
-                            {
-                                returnDocument: 'after',
-                                projection: { _id: 1, index: 1, count: 1 }
-                            }
-                        );
-
-                        if (retryResult.value) {
-                            const doc = retryResult.value;
-                            console.log(`[SLOT-RETRY-SUCCESS] ${postId} → ${doc._id}`);
-                            
-                            await this.invalidateSlotCache(col);
-                            
-                            return {
-                                _id: doc._id,
-                                index: doc.index,
-                                count: doc.count
-                            };
-                        }
-                    } else {
-                        throw insertErr;
+                } finally {
+                    if (lockValue) {
+                        await releaseDistributedLock(lockKey, lockValue);
                     }
                 }
-
-            } finally {
-                // ✅ Always release lock
-                await releaseDistributedLock(lockKey, lockValue);
+            },
+            {
+                readConcern: { level: 'snapshot' },
+                writeConcern: { w: 'majority' },
+                readPreference: 'primary'
             }
+        );
 
-        } catch (error) {
-            console.error(`[SLOT-ERROR-${attempt}/${maxAttempts}]`, error.message);
-
-            if (attempt === maxAttempts) {
-                throw new Error(`Slot allocation failed after ${maxAttempts} attempts: ${error.message}`);
-            }
-
-            // Exponential backoff
-            const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
-            console.log(`[SLOT-BACKOFF] Waiting ${backoff}ms before retry ${attempt + 1}`);
-            await new Promise(resolve => setTimeout(resolve, backoff));
-        }
-    }
-
-    throw new Error(`Could not allocate slot for postId ${postId} after ${maxAttempts} attempts`);
+        return result;
+    });
 }
+
 
 
 // NEW: Helper to invalidate slot cache
@@ -2226,14 +2327,22 @@ console.log(`[CACHE-INVALIDATED] ${cacheKey}`);
 }
 
 async saveToUserPosts(userId, postData) {
-const start = Date.now();
-const result = await this.db.collection('user_posts').updateOne(
-{ userId, postId: postData.postId },
-{ $set: { ...postData, userId, postId: postData.postId, createdAt: new Date().toISOString() } },
-{ upsert: true }
-);
-logDbOp('updateOne', 'user_posts', { userId, postId: postData.postId }, result, Date.now() - start);
-await this.atomicIncrement(`user_post_count:${userId}`, 1);
+    try {
+        const result = await this.db.collection('user_posts').updateOne(
+            { userId, postId: postData.postId },
+            { $set: { ...postData, userId, postId: postData.postId, createdAt: new Date().toISOString() } },
+            { upsert: true }
+        );
+        logDbOp('updateOne', 'user_posts', { userId, postId: postData.postId }, result, 0);
+        await this.atomicIncrement(`user_post_count:${userId}`, 1);
+    } catch (error) {
+        // ✅ Handle duplicate key error gracefully
+        if (error.code === 11000) {
+            console.log(`[DUPLICATE-POST] ${postData.postId} already exists for user ${userId} - skipping`);
+            return; // Silently ignore, post already exists
+        }
+        throw error; // Re-throw other errors
+    }
 }
 
 async atomicIncrement(key, by = 1) {
@@ -2624,15 +2733,13 @@ duration: duration
 });
 
 } catch (error) {
-console.error('[SINGLE-REEL-ERROR] ❌ CRITICAL ERROR', error);
-console.error('Stack trace:', error.stack);
-
-res.status(500).json({
-success: false,
-error: 'Server error fetching reel',
-message: error.message,
-stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-});
+    console.error('[ERROR]', error); // Log internally only
+    
+    res.status(500).json({
+        success: false,
+        error: 'Internal server error',
+        requestId: req.requestId  // For support tickets
+    });
 }
 });
 
