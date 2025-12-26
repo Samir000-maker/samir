@@ -628,7 +628,7 @@ const corsOptions = {
     origin: (origin, callback) => {
         const whitelist = [
             'https://samir-hgr9.onrender.com',
-            'https://app.yourdomain.com',
+            'https://samir000-maker.github.io/ping/',
             process.env.NODE_ENV === 'development' ? 'http://localhost:12312' : null
         ].filter(Boolean);
         
