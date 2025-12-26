@@ -417,10 +417,6 @@ async function withRetry(operation, maxRetries = 3, delay = 1000) {
     }
 }
 
-// Usage
-const result = await withRetry(async () => {
-    return await db.collection('posts').findOne({ _id: postId });
-});
 
 
 
@@ -1844,6 +1840,11 @@ if (cached) {
 console.log(`[CACHE-HIT] user_status for ${userId} | Source: Redis/Memory`);
 return cached;
 }
+
+    // Usage
+const result = await withRetry(async () => {
+    return await db.collection('posts').findOne({ _id: postId });
+});
 
 const readsBefore = dbOpCounters.reads;
 const start = Date.now();
