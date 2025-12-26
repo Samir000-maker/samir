@@ -119,7 +119,7 @@ db = client.db(DB_NAME);
         // Default to latest slots if user is new
 let reelSlotIds = ['reel_0'];
 let postSlotIds = ['post_0'];
-
+let sessionManager;
 
 class SessionManager {
     constructor(client) {
@@ -146,7 +146,6 @@ class SessionManager {
     }
 }
 
-const sessionManager = new SessionManager(this.db.client);
 
 class LRUCache {
     constructor(maxSize = MAX_CACHE_SIZE) {
