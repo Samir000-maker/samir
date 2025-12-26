@@ -1096,6 +1096,41 @@ if (failed > 0) {
 
 
 
+// ✅ ATOMIC counter with retry
+async function getNextSlotIndex(col, maxRetries = 5) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const counterResult = await db.collection('slot_counters').findOneAndUpdate(
+                { _id: `${col}_counter` },
+                { 
+                    $inc: { value: 1 },
+                    $setOnInsert: { createdAt: new Date() }
+                },
+                { 
+                    upsert: true, 
+                    returnDocument: 'after',
+                    // ✅ Add write concern for safety
+                    writeConcern: { w: 'majority', j: true }
+                }
+            );
+            
+            if (!counterResult.value) {
+                throw new Error('Counter increment failed');
+            }
+            
+            return counterResult.value.value;
+            
+        } catch (error) {
+            if (attempt === maxRetries) {
+                throw new Error(`Failed to get slot counter after ${maxRetries} attempts: ${error.message}`);
+            }
+            
+            console.warn(`[COUNTER-RETRY] Attempt ${attempt} failed, retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+        }
+    }
+}
+
 
 async function createAggregationIndexes() {
 try {
@@ -2165,41 +2200,6 @@ return maxIndex;
 }
 
 
-
-// ✅ ATOMIC counter with retry
-async function getNextSlotIndex(col, maxRetries = 5) {
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            const counterResult = await db.collection('slot_counters').findOneAndUpdate(
-                { _id: `${col}_counter` },
-                { 
-                    $inc: { value: 1 },
-                    $setOnInsert: { createdAt: new Date() }
-                },
-                { 
-                    upsert: true, 
-                    returnDocument: 'after',
-                    // ✅ Add write concern for safety
-                    writeConcern: { w: 'majority', j: true }
-                }
-            );
-            
-            if (!counterResult.value) {
-                throw new Error('Counter increment failed');
-            }
-            
-            return counterResult.value.value;
-            
-        } catch (error) {
-            if (attempt === maxRetries) {
-                throw new Error(`Failed to get slot counter after ${maxRetries} attempts: ${error.message}`);
-            }
-            
-            console.warn(`[COUNTER-RETRY] Attempt ${attempt} failed, retrying...`);
-            await new Promise(resolve => setTimeout(resolve, 50 * attempt));
-        }
-    }
-}
 
 
 class SessionManager {
