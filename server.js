@@ -4618,38 +4618,6 @@ return res.status(500).json({ success: false, error: 'Failed to recover userId' 
 });
 
 
-
-
-
-async function createInstagramFeedIndexes() {
-try {
-// Ultra-fast compound indexes for Instagram-style queries
-const indexes = [
-// Following queries optimization
-{ collection: 'posts', index: { 'postList.userId': 1, 'postList.timestamp': -1 }, options: { background: true } },
-{ collection: 'reels', index: { 'reelsList.userId': 1, 'reelsList.timestamp': -1 }, options: { background: true } },
-
-// Ranking optimization
-{ collection: 'posts', index: { 'postList.retention': -1, 'postList.likeCount': -1, 'postList.timestamp': -1 }, options: { background: true } },
-{ collection: 'reels', index: { 'reelsList.retention': -1, 'reelsList.likeCount': -1, 'reelsList.timestamp': -1 }, options: { background: true } },
-
-// User diversity optimization
-{ collection: 'posts', index: { 'postList.userId': 1, 'postList.postId': 1 }, options: { background: true } },
-{ collection: 'reels', index: { 'reelsList.userId': 1, 'reelsList.postId': 1 }, options: { background: true } }
-];
-
-for (const { collection, index, options } of indexes) {
-await db.collection(collection).createIndex(index, options);
-log('info', `Created Instagram feed index for ${collection}`);
-}
-
-log('info', '[INSTAGRAM-INDEXES] All feed optimization indexes created');
-} catch (error) {
-log('error', '[INSTAGRAM-INDEX-ERROR]', error.message);
-}
-}
-
-
 // Helper function to find which collection and document contains a specific reel
 async function findReelLocation(reelId, hintSourceDocument = null) {
 try {
@@ -4919,63 +4887,6 @@ error: error.message
 };
 }
 }
-
-
-
-
-
-
-//
-
-
-
-async function createOptimizedIndexes() {
-const db = client.db(DB_NAME);
-
-// user_reel_interactions indexes
-await db.collection('user_reel_interactions').createIndex({ "_id": 1 }); // Primary key
-await db.collection('user_reel_interactions').createIndex({ "userId": 1, "date": -1 });
-await db.collection('user_reel_interactions').createIndex({ "viewedReels.postId": 1 });
-await db.collection('user_reel_interactions').createIndex({ "likedReels.postId": 1 });
-
-// reel_stats indexes
-await db.collection('reel_stats').createIndex({ "_id": 1 }); // Primary key (postId)
-await db.collection('reel_stats').createIndex({ "sourceDocument": 1 });
-await db.collection('reel_stats').createIndex({ "likeCount": -1 }); // For trending
-
-// user_interaction_cache indexes
-await db.collection('user_interaction_cache').createIndex({ "_id": 1 });
-await db.collection('user_interaction_cache').createIndex({ "userId": 1 });
-await db.collection('user_interaction_cache').createIndex({ "ttl": 1 }, { expireAfterSeconds: 0 });
-
-console.log('[INDEXES] All interaction indexes created successfully');
-}
-
-
-
-async function createRankingIndexes() {
-try {
-const rankingIndexes = [
-// Posts collection
-{ collection: 'posts', index: { retention: -1, likeCount: -1, commentCount: -1, viewCount: -1, createdAt: -1 }, options: { background: true } },
-// Reels collection
-{ collection: 'reels', index: { retention: -1, likeCount: -1, commentCount: -1, viewCount: -1, createdAt: -1 }, options: { background: true } },
-// Compound indexes for efficient filtering
-{ collection: 'posts', index: { '_id': 1, 'retention': -1 }, options: { background: true } },
-{ collection: 'reels', index: { '_id': 1, 'retention': -1 }, options: { background: true } }
-];
-
-for (const { collection, index, options } of rankingIndexes) {
-await db.collection(collection).createIndex(index, options);
-log('info', `Created ranking index for ${collection}`);
-}
-} catch (error) {
-log('warn', 'Ranking index creation error:', error.message);
-}
-}
-
-
-
 
 
 app.post('/api/interactions/check', async (req, res) => {
@@ -5328,11 +5239,6 @@ return res.status(500).json({ error: 'Failed to get reel statistics' });
 // Database Cleanup and Maintenance
 // =================================================================
 
-// ✅ Add index first
-await db.collection('user_reel_interactions').createIndex(
-    { createdAt: 1 },
-    { name: 'cleanup_index', background: true }
-);
 
 // ✅ Add limit to batch deletions
 async function cleanupOldInteractions() {
