@@ -22,6 +22,29 @@ import crypto from 'crypto';
 const app = express();
 
 
+const mongoOptions = {
+    maxPoolSize: 500,
+    minPoolSize: 50,
+    maxIdleTimeMS: 300000,
+    serverSelectionTimeoutMS: 10000,
+    socketTimeoutMS: 60000,
+    connectTimeoutMS: 15000,
+    readPreference: 'secondaryPreferred',
+    readConcern: { level: 'majority' },
+    writeConcern: { w: 'majority', j: false },
+    retryWrites: true,
+    retryReads: true,
+    waitQueueTimeoutMS: 30000,
+    maxConnecting: 20,
+    compressors: ['snappy', 'zlib'],
+    heartbeatFrequencyMS: 10000,
+    monitorCommands: false,
+    directConnection: false,
+    appName: 'instagram-clone-prod',
+    maxStalenessSeconds: 90
+};
+
+
 import helmet from 'helmet';
 
 app.use(helmet({
