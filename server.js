@@ -1047,7 +1047,9 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
   const normalField = isReel ? 'normalReelSlotId' : 'normalPostSlotId';
   const listKey = isReel ? 'reelsList' : 'postList';
 
-  console.log(`[SLOT-ALGORITHM] START userId=${userId} | type=${contentType} | minRequired=${minContentRequired}`);
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`[FEED-ALGORITHM-START] userId=${userId} | type=${contentType} | minRequired=${minContentRequired}`);
+  console.log(`${'='.repeat(80)}`);
 
   // ============================================================
   // READ 1: Get user status
@@ -1059,9 +1061,9 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
   
   const isNewUser = !userStatus || !userStatus[statusField];
   
-  console.log(`[SLOT-ALGORITHM] User status: ${isNewUser ? 'NEW USER' : `latestSlot=${userStatus[statusField]}, normalSlot=${userStatus[normalField]}`}`);
+  console.log(`[USER-STATUS] ${isNewUser ? 'NEW USER' : `RETURNING USER | latest=${userStatus[statusField]}, normal=${userStatus[normalField]}`}`);
 
-  // Get user interests for filtering
+  // Get user interests
   let userInterests = [];
   try {
     const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
@@ -1069,47 +1071,52 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
       userInterests = userResponse.data.user.interests || [];
     }
   } catch (e) {
-    console.warn(`[SLOT-ALGORITHM] Interests fetch failed: ${e.message}`);
+    console.warn(`[INTERESTS-FETCH-FAILED] ${e.message}`);
   }
 
-  console.log(`[SLOT-ALGORITHM] User interests: [${userInterests.join(', ')}]`);
+  console.log(`[USER-INTERESTS] [${userInterests.join(', ')}] (${userInterests.length} interests)`);
 
   let slotsToRead = [];
   let newLatestSlot = null;
   let newNormalSlot = null;
 
   // ============================================================
-  // DETERMINE WHICH SLOTS TO READ (MAX 3)
+  // PHASE 1: DETERMINE WHICH SLOTS TO READ
   // ============================================================
   if (isNewUser) {
-    // FRESH USER: Read latest 3 slots (e.g., reel_8, reel_7, reel_6)
+    // ✅ FRESH USER LOGIC: Read latest 3 slots (reel_10, reel_9, reel_8)
     const latestSlot = await this.getLatestSlotOptimized(collection);
     if (!latestSlot) {
-      console.warn(`[SLOT-ALGORITHM] No slots found in ${collection}`);
+      console.warn(`[NO-SLOTS-FOUND] ${collection} collection is empty`);
       return { content: [], latestDocumentId: null, normalDocumentId: null, isNewUser: true };
     }
 
     const latestIndex = latestSlot.index;
     slotsToRead = [
-      `${collection.slice(0, -1)}_${latestIndex}`,
-      `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`,
-      `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`
+      `${collection.slice(0, -1)}_${latestIndex}`,     // reel_10
+      `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`, // reel_9
+      `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`  // reel_8
     ];
 
-    newLatestSlot = slotsToRead[0];
-    newNormalSlot = slotsToRead[2];
+    // ✅ CORRECT: latestReelSlotId = reel_10, normalReelSlotId = reel_8
+    newLatestSlot = slotsToRead[0]; // reel_10
+    newNormalSlot = slotsToRead[2]; // reel_8
 
-    console.log(`[SLOT-ALGORITHM] NEW USER slots: [${slotsToRead.join(', ')}]`);
+    console.log(`[FRESH-USER-SLOTS] Will read: [${slotsToRead.join(', ')}]`);
+    console.log(`[FRESH-USER-SAVE] latestSlot=${newLatestSlot}, normalSlot=${newNormalSlot}`);
 
   } else {
-    // RETURNING USER: Check for newer slots FIRST
+    // ✅ RETURNING USER LOGIC
     const currentLatestSlot = userStatus[statusField];
     const currentNormalSlot = userStatus[normalField];
     
     const latestMatch = currentLatestSlot.match(/_(\d+)$/);
     const latestIndex = latestMatch ? parseInt(latestMatch[1]) : 0;
 
-    // ✅ CRITICAL: Always check for NEWER document first
+    const normalMatch = currentNormalSlot.match(/_(\d+)$/);
+    const normalIndex = normalMatch ? parseInt(normalMatch[1]) : 0;
+
+    // ✅ STEP 1: Check for NEWER document (reel_11 if latest is reel_10)
     const newerSlotId = `${collection.slice(0, -1)}_${latestIndex + 1}`;
     const newerSlotExists = await this.db.collection(collection).findOne(
       { _id: newerSlotId },
@@ -1117,44 +1124,85 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     );
 
     if (newerSlotExists) {
-      console.log(`[SLOT-ALGORITHM] ✅ NEWER SLOT FOUND: ${newerSlotId}`);
+      console.log(`[NEWER-SLOT-FOUND] ${newerSlotId} exists!`);
       
-      // Read: newerSlot, normalSlot, normalSlot-1
-      const normalMatch = currentNormalSlot.match(/_(\d+)$/);
-      const normalIndex = normalMatch ? parseInt(normalMatch[1]) : 0;
-
+      // ✅ Read: newerSlot, normalSlot, normalSlot-1
       slotsToRead = [
-        newerSlotId,
-        currentNormalSlot,
-        `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`
+        newerSlotId, // reel_11
+        currentNormalSlot, // reel_8
+        `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}` // reel_7
       ];
 
+      // ✅ UPDATE: latestSlot = reel_11, normalSlot = reel_7
       newLatestSlot = newerSlotId;
       newNormalSlot = slotsToRead[2];
 
+      console.log(`[RETURNING-USER-NEWER] Will read: [${slotsToRead.join(', ')}]`);
+      console.log(`[RETURNING-USER-SAVE] latestSlot=${newLatestSlot}, normalSlot=${newNormalSlot}`);
+
     } else {
-      console.log(`[SLOT-ALGORITHM] No newer slot after ${currentLatestSlot}, reading backward from normalSlot`);
+      console.log(`[NO-NEWER-SLOT] ${newerSlotId} doesn't exist, reading backward from normalSlot`);
       
-      // Read: normalSlot, normalSlot-1, normalSlot-2
-      const normalMatch = currentNormalSlot.match(/_(\d+)$/);
-      const normalIndex = normalMatch ? parseInt(normalMatch[1]) : 0;
+      // ✅ SPECIAL CASE: normalSlot is reel_0 (can't go backward)
+      if (normalIndex === 0) {
+        console.log(`[REACHED-REEL-0] Can't go backward, checking for latest documents`);
+        
+        // Check if there are ANY newer slots beyond latestSlot
+        const allNewerSlots = [];
+        for (let i = latestIndex + 1; i <= latestIndex + 10; i++) {
+          const checkSlot = `${collection.slice(0, -1)}_${i}`;
+          const exists = await this.db.collection(collection).findOne(
+            { _id: checkSlot },
+            { projection: { _id: 1 } }
+          );
+          if (exists) allNewerSlots.push(checkSlot);
+          else break; // Stop at first gap
+        }
 
-      slotsToRead = [
-        currentNormalSlot,
-        `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`,
-        `${collection.slice(0, -1)}_${Math.max(normalIndex - 2, 0)}`
-      ];
+        if (allNewerSlots.length > 0) {
+          // Found newer slots, read latest 3
+          slotsToRead = allNewerSlots.slice(-3);
+          newLatestSlot = slotsToRead[slotsToRead.length - 1];
+          newNormalSlot = slotsToRead[0];
+          
+          console.log(`[REEL-0-FOUND-NEWER] Will read: [${slotsToRead.join(', ')}]`);
+        } else {
+          // No newer slots, re-read from latestSlot backward
+          slotsToRead = [
+            currentLatestSlot, // reel_10
+            `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`, // reel_9
+            `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`  // reel_8
+          ];
+          
+          newLatestSlot = currentLatestSlot; // Keep same
+          newNormalSlot = slotsToRead[2];
+          
+          console.log(`[REEL-0-NO-NEWER] Re-reading: [${slotsToRead.join(', ')}]`);
+        }
+        
+      } else {
+        // ✅ NORMAL CASE: Read normalSlot, normalSlot-1, normalSlot-2
+        slotsToRead = [
+          currentNormalSlot, // reel_8
+          `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`, // reel_7
+          `${collection.slice(0, -1)}_${Math.max(normalIndex - 2, 0)}`  // reel_6
+        ];
 
-      newLatestSlot = currentLatestSlot; // Unchanged
-      newNormalSlot = slotsToRead[2];
+        // ✅ UPDATE: latestSlot stays same, normalSlot = reel_6
+        newLatestSlot = currentLatestSlot;
+        newNormalSlot = slotsToRead[2];
+
+        console.log(`[RETURNING-USER-BACKWARD] Will read: [${slotsToRead.join(', ')}]`);
+        console.log(`[RETURNING-USER-SAVE] latestSlot=${newLatestSlot} (unchanged), normalSlot=${newNormalSlot}`);
+      }
     }
-
-    console.log(`[SLOT-ALGORITHM] RETURNING USER slots: [${slotsToRead.join(', ')}]`);
   }
 
   // ============================================================
-  // READ 2-4: Fetch content from determined slots (MAX 3 READS)
+  // PHASE 2: FETCH CONTENT FROM DETERMINED SLOTS (MAX 3)
   // ============================================================
+  console.log(`\n[CONTENT-FETCH-START] Reading ${slotsToRead.length} slots...`);
+  
   const slotContents = [];
   for (const slotId of slotsToRead) {
     const slotDoc = await this.db.collection(collection).findOne(
@@ -1167,62 +1215,71 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
         slotId: slotId,
         content: slotDoc[listKey]
       });
-      console.log(`[SLOT-ALGORITHM] READ ${slotId}: ${slotDoc[listKey].length} items`);
+      console.log(`[SLOT-READ] ${slotId}: ${slotDoc[listKey].length} items (count=${slotDoc.count})`);
     } else {
-      console.log(`[SLOT-ALGORITHM] READ ${slotId}: EMPTY or NOT FOUND`);
+      console.log(`[SLOT-READ] ${slotId}: EMPTY or NOT FOUND`);
     }
   }
 
   // ============================================================
-  // READ 5-7: Fetch viewed content for ONLY these 3 slots (MAX 3 READS)
+  // PHASE 3: FILTER VIEWED CONTENT (MAX 3 CONTRIB READS)
   // ============================================================
+  console.log(`\n[FILTERING-START] Checking viewed content in contrib_${collection}...`);
+  
   const viewedIds = new Set();
   for (const { slotId } of slotContents) {
-    const uniqueDocId = `${userId}_${slotId}`;
     const contribDoc = await this.db.collection(`contrib_${collection}`).findOne(
-      { _id: uniqueDocId },
+      { 
+        userId: userId,
+        slotId: slotId
+      },
       { projection: { ids: 1 } }
     );
 
     if (contribDoc && contribDoc.ids) {
       contribDoc.ids.forEach(id => viewedIds.add(id));
-      console.log(`[SLOT-ALGORITHM] VIEWED in ${slotId}: ${contribDoc.ids.length} items`);
+      console.log(`[VIEWED-FILTER] ${slotId}: ${contribDoc.ids.length} viewed IDs`);
+    } else {
+      console.log(`[VIEWED-FILTER] ${slotId}: No contributions found`);
     }
   }
 
-  console.log(`[SLOT-ALGORITHM] Total viewed IDs: ${viewedIds.size}`);
+  console.log(`[TOTAL-VIEWED] ${viewedIds.size} IDs to exclude`);
 
   // ============================================================
-  // PHASE 1: Interest-based filtering
+  // PHASE 4: INTEREST-BASED FILTERING
   // ============================================================
-  let filteredContent = [];
+  console.log(`\n[INTEREST-FILTERING-START] Matching with user interests...`);
+  
+  let interestedContent = [];
 
   for (const { slotId, content } of slotContents) {
     for (const item of content) {
       // Skip if already viewed
       if (viewedIds.has(item.postId)) continue;
 
-      // ✅ INTEREST FILTERING: Match category with user interests
+      // ✅ Interest filtering
       if (userInterests.length > 0) {
         if (item.category && userInterests.includes(item.category)) {
-          filteredContent.push(item);
+          interestedContent.push(item);
+          console.log(`[INTEREST-MATCH] ${item.postId.substring(0, 8)}: category=${item.category}`);
         }
       } else {
-        // No interests defined, include all
-        filteredContent.push(item);
+        // No interests = include all
+        interestedContent.push(item);
       }
     }
   }
 
-  console.log(`[SLOT-ALGORITHM] PHASE 1 (Interest-filtered): ${filteredContent.length} items`);
+  console.log(`[INTEREST-FILTERED] ${interestedContent.length} items matched interests`);
 
   // ============================================================
-  // PHASE 2: Fill remainder with high-engagement content
+  // PHASE 5: FILL WITH HIGH-ENGAGEMENT CONTENT IF NEEDED
   // ============================================================
-  if (filteredContent.length < minContentRequired) {
-    console.log(`[SLOT-ALGORITHM] PHASE 2: Need ${minContentRequired - filteredContent.length} more items`);
-
-    const existingIds = new Set(filteredContent.map(item => item.postId));
+  if (interestedContent.length < minContentRequired) {
+    console.log(`\n[ENGAGEMENT-FILL-START] Need ${minContentRequired - interestedContent.length} more items`);
+    
+    const existingIds = new Set(interestedContent.map(item => item.postId));
     const remainderContent = [];
 
     for (const { content } of slotContents) {
@@ -1233,7 +1290,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
       }
     }
 
-    // ✅ ENGAGEMENT RANKING: retention > likes > comments > views
+    // ✅ Sort by engagement: retention > likes > comments > views
     remainderContent.sort((a, b) => {
       const retentionDiff = (b.retention || 0) - (a.retention || 0);
       if (Math.abs(retentionDiff) > 1) return retentionDiff;
@@ -1247,16 +1304,21 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
       return (b.viewCount || 0) - (a.viewCount || 0);
     });
 
-    const needed = minContentRequired - filteredContent.length;
-    filteredContent.push(...remainderContent.slice(0, needed));
-
-    console.log(`[SLOT-ALGORITHM] PHASE 2 (High-engagement): Added ${Math.min(remainderContent.length, needed)} items`);
+    const needed = minContentRequired - interestedContent.length;
+    const fillContent = remainderContent.slice(0, needed);
+    
+    fillContent.forEach(item => {
+      console.log(`[ENGAGEMENT-FILL] ${item.postId.substring(0, 8)}: retention=${item.retention}%, likes=${item.likeCount}`);
+    });
+    
+    interestedContent.push(...fillContent);
+    console.log(`[ENGAGEMENT-FILLED] Added ${fillContent.length} high-engagement items`);
   }
 
   // ============================================================
-  // FINAL RANKING: Sort by engagement
+  // PHASE 6: FINAL RANKING
   // ============================================================
-  filteredContent.sort((a, b) => {
+  interestedContent.sort((a, b) => {
     const retentionDiff = (b.retention || 0) - (a.retention || 0);
     if (Math.abs(retentionDiff) > 1) return retentionDiff;
 
@@ -1270,30 +1332,40 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
   });
 
   // ============================================================
-  // UPDATE USER STATUS (if slots changed)
+  // PHASE 7: UPDATE USER STATUS
   // ============================================================
   if (newLatestSlot && newNormalSlot) {
     await this.updateUserStatus(userId, {
       [statusField]: newLatestSlot,
       [normalField]: newNormalSlot
     });
-    console.log(`[SLOT-ALGORITHM] Updated user_status: latest=${newLatestSlot}, normal=${newNormalSlot}`);
+    console.log(`\n[USER-STATUS-UPDATE] Saved: latest=${newLatestSlot}, normal=${newNormalSlot}`);
   }
 
   const duration = Date.now() - start;
-  console.log(`[SLOT-ALGORITHM] COMPLETE: ${filteredContent.length} items | ${duration}ms | Reads: ${1 + slotContents.length + slotContents.length} (1 user_status + ${slotContents.length} slots + ${slotContents.length} contrib)`);
+  const totalReads = 1 + slotContents.length + slotContents.length; // 1 user_status + 3 slots + 3 contrib
+
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`[FEED-ALGORITHM-COMPLETE]`);
+  console.log(`  Content Returned: ${interestedContent.length} items`);
+  console.log(`  Total Reads: ${totalReads} (1 user_status + ${slotContents.length} slots + ${slotContents.length} contrib)`);
+  console.log(`  Duration: ${duration}ms`);
+  console.log(`  Slots Read: [${slotsToRead.join(', ')}]`);
+  console.log(`  Status Saved: latest=${newLatestSlot}, normal=${newNormalSlot}`);
+  console.log(`${'='.repeat(80)}\n`);
 
   return {
-    content: filteredContent.slice(0, minContentRequired * 2),
+    content: interestedContent.slice(0, minContentRequired * 2),
     latestDocumentId: newLatestSlot,
     normalDocumentId: newNormalSlot,
     isNewUser,
-    hasNewContent: filteredContent.length > 0,
+    hasNewContent: interestedContent.length > 0,
     metadata: {
       slotsRead: slotsToRead,
-      interestFiltered: filteredContent.length,
-      totalReads: 1 + slotContents.length + slotContents.length,
-      userInterests
+      interestFiltered: interestedContent.length,
+      totalReads: totalReads,
+      userInterests,
+      duration
     }
   };
 }
@@ -3216,19 +3288,25 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
+    // ✅ NEW FORMAT: Client sends { postId, slotId }
+    // Example: reels = [{ postId: "abc123", slotId: "reel_10" }, ...]
+    
     console.log(`[BATCH-START] userId=${userId} | ${posts.length}P + ${reels.length}R`);
 
-    // ✅ CRITICAL FIX: Build operations with CORRECT slotId determination
     const postOperations = [];
     const reelOperations = [];
 
-    // Process posts
-    for (const postId of posts) {
-      const slotId = await getSlotForPost(postId);
+    // ✅ Process posts (client provides slotId)
+    for (const item of posts) {
+      const postId = typeof item === 'string' ? item : item.postId;
+      const slotId = typeof item === 'object' ? item.slotId : await getSlotForPost(postId);
+      
       if (!slotId) {
         console.warn(`[BATCH-SKIP-POST] ${postId} - slot not found`);
         continue;
       }
+
+      console.log(`[BATCH-POST] ${postId.substring(0, 8)} → ${slotId}`);
 
       postOperations.push({
         updateOne: {
@@ -3250,13 +3328,17 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
-    // Process reels
-    for (const reelId of reels) {
-      const slotId = await getSlotForReel(reelId);
+    // ✅ Process reels (client provides slotId)
+    for (const item of reels) {
+      const reelId = typeof item === 'string' ? item : item.postId;
+      const slotId = typeof item === 'object' ? item.slotId : await getSlotForReel(reelId);
+      
       if (!slotId) {
         console.warn(`[BATCH-SKIP-REEL] ${reelId} - slot not found`);
         continue;
       }
+
+      console.log(`[BATCH-REEL] ${reelId.substring(0, 8)} → ${slotId}`);
 
       reelOperations.push({
         updateOne: {
@@ -3278,26 +3360,26 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
-    // Execute operations
+    // Execute bulk writes
     const [postResults, reelResults] = await Promise.all([
       postOperations.length > 0 
         ? db.collection('contrib_posts').bulkWrite(postOperations, { 
             ordered: false,
             writeConcern: { w: 1, j: false }
           })
-        : Promise.resolve({ insertedCount: 0, modifiedCount: 0 }),
+        : Promise.resolve({ upsertedCount: 0, modifiedCount: 0 }),
       
       reelOperations.length > 0
         ? db.collection('contrib_reels').bulkWrite(reelOperations, { 
             ordered: false,
             writeConcern: { w: 1, j: false }
           })
-        : Promise.resolve({ insertedCount: 0, modifiedCount: 0 })
+        : Promise.resolve({ upsertedCount: 0, modifiedCount: 0 })
     ]);
 
     const duration = Date.now() - startTime;
 
-    console.log(`[BATCH-COMPLETE] userId=${userId} | ${posts.length}P + ${reels.length}R in ${duration}ms`);
+    console.log(`[BATCH-COMPLETE] userId=${userId} | ${postOperations.length}P + ${reelOperations.length}R operations in ${duration}ms`);
 
     res.json({
       success: true,
@@ -3305,15 +3387,17 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
         posts: posts.length,
         reels: reels.length
       },
+      saved: {
+        posts: postOperations.length,
+        reels: reelOperations.length
+      },
       results: {
         posts: {
-          operations: postOperations.length,
-          inserted: postResults.upsertedCount || 0,
+          upserted: postResults.upsertedCount || 0,
           modified: postResults.modifiedCount || 0
         },
         reels: {
-          operations: reelOperations.length,
-          inserted: reelResults.upsertedCount || 0,
+          upserted: reelResults.upsertedCount || 0,
           modified: reelResults.modifiedCount || 0
         }
       },
