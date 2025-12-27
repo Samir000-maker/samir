@@ -19,7 +19,7 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@clus
 const DB_NAME = process.env.DB_NAME || 'appdb';
 const axios = require('axios');
 const Redis = require('ioredis');
-const LRU = require('lru-cache');
+import LRU from 'lru-cache';
 const activeRequestsWithTimestamp = new Map();
 const REQUEST_DEDUP_TTL = 5000; // 5 seconds
 const requestDeduplication = new Map();
