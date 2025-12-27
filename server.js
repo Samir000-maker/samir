@@ -43,7 +43,7 @@ const { promisify } = require('util');
 
 
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
-const MAX_CONTENT_PER_SLOT = 3; // Maximum content items per document before creating new slot
+const MAX_CONTENT_PER_SLOT = 40; // Maximum content items per document before creating new slot
 const DEFAULT_CONTENT_BATCH_SIZE = 10; // Default number of items to return per request
 const MIN_CONTENT_FOR_FEED = 10; // Minimum content required for feed requests
 // ============================================================================
@@ -5290,7 +5290,6 @@ return res.status(500).json({ error: 'Failed to get reel statistics' });
 
 
 
-
 app.post('/api/debug/feed-analysis', async (req, res) => {
     const analysisStart = Date.now();
     const { userId, feedType = 'mixed' } = req.body;
@@ -5335,6 +5334,8 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
         );
         reads.user_status = 1;
 
+        const isNewUser = !userStatus || !userStatus.latestReelSlotId;
+
         if (userStatus) {
             documentsRead.user_status.push({
                 _id: userId,
@@ -5342,37 +5343,119 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
                 normalReelSlotId: userStatus.normalReelSlotId,
                 latestPostSlotId: userStatus.latestPostSlotId,
                 normalPostSlotId: userStatus.normalPostSlotId,
+                readTime: Date.now() - t1,
+                isNewUser: false
+            });
+        } else {
+            documentsRead.user_status.push({
+                _id: userId,
+                status: 'NOT_FOUND',
+                isNewUser: true,
                 readTime: Date.now() - t1
             });
         }
 
-        // Extract slot numbers
-        const latestReelNum = parseInt(userStatus?.latestReelSlotId?.split('_')[1] || '0');
-        const normalReelNum = parseInt(userStatus?.normalReelSlotId?.split('_')[1] || '0');
-        const latestPostNum = parseInt(userStatus?.latestPostSlotId?.split('_')[1] || '0');
-        const normalPostNum = parseInt(userStatus?.normalPostSlotId?.split('_')[1] || '0');
+        // ============================================================
+        // DETERMINE SLOTS TO READ (FOLLOWING YOUR ALGORITHM)
+        // ============================================================
+        let reelSlotsToRead = [];
+        let postSlotsToRead = [];
+
+        if (isNewUser) {
+            // ✅ FRESH USER: Read latest, latest-1, latest-2
+            const latestReelDoc = await db.collection('reels').findOne(
+                {},
+                { sort: { index: -1 }, projection: { index: 1 } }
+            );
+
+            const latestPostDoc = await db.collection('posts').findOne(
+                {},
+                { sort: { index: -1 }, projection: { index: 1 } }
+            );
+
+            if (latestReelDoc) {
+                const latestIndex = latestReelDoc.index;
+                reelSlotsToRead = [
+                    `reel_${latestIndex}`,
+                    `reel_${Math.max(latestIndex - 1, 0)}`,
+                    `reel_${Math.max(latestIndex - 2, 0)}`
+                ];
+            }
+
+            if (latestPostDoc) {
+                const latestIndex = latestPostDoc.index;
+                postSlotsToRead = [
+                    `post_${latestIndex}`,
+                    `post_${Math.max(latestIndex - 1, 0)}`,
+                    `post_${Math.max(latestIndex - 2, 0)}`
+                ];
+            }
+
+            console.log(`[FEED-ANALYSIS] NEW USER | Will read: reels=[${reelSlotsToRead.join(', ')}] posts=[${postSlotsToRead.join(', ')}]`);
+
+        } else {
+            // ✅ RETURNING USER: Check for newer slot first
+            const latestReelNum = parseInt(userStatus.latestReelSlotId?.split('_')[1] || '0');
+            const normalReelNum = parseInt(userStatus.normalReelSlotId?.split('_')[1] || '0');
+            
+            const latestPostNum = parseInt(userStatus.latestPostSlotId?.split('_')[1] || '0');
+            const normalPostNum = parseInt(userStatus.normalPostSlotId?.split('_')[1] || '0');
+
+            // Check for newer reel slot
+            const newerReelSlotId = `reel_${latestReelNum + 1}`;
+            const newerReelExists = await db.collection('reels').findOne(
+                { _id: newerReelSlotId },
+                { projection: { _id: 1 } }
+            );
+
+            if (newerReelExists) {
+                reelSlotsToRead = [
+                    newerReelSlotId,
+                    userStatus.normalReelSlotId,
+                    `reel_${Math.max(normalReelNum - 1, 0)}`
+                ];
+            } else {
+                reelSlotsToRead = [
+                    userStatus.normalReelSlotId,
+                    `reel_${Math.max(normalReelNum - 1, 0)}`,
+                    `reel_${Math.max(normalReelNum - 2, 0)}`
+                ];
+            }
+
+            // Check for newer post slot
+            const newerPostSlotId = `post_${latestPostNum + 1}`;
+            const newerPostExists = await db.collection('posts').findOne(
+                { _id: newerPostSlotId },
+                { projection: { _id: 1 } }
+            );
+
+            if (newerPostExists) {
+                postSlotsToRead = [
+                    newerPostSlotId,
+                    userStatus.normalPostSlotId,
+                    `post_${Math.max(normalPostNum - 1, 0)}`
+                ];
+            } else {
+                postSlotsToRead = [
+                    userStatus.normalPostSlotId,
+                    `post_${Math.max(normalPostNum - 1, 0)}`,
+                    `post_${Math.max(normalPostNum - 2, 0)}`
+                ];
+            }
+
+            console.log(`[FEED-ANALYSIS] RETURNING USER | Will read: reels=[${reelSlotsToRead.join(', ')}] posts=[${postSlotsToRead.join(', ')}]`);
+        }
+
+        // Remove duplicates
+        reelSlotsToRead = [...new Set(reelSlotsToRead)];
+        postSlotsToRead = [...new Set(postSlotsToRead)];
 
         // ============================================================
-        // DETERMINE SLOTS TO READ (Max 3 per type)
-        // ============================================================
-        const reelSlotsToRead = [
-            `reel_${latestReelNum + 1}`, // Check for newer
-            `reel_${latestReelNum}`,     // Current latest
-            `reel_${normalReelNum}`      // Normal
-        ].filter((v, i, a) => a.indexOf(v) === i); // Remove duplicates
-
-        const postSlotsToRead = [
-            `post_${latestPostNum + 1}`,
-            `post_${latestPostNum}`,
-            `post_${normalPostNum}`
-        ].filter((v, i, a) => a.indexOf(v) === i);
-
-        // ============================================================
-        // READ 2-4: reels collection (3 documents max)
+        // READ 2-4: reels collection (MAX 3 documents)
         // ============================================================
         const t2 = Date.now();
         const reelDocs = await db.collection('reels').find(
-            { _id: { $in: reelSlotsToRead.slice(0, 3) } },
+            { _id: { $in: reelSlotsToRead } },
             { projection: { _id: 1, count: 1, index: 1 } }
         ).toArray();
         reads.reels_collection = reelDocs.length;
@@ -5391,31 +5474,33 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
         // ============================================================
         const actualReelSlots = reelDocs.map(d => d._id);
         
-        const t3 = Date.now();
-        const contribReelDocs = await db.collection('contrib_reels').find(
-            { 
-                userId: userId,
-                slotId: { $in: actualReelSlots }
-            },
-            { projection: { slotId: 1, ids: 1 } }
-        ).toArray();
-        reads.contrib_reels = contribReelDocs.length;
+        if (actualReelSlots.length > 0) {
+            const t3 = Date.now();
+            const contribReelDocs = await db.collection('contrib_reels').find(
+                { 
+                    userId: userId,
+                    slotId: { $in: actualReelSlots }
+                },
+                { projection: { slotId: 1, ids: 1 } }
+            ).toArray();
+            reads.contrib_reels = contribReelDocs.length;
 
-        contribReelDocs.forEach(doc => {
-            documentsRead.contrib_reels.push({
-                userId: userId,
-                slotId: doc.slotId,
-                idsCount: doc.ids?.length || 0,
-                readTime: Date.now() - t3
+            contribReelDocs.forEach(doc => {
+                documentsRead.contrib_reels.push({
+                    userId: userId,
+                    slotId: doc.slotId,
+                    idsCount: doc.ids?.length || 0,
+                    readTime: Date.now() - t3
+                });
             });
-        });
+        }
 
         // ============================================================
         // READ 8-10: posts collection
         // ============================================================
         const t4 = Date.now();
         const postDocs = await db.collection('posts').find(
-            { _id: { $in: postSlotsToRead.slice(0, 3) } },
+            { _id: { $in: postSlotsToRead } },
             { projection: { _id: 1, count: 1, index: 1 } }
         ).toArray();
         reads.posts_collection = postDocs.length;
@@ -5434,24 +5519,26 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
         // ============================================================
         const actualPostSlots = postDocs.map(d => d._id);
         
-        const t5 = Date.now();
-        const contribPostDocs = await db.collection('contrib_posts').find(
-            { 
-                userId: userId,
-                slotId: { $in: actualPostSlots }
-            },
-            { projection: { slotId: 1, ids: 1 } }
-        ).toArray();
-        reads.contrib_posts = contribPostDocs.length;
+        if (actualPostSlots.length > 0) {
+            const t5 = Date.now();
+            const contribPostDocs = await db.collection('contrib_posts').find(
+                { 
+                    userId: userId,
+                    slotId: { $in: actualPostSlots }
+                },
+                { projection: { slotId: 1, ids: 1 } }
+            ).toArray();
+            reads.contrib_posts = contribPostDocs.length;
 
-        contribPostDocs.forEach(doc => {
-            documentsRead.contrib_posts.push({
-                userId: userId,
-                slotId: doc.slotId,
-                idsCount: doc.ids?.length || 0,
-                readTime: Date.now() - t5
+            contribPostDocs.forEach(doc => {
+                documentsRead.contrib_posts.push({
+                    userId: userId,
+                    slotId: doc.slotId,
+                    idsCount: doc.ids?.length || 0,
+                    readTime: Date.now() - t5
+                });
             });
-        });
+        }
 
         // ============================================================
         // READ 14: user_interaction_cache (1 document)
@@ -5477,6 +5564,17 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
         }
 
         // ============================================================
+        // CALCULATE TOTAL CONTENT AVAILABLE
+        // ============================================================
+        const totalReelItems = reelDocs.reduce((sum, doc) => sum + (doc.count || 0), 0);
+        const totalPostItems = postDocs.reduce((sum, doc) => sum + (doc.count || 0), 0);
+        const totalViewedReels = documentsRead.contrib_reels.reduce((sum, doc) => sum + doc.idsCount, 0);
+        const totalViewedPosts = documentsRead.contrib_posts.reduce((sum, doc) => sum + doc.idsCount, 0);
+
+        const availableReels = totalReelItems - totalViewedReels;
+        const availablePosts = totalPostItems - totalViewedPosts;
+
+        // ============================================================
         // FINAL SUMMARY
         // ============================================================
         const totalReads = Object.values(reads).reduce((sum, val) => sum + val, 0);
@@ -5486,6 +5584,7 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
 ╔════════════════════════════════════════════════════════════════════╗
 ║  FEED ANALYSIS REPORT - User: ${userId.substring(0, 20)}...
 ╠════════════════════════════════════════════════════════════════════╣
+║  User Type: ${isNewUser ? '🆕 NEW USER' : '🔄 RETURNING USER'}
 ║  Total Reads: ${totalReads} documents in ${totalTime}ms
 ║  
 ║  READ BREAKDOWN:
@@ -5496,14 +5595,28 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
 ║    5. contrib_posts      : ${reads.contrib_posts} reads
 ║    6. interaction_cache  : ${reads.user_interaction_cache} read
 ║
-║  DOCUMENTS READ:
-║  └─ user_status: ${documentsRead.user_status.map(d => d._id).join(', ') || 'none'}
-║  └─ reels: ${documentsRead.reels.map(d => d._id).join(', ') || 'none'}
+║  SLOTS READ:
+║  └─ Reels: [${documentsRead.reels.map(d => d._id).join(', ') || 'none'}]
+║  └─ Posts: [${documentsRead.posts.map(d => d._id).join(', ') || 'none'}]
+║
+║  CONTENT SUMMARY:
+║  └─ Total reel items in slots: ${totalReelItems}
+║  └─ Viewed reels (filtered):   ${totalViewedReels}
+║  └─ Available reels:            ${availableReels} ${availableReels < MIN_CONTENT_FOR_FEED ? '⚠️ BELOW MIN (10)' : '✅'}
+║  
+║  └─ Total post items in slots: ${totalPostItems}
+║  └─ Viewed posts (filtered):   ${totalViewedPosts}
+║  └─ Available posts:            ${availablePosts} ${availablePosts < MIN_CONTENT_FOR_FEED ? '⚠️ BELOW MIN (10)' : '✅'}
+║
+║  CONTRIB FILTERING:
 ║  └─ contrib_reels: ${documentsRead.contrib_reels.map(d => `${d.slotId}(${d.idsCount})`).join(', ') || 'none'}
-║  └─ posts: ${documentsRead.posts.map(d => d._id).join(', ') || 'none'}
 ║  └─ contrib_posts: ${documentsRead.contrib_posts.map(d => `${d.slotId}(${d.idsCount})`).join(', ') || 'none'}
 ║
 ║  OPTIMIZATION STATUS: ${totalReads <= 14 ? '✅ EXCELLENT' : '⚠️ NEEDS OPTIMIZATION'}
+║  
+║  ⚠️  ISSUE DETECTED:
+║  ${availableReels < MIN_CONTENT_FOR_FEED ? `   Only ${reelDocs.length} reel slots read (should be 3)` : '   No issues detected'}
+║  ${totalReelItems < MIN_CONTENT_FOR_FEED ? `   Each slot has only ${Math.round(totalReelItems / reelDocs.length)} items` : ''}
 ╚════════════════════════════════════════════════════════════════════╝
         `;
 
@@ -5512,14 +5625,36 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
         return res.json({
             success: true,
             userId,
+            isNewUser,
             summary: {
                 totalReads,
                 totalTime,
                 breakdown: reads,
                 isOptimized: totalReads <= 14
             },
+            contentSummary: {
+                reels: {
+                    totalInSlots: totalReelItems,
+                    viewed: totalViewedReels,
+                    available: availableReels,
+                    meetsMinimum: availableReels >= MIN_CONTENT_FOR_FEED
+                },
+                posts: {
+                    totalInSlots: totalPostItems,
+                    viewed: totalViewedPosts,
+                    available: availablePosts,
+                    meetsMinimum: availablePosts >= MIN_CONTENT_FOR_FEED
+                }
+            },
             documentsRead,
-            plainTextReport: summary
+            plainTextReport: summary,
+            algorithmExpectation: isNewUser ? {
+                expectedReelSlots: reelSlotsToRead,
+                expectedPostSlots: postSlotsToRead,
+                expectedReads: '1 user_status + 3 reels + 3 contrib_reels + 3 posts + 3 contrib_posts = 13 reads',
+                actualReelSlotsRead: documentsRead.reels.length,
+                actualPostSlotsRead: documentsRead.posts.length
+            } : null
         });
 
     } catch (err) {
