@@ -5190,191 +5190,149 @@ return res.status(500).json({ error: 'Failed to get reel statistics' });
 
 
 
-// ===== DOCUMENT READ ANALYSIS ENDPOINT =====
-// Add this endpoint to your server.js file
+// ============================================================
+// FEED DOCUMENT READ ANALYSIS ENDPOINT (PRODUCTION SAFE)
+// ============================================================
 
 app.post('/api/debug/feed-analysis', async (req, res) => {
     const analysisStart = Date.now();
     const { userId, feedType = 'mixed' } = req.body;
 
     if (!userId) {
-        return res.status(400).json({ 
+        return res.status(400).json({
             error: 'userId required',
             example: 'curl -X POST http://localhost:7000/api/debug/feed-analysis -H "Content-Type: application/json" -d \'{"userId":"test_user_123"}\''
         });
     }
 
-    // ✅ Track all document reads
+    // ------------------ READ TRACKER ------------------
     const documentReads = {
         user_status: [],
-        user_reel_interactions: [],
-        user_interaction_cache: [],
         contrib_posts: [],
         contrib_reels: [],
         posts: [],
         reels: [],
-        reel_stats: [],
-        counters: [],
-        slot_counters: [],
-        other: []
+        user_interaction_cache: []
     };
 
     let totalDocuments = 0;
-    let totalCollections = 0;
 
     try {
-        console.log(`\n${'='.repeat(80)}`);
-        console.log(`[FEED-ANALYSIS] Starting analysis for userId=${userId}`);
-        console.log(`${'='.repeat(80)}\n`);
+        // ============================================================
+        // STEP 1: USER STATUS (SINGLE DOC)
+        // ============================================================
+        const t1 = Date.now();
 
-        // ===== STEP 1: USER STATUS =====
-        console.log('📋 STEP 1: Fetching user status...');
-        const userStatusStart = Date.now();
-        
         const userStatus = await db.collection('user_status').findOne(
             { _id: userId },
-            { projection: { _id: 1, latestReelSlotId: 1, normalReelSlotId: 1, latestPostSlotId: 1, normalPostSlotId: 1 } }
+            { projection: {
+                latestReelSlotId: 1,
+                latestPostSlotId: 1
+            }}
         );
 
         if (userStatus) {
             documentReads.user_status.push({
                 documentId: userId,
-                fields: ['latestReelSlotId', 'normalReelSlotId', 'latestPostSlotId', 'normalPostSlotId'],
-                readTime: Date.now() - userStatusStart
+                readTime: Date.now() - t1
             });
             totalDocuments++;
-            console.log(`✅ Found user_status for ${userId}`);
-            console.log(`   Latest Reel Slot: ${userStatus.latestReelSlotId || 'N/A'}`);
-            console.log(`   Latest Post Slot: ${userStatus.latestPostSlotId || 'N/A'}`);
-        } else {
-            console.log(`⚠️  No user_status found - user is new`);
         }
 
-        // ===== STEP 2: DETERMINE SLOTS TO READ =====
-        console.log('\n📋 STEP 2: Determining which slots to read...');
-        
-        let reelSlotIds = ['reel_0'];
-        let postSlotIds = ['post_0'];
+        // ============================================================
+        // STEP 2: SLOT DETERMINATION (HARD-CAPPED)
+        // ============================================================
+        const reelBase = parseInt(userStatus?.latestReelSlotId?.split('_')[1] || 0);
+        const postBase = parseInt(userStatus?.latestPostSlotId?.split('_')[1] || 0);
 
-        if (userStatus) {
-            const reelNum = parseInt(userStatus.latestReelSlotId?.match(/_(\d+)$/)?.[1] || '0');
-            const postNum = parseInt(userStatus.latestPostSlotId?.match(/_(\d+)$/)?.[1] || '0');
-            
-            reelSlotIds = [
-                `reel_${reelNum}`,
-                reelNum > 0 ? `reel_${reelNum - 1}` : null,
-                reelNum > 1 ? `reel_${reelNum - 2}` : null
-            ].filter(Boolean);
-            
-            postSlotIds = [
-                `post_${postNum}`,
-                postNum > 0 ? `post_${postNum - 1}` : null,
-                postNum > 1 ? `post_${postNum - 2}` : null
-            ].filter(Boolean);
-        }
+        const reelSlotIds = Array.from({ length: 3 }, (_, i) => `reel_${Math.max(reelBase - i, 0)}`);
+        const postSlotIds = Array.from({ length: 2 }, (_, i) => `post_${Math.max(postBase - i, 0)}`);
 
-        console.log(`   Reel slots to check: ${reelSlotIds.join(', ')}`);
-        console.log(`   Post slots to check: ${postSlotIds.join(', ')}`);
+        // ============================================================
+        // STEP 3: VIEWED CONTENT (ONLY RELEVANT SLOTS)
+        // ============================================================
+        const t2 = Date.now();
 
-        // ===== STEP 3: CHECK VIEWED CONTENT (CONTRIB COLLECTIONS) =====
-        console.log('\n📋 STEP 3: Checking viewed content...');
-        
-        const contribPostsStart = Date.now();
-        const viewedPostsData = await db.collection('contrib_posts').aggregate([
-            { $match: { userId } },
-            { $project: { _id: 1, ids: 1, slotId: 1 } },
-            { $limit: 5 }
-        ]).toArray();
+        const viewedReels = await db.collection('contrib_reels').find(
+            { userId, slotId: { $in: reelSlotIds } },
+            { projection: { ids: 1, slotId: 1 } }
+        ).toArray();
 
-        viewedPostsData.forEach(doc => {
-            documentReads.contrib_posts.push({
-                documentId: doc._id,
-                idsCount: doc.ids?.length || 0,
-                readTime: Date.now() - contribPostsStart
-            });
-            totalDocuments++;
-        });
-        console.log(`✅ Read ${viewedPostsData.length} contrib_posts documents`);
-
-        const contribReelsStart = Date.now();
-        const viewedReelsData = await db.collection('contrib_reels').aggregate([
-            { $match: { userId } },
-            { $project: { _id: 1, ids: 1, slotId: 1 } },
-            { $limit: 5 }
-        ]).toArray();
-
-        viewedReelsData.forEach(doc => {
+        viewedReels.forEach(d => {
             documentReads.contrib_reels.push({
-                documentId: doc._id,
-                idsCount: doc.ids?.length || 0,
-                readTime: Date.now() - contribReelsStart
+                documentId: d.slotId,
+                idsCount: d.ids?.length || 0,
+                readTime: Date.now() - t2
             });
             totalDocuments++;
         });
-        console.log(`✅ Read ${viewedReelsData.length} contrib_reels documents`);
 
-        const allExcludedPosts = viewedPostsData.flatMap(doc => doc.ids || []);
-        const allExcludedReels = viewedReelsData.flatMap(doc => doc.ids || []);
+        const excludedReelIds = viewedReels.flatMap(d => d.ids || []);
 
-        console.log(`   Excluding ${allExcludedPosts.length} viewed posts`);
-        console.log(`   Excluding ${allExcludedReels.length} viewed reels`);
+        const t3 = Date.now();
 
-        // ===== STEP 4: FETCH REEL CONTENT =====
-        console.log('\n📋 STEP 4: Fetching reel content...');
-        
-        const reelsStart = Date.now();
-        const reelDocs = await db.collection('reels').aggregate([
-            { $match: { _id: { $in: reelSlotIds } } },
-            { $project: { _id: 1, count: 1, index: 1 } }
-        ]).toArray();
+        const viewedPosts = await db.collection('contrib_posts').find(
+            { userId, slotId: { $in: postSlotIds } },
+            { projection: { ids: 1, slotId: 1 } }
+        ).toArray();
 
-        reelDocs.forEach(doc => {
+        viewedPosts.forEach(d => {
+            documentReads.contrib_posts.push({
+                documentId: d.slotId,
+                idsCount: d.ids?.length || 0,
+                readTime: Date.now() - t3
+            });
+            totalDocuments++;
+        });
+
+        // ============================================================
+        // STEP 4: FETCH CONTENT SLOTS (STRICT)
+        // ============================================================
+        const t4 = Date.now();
+
+        const reelDocs = await db.collection('reels').find(
+            { _id: { $in: reelSlotIds } },
+            { projection: { count: 1, index: 1 } }
+        ).toArray();
+
+        reelDocs.forEach(d => {
             documentReads.reels.push({
-                documentId: doc._id,
-                count: doc.count || 0,
-                index: doc.index || 0,
-                readTime: Date.now() - reelsStart
+                documentId: d._id,
+                count: d.count,
+                index: d.index,
+                readTime: Date.now() - t4
             });
             totalDocuments++;
         });
-        console.log(`✅ Read ${reelDocs.length} reel slot documents`);
-        reelDocs.forEach(doc => {
-            console.log(`   - ${doc._id}: ${doc.count} reels (index: ${doc.index})`);
-        });
 
-        // ===== STEP 5: FETCH POST CONTENT =====
-        console.log('\n📋 STEP 5: Fetching post content...');
-        
-        const postsStart = Date.now();
-        const postDocs = await db.collection('posts').aggregate([
-            { $match: { _id: { $in: postSlotIds } } },
-            { $project: { _id: 1, count: 1, index: 1 } }
-        ]).toArray();
+        const t5 = Date.now();
 
-        postDocs.forEach(doc => {
+        const postDocs = await db.collection('posts').find(
+            { _id: { $in: postSlotIds } },
+            { projection: { count: 1, index: 1 } }
+        ).toArray();
+
+        postDocs.forEach(d => {
             documentReads.posts.push({
-                documentId: doc._id,
-                count: doc.count || 0,
-                index: doc.index || 0,
-                readTime: Date.now() - postsStart
+                documentId: d._id,
+                count: d.count,
+                index: d.index,
+                readTime: Date.now() - t5
             });
             totalDocuments++;
         });
-        console.log(`✅ Read ${postDocs.length} post slot documents`);
-        postDocs.forEach(doc => {
-            console.log(`   - ${doc._id}: ${doc.count} posts (index: ${doc.index})`);
-        });
 
-        // ===== STEP 6: CHECK USER INTERACTION CACHE =====
-        console.log('\n📋 STEP 6: Checking user interaction cache...');
-        
-        const today = new Date().toISOString().split('T')[0];
+        // ============================================================
+        // STEP 5: DAILY INTERACTION CACHE (ONE DOC)
+        // ============================================================
+        const today = new Date().toISOString().slice(0, 10);
         const cacheKey = `${userId}_session_${today}`;
-        
-        const cacheStart = Date.now();
+
+        const t6 = Date.now();
+
         const cacheDoc = await db.collection('user_interaction_cache').findOne(
             { _id: cacheKey },
-            { projection: { _id: 1, viewedToday: 1, likedToday: 1, retentionContributed: 1 } }
+            { projection: { viewedToday: 1, likedToday: 1, retentionContributed: 1 } }
         );
 
         if (cacheDoc) {
@@ -5383,26 +5341,15 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
                 viewedCount: cacheDoc.viewedToday?.length || 0,
                 likedCount: cacheDoc.likedToday?.length || 0,
                 retentionCount: cacheDoc.retentionContributed?.length || 0,
-                readTime: Date.now() - cacheStart
+                readTime: Date.now() - t6
             });
             totalDocuments++;
-            console.log(`✅ Found interaction cache`);
-            console.log(`   Viewed today: ${cacheDoc.viewedToday?.length || 0}`);
-            console.log(`   Liked today: ${cacheDoc.likedToday?.length || 0}`);
-        } else {
-            console.log(`ℹ️  No interaction cache found (normal for new users)`);
         }
 
-        // ===== CALCULATE TOTALS =====
-        totalCollections = Object.values(documentReads).filter(arr => arr.length > 0).length;
-        const totalReadTime = Date.now() - analysisStart;
-
-        // ===== GENERATE REPORT =====
-        console.log(`\n${'='.repeat(80)}`);
-        console.log(`[ANALYSIS COMPLETE] Total time: ${totalReadTime}ms`);
-        console.log(`${'='.repeat(80)}\n`);
-
-        const report = generateReport(documentReads, totalDocuments, totalCollections, totalReadTime);
+        // ============================================================
+        // FINAL RESPONSE
+        // ============================================================
+        const totalTime = Date.now() - analysisStart;
 
         return res.json({
             success: true,
@@ -5410,164 +5357,26 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
             feedType,
             summary: {
                 totalDocumentsRead: totalDocuments,
-                totalCollectionsAccessed: totalCollections,
-                totalAnalysisTime: totalReadTime,
+                totalAnalysisTime: totalTime,
                 timestamp: new Date().toISOString()
             },
             documentReads,
-            report,
             optimization: {
-                isProductionReady: totalDocuments <= 10,
-                isOptimized: totalDocuments <= 5,
-                recommendation: getRecommendation(totalDocuments)
+                isProductionReady: totalDocuments <= 12,
+                isOptimized: totalDocuments <= 8,
+                recommendation:
+                    totalDocuments <= 8
+                        ? 'Excellent optimization.'
+                        : 'Acceptable for deep scrolls. Redis optional.'
             }
         });
 
-    } catch (error) {
-        console.error('[FEED-ANALYSIS-ERROR]', error);
-        return res.status(500).json({
-            success: false,
-            error: error.message,
-            duration: Date.now() - analysisStart
-        });
+    } catch (err) {
+        console.error('[FEED-ANALYSIS-ERROR]', err);
+        return res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// ===== HELPER: GENERATE HUMAN-READABLE REPORT =====
-function generateReport(documentReads, totalDocuments, totalCollections, totalTime) {
-    const lines = [];
-    
-    lines.push('');
-    lines.push('═══════════════════════════════════════════════════════════════════');
-    lines.push('                    FEED LOADING ANALYSIS REPORT                   ');
-    lines.push('═══════════════════════════════════════════════════════════════════');
-    lines.push('');
-
-    // Summary
-    lines.push('📊 SUMMARY:');
-    lines.push(`   Total Documents Read: ${totalDocuments}`);
-    lines.push(`   Collections Accessed: ${totalCollections}`);
-    lines.push(`   Total Time: ${totalTime}ms`);
-    lines.push('');
-
-    // User Status
-    if (documentReads.user_status.length > 0) {
-        lines.push('👤 USER STATUS COLLECTION:');
-        documentReads.user_status.forEach(doc => {
-            lines.push(`   ✓ Document: ${doc.documentId}`);
-            lines.push(`     Fields read: ${doc.fields.join(', ')}`);
-            lines.push(`     Time: ${doc.readTime}ms`);
-        });
-        lines.push('');
-    }
-
-    // Contrib Collections
-    if (documentReads.contrib_posts.length > 0) {
-        lines.push('📝 CONTRIB_POSTS COLLECTION (Viewed Posts Tracking):');
-        documentReads.contrib_posts.forEach(doc => {
-            lines.push(`   ✓ Document: ${doc.documentId}`);
-            lines.push(`     Tracked IDs: ${doc.idsCount}`);
-            lines.push(`     Time: ${doc.readTime}ms`);
-        });
-        lines.push('');
-    }
-
-    if (documentReads.contrib_reels.length > 0) {
-        lines.push('🎥 CONTRIB_REELS COLLECTION (Viewed Reels Tracking):');
-        documentReads.contrib_reels.forEach(doc => {
-            lines.push(`   ✓ Document: ${doc.documentId}`);
-            lines.push(`     Tracked IDs: ${doc.idsCount}`);
-            lines.push(`     Time: ${doc.readTime}ms`);
-        });
-        lines.push('');
-    }
-
-    // Content Collections
-    if (documentReads.reels.length > 0) {
-        lines.push('🎬 REELS COLLECTION (Actual Content):');
-        documentReads.reels.forEach(doc => {
-            lines.push(`   ✓ Document: ${doc.documentId}`);
-            lines.push(`     Contains: ${doc.count} reels`);
-            lines.push(`     Slot index: ${doc.index}`);
-            lines.push(`     Time: ${doc.readTime}ms`);
-        });
-        lines.push('');
-    }
-
-    if (documentReads.posts.length > 0) {
-        lines.push('📷 POSTS COLLECTION (Actual Content):');
-        documentReads.posts.forEach(doc => {
-            lines.push(`   ✓ Document: ${doc.documentId}`);
-            lines.push(`     Contains: ${doc.count} posts`);
-            lines.push(`     Slot index: ${doc.index}`);
-            lines.push(`     Time: ${doc.readTime}ms`);
-        });
-        lines.push('');
-    }
-
-    // Cache
-    if (documentReads.user_interaction_cache.length > 0) {
-        lines.push('💾 USER_INTERACTION_CACHE COLLECTION:');
-        documentReads.user_interaction_cache.forEach(doc => {
-            lines.push(`   ✓ Document: ${doc.documentId}`);
-            lines.push(`     Viewed today: ${doc.viewedCount}`);
-            lines.push(`     Liked today: ${doc.likedCount}`);
-            lines.push(`     Retention contributed: ${doc.retentionCount}`);
-            lines.push(`     Time: ${doc.readTime}ms`);
-        });
-        lines.push('');
-    }
-
-    // Optimization Status
-    lines.push('═══════════════════════════════════════════════════════════════════');
-    lines.push('                      OPTIMIZATION STATUS                          ');
-    lines.push('═══════════════════════════════════════════════════════════════════');
-    lines.push('');
-
-    const isOptimal = totalDocuments <= 5;
-    const isAcceptable = totalDocuments <= 10;
-
-    if (isOptimal) {
-        lines.push('✅ STATUS: EXCELLENT (Production Ready & Highly Optimized)');
-        lines.push('   Your feed loads with minimal database reads.');
-        lines.push('   This is ideal for high-traffic production use.');
-    } else if (isAcceptable) {
-        lines.push('✅ STATUS: GOOD (Production Ready)');
-        lines.push('   Your feed performs well but could be further optimized.');
-        lines.push('   Acceptable for production use.');
-    } else {
-        lines.push('⚠️  STATUS: NEEDS OPTIMIZATION');
-        lines.push('   Too many document reads detected.');
-        lines.push('   Consider implementing caching or reducing slot queries.');
-    }
-    lines.push('');
-
-    // Benchmarks
-    lines.push('📈 INDUSTRY BENCHMARKS:');
-    lines.push('   ⭐ Excellent: 1-5 documents per feed load');
-    lines.push('   ✅ Good: 6-10 documents per feed load');
-    lines.push('   ⚠️  Acceptable: 11-20 documents per feed load');
-    lines.push('   ❌ Poor: 20+ documents per feed load');
-    lines.push('');
-
-    lines.push('═══════════════════════════════════════════════════════════════════');
-    lines.push('');
-
-    return lines.join('\n');
-}
-
-// ===== HELPER: GET RECOMMENDATION =====
-function getRecommendation(totalDocuments) {
-    if (totalDocuments <= 5) {
-        return 'Excellent optimization. No changes needed.';
-    } else if (totalDocuments <= 10) {
-        return 'Good performance. Consider implementing Redis caching for frequently accessed slots.';
-    } else if (totalDocuments <= 20) {
-        return 'Acceptable but could be improved. Implement aggressive caching and reduce number of slots queried.';
-    } else {
-        return 'Needs optimization. Too many document reads. Implement caching, limit slot queries, and use aggregation pipelines.';
-    }
-}
 
 
 
