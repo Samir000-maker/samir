@@ -107,33 +107,6 @@ const getOrCreateRequest = (key, requestFactory) => {
   return promise;
 };
   
-  
-// Quick inline cleanup (don't iterate entire map)
-if (activeRequestsWithTimestamp.size > 1000) {
-console.warn(`[REQUEST-MAP-WARNING] Map size: ${activeRequestsWithTimestamp.size} - forcing cleanup`);
-for (const [reqKey, reqData] of activeRequestsWithTimestamp.entries()) {
-if (now - reqData.timestamp > REQUEST_DEDUP_TTL) {
-activeRequestsWithTimestamp.delete(reqKey);
-}
-}
-}
-
-if (activeRequestsWithTimestamp.has(key)) {
-console.log(`[REQUEST-DEDUP] ${key} - using existing request | Map size: ${activeRequestsWithTimestamp.size}`);
-return activeRequestsWithTimestamp.get(key).promise;
-}
-
-const promise = requestFactory().finally(() => {
-activeRequestsWithTimestamp.delete(key);
-});
-
-activeRequestsWithTimestamp.set(key, {
-promise,
-timestamp: now
-});
-
-return promise;
-};
 
 // CRITICAL: Enhanced logging with collection scan detection
 function logDbOp(op, col, query = {}, result = null, time = 0, options = {}) {
