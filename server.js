@@ -521,6 +521,8 @@ async function initMongo() {
     await enableSharding();
   }
 
+
+  await createContribIndexes();
   // ✅ CREATE ALL INDEXES (consolidated function)
   await createAllProductionIndexes();
 
@@ -552,6 +554,35 @@ async function initMongo() {
 
   console.log('[MONGO-INIT] ✅ Initialization complete');
 }
+
+
+async function createContribIndexes() {
+  try {
+    // ✅ CRITICAL: Compound index for FAST filtering
+    await db.collection('contrib_posts').createIndex(
+      { userId: 1, slotId: 1 },
+      { 
+        name: 'userId_slotId_lookup',
+        background: true
+      }
+    );
+
+    await db.collection('contrib_reels').createIndex(
+      { userId: 1, slotId: 1 },
+      { 
+        name: 'userId_slotId_lookup',
+        background: true
+      }
+    );
+
+    console.log('[CONTRIB-INDEXES] ✅ Created compound indexes for userId + slotId');
+  } catch (err) {
+    if (err.code !== 85) { // Ignore "already exists"
+      console.error('[CONTRIB-INDEX-ERROR]', err.message);
+    }
+  }
+}
+
 
 // ============================================================
 // ✅ CONSOLIDATED INDEX CREATION (replaces all separate functions)
@@ -3187,27 +3218,29 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
 
     console.log(`[BATCH-START] userId=${userId} | ${posts.length}P + ${reels.length}R`);
 
-    // ✅ CRITICAL FIX: Use bulkWrite for ALL operations (not individual updateOne calls)
-    
+    // ✅ CRITICAL FIX: Build operations with CORRECT slotId determination
     const postOperations = [];
     const reelOperations = [];
 
-    // Build bulk operations
+    // Process posts
     for (const postId of posts) {
-      // Determine which slot this post belongs to (you need to implement getSlotForPost)
-      const slotId = await getSlotForPost(postId);  // See implementation below
-      if (!slotId) continue;
+      const slotId = await getSlotForPost(postId);
+      if (!slotId) {
+        console.warn(`[BATCH-SKIP-POST] ${postId} - slot not found`);
+        continue;
+      }
 
-      const uniqueDocId = `${userId}_${slotId}`;
-      
       postOperations.push({
         updateOne: {
-          filter: { _id: uniqueDocId },
+          filter: { 
+            userId: userId,
+            slotId: slotId
+          },
           update: {
             $addToSet: { ids: postId },
             $setOnInsert: {
-              userId,
-              slotId,
+              userId: userId,
+              slotId: slotId,
               createdAt: new Date()
             },
             $set: { updatedAt: new Date() }
@@ -3217,20 +3250,25 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
+    // Process reels
     for (const reelId of reels) {
       const slotId = await getSlotForReel(reelId);
-      if (!slotId) continue;
+      if (!slotId) {
+        console.warn(`[BATCH-SKIP-REEL] ${reelId} - slot not found`);
+        continue;
+      }
 
-      const uniqueDocId = `${userId}_${slotId}`;
-      
       reelOperations.push({
         updateOne: {
-          filter: { _id: uniqueDocId },
+          filter: { 
+            userId: userId,
+            slotId: slotId
+          },
           update: {
             $addToSet: { ids: reelId },
             $setOnInsert: {
-              userId,
-              slotId,
+              userId: userId,
+              slotId: slotId,
               createdAt: new Date()
             },
             $set: { updatedAt: new Date() }
@@ -3240,12 +3278,12 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
-    // ✅ CRITICAL: Execute ALL writes in parallel with bulkWrite
+    // Execute operations
     const [postResults, reelResults] = await Promise.all([
       postOperations.length > 0 
         ? db.collection('contrib_posts').bulkWrite(postOperations, { 
-            ordered: false,  // Continue on error
-            writeConcern: { w: 1, j: false }  // Fast writes
+            ordered: false,
+            writeConcern: { w: 1, j: false }
           })
         : Promise.resolve({ insertedCount: 0, modifiedCount: 0 }),
       
@@ -3269,11 +3307,13 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       },
       results: {
         posts: {
-          inserted: postResults.insertedCount || 0,
+          operations: postOperations.length,
+          inserted: postResults.upsertedCount || 0,
           modified: postResults.modifiedCount || 0
         },
         reels: {
-          inserted: reelResults.insertedCount || 0,
+          operations: reelOperations.length,
+          inserted: reelResults.upsertedCount || 0,
           modified: reelResults.modifiedCount || 0
         }
       },
@@ -5167,185 +5207,235 @@ return res.status(500).json({ error: 'Failed to get reel statistics' });
 
 
 
-// ============================================================
-// FEED DOCUMENT READ ANALYSIS ENDPOINT (PRODUCTION SAFE)
-// ============================================================
-
 app.post('/api/debug/feed-analysis', async (req, res) => {
     const analysisStart = Date.now();
     const { userId, feedType = 'mixed' } = req.body;
 
     if (!userId) {
         return res.status(400).json({
-            error: 'userId required',
-            example: 'curl -X POST http://localhost:7000/api/debug/feed-analysis -H "Content-Type: application/json" -d \'{"userId":"test_user_123"}\''
+            error: 'userId required'
         });
     }
 
-    // ------------------ READ TRACKER ------------------
-    const documentReads = {
+    const reads = {
+        user_status: 0,
+        reels_collection: 0,
+        posts_collection: 0,
+        contrib_reels: 0,
+        contrib_posts: 0,
+        user_interaction_cache: 0
+    };
+
+    const documentsRead = {
         user_status: [],
-        contrib_posts: [],
-        contrib_reels: [],
-        posts: [],
         reels: [],
+        posts: [],
+        contrib_reels: [],
+        contrib_posts: [],
         user_interaction_cache: []
     };
 
-    let totalDocuments = 0;
-
     try {
         // ============================================================
-        // STEP 1: USER STATUS (SINGLE DOC)
+        // READ 1: user_status
         // ============================================================
         const t1 = Date.now();
-
         const userStatus = await db.collection('user_status').findOne(
             { _id: userId },
             { projection: {
                 latestReelSlotId: 1,
-                latestPostSlotId: 1
+                normalReelSlotId: 1,
+                latestPostSlotId: 1,
+                normalPostSlotId: 1
             }}
         );
+        reads.user_status = 1;
 
         if (userStatus) {
-            documentReads.user_status.push({
-                documentId: userId,
+            documentsRead.user_status.push({
+                _id: userId,
+                latestReelSlotId: userStatus.latestReelSlotId,
+                normalReelSlotId: userStatus.normalReelSlotId,
+                latestPostSlotId: userStatus.latestPostSlotId,
+                normalPostSlotId: userStatus.normalPostSlotId,
                 readTime: Date.now() - t1
             });
-            totalDocuments++;
         }
 
-        // ============================================================
-        // STEP 2: SLOT DETERMINATION (HARD-CAPPED)
-        // ============================================================
-        const reelBase = parseInt(userStatus?.latestReelSlotId?.split('_')[1] || 0);
-        const postBase = parseInt(userStatus?.latestPostSlotId?.split('_')[1] || 0);
-
-        const reelSlotIds = Array.from({ length: 3 }, (_, i) => `reel_${Math.max(reelBase - i, 0)}`);
-        const postSlotIds = Array.from({ length: 2 }, (_, i) => `post_${Math.max(postBase - i, 0)}`);
+        // Extract slot numbers
+        const latestReelNum = parseInt(userStatus?.latestReelSlotId?.split('_')[1] || '0');
+        const normalReelNum = parseInt(userStatus?.normalReelSlotId?.split('_')[1] || '0');
+        const latestPostNum = parseInt(userStatus?.latestPostSlotId?.split('_')[1] || '0');
+        const normalPostNum = parseInt(userStatus?.normalPostSlotId?.split('_')[1] || '0');
 
         // ============================================================
-        // STEP 3: VIEWED CONTENT (ONLY RELEVANT SLOTS)
+        // DETERMINE SLOTS TO READ (Max 3 per type)
+        // ============================================================
+        const reelSlotsToRead = [
+            `reel_${latestReelNum + 1}`, // Check for newer
+            `reel_${latestReelNum}`,     // Current latest
+            `reel_${normalReelNum}`      // Normal
+        ].filter((v, i, a) => a.indexOf(v) === i); // Remove duplicates
+
+        const postSlotsToRead = [
+            `post_${latestPostNum + 1}`,
+            `post_${latestPostNum}`,
+            `post_${normalPostNum}`
+        ].filter((v, i, a) => a.indexOf(v) === i);
+
+        // ============================================================
+        // READ 2-4: reels collection (3 documents max)
         // ============================================================
         const t2 = Date.now();
-
-        const viewedReels = await db.collection('contrib_reels').find(
-            { userId, slotId: { $in: reelSlotIds } },
-            { projection: { ids: 1, slotId: 1 } }
+        const reelDocs = await db.collection('reels').find(
+            { _id: { $in: reelSlotsToRead.slice(0, 3) } },
+            { projection: { _id: 1, count: 1, index: 1 } }
         ).toArray();
+        reads.reels_collection = reelDocs.length;
 
-        viewedReels.forEach(d => {
-            documentReads.contrib_reels.push({
-                documentId: d.slotId,
-                idsCount: d.ids?.length || 0,
+        reelDocs.forEach(doc => {
+            documentsRead.reels.push({
+                _id: doc._id,
+                count: doc.count,
+                index: doc.index,
                 readTime: Date.now() - t2
             });
-            totalDocuments++;
         });
 
-        const excludedReelIds = viewedReels.flatMap(d => d.ids || []);
-
+        // ============================================================
+        // READ 5-7: contrib_reels (ONLY for reels we fetched)
+        // ============================================================
+        const actualReelSlots = reelDocs.map(d => d._id);
+        
         const t3 = Date.now();
-
-        const viewedPosts = await db.collection('contrib_posts').find(
-            { userId, slotId: { $in: postSlotIds } },
-            { projection: { ids: 1, slotId: 1 } }
+        const contribReelDocs = await db.collection('contrib_reels').find(
+            { 
+                userId: userId,
+                slotId: { $in: actualReelSlots }
+            },
+            { projection: { slotId: 1, ids: 1 } }
         ).toArray();
+        reads.contrib_reels = contribReelDocs.length;
 
-        viewedPosts.forEach(d => {
-            documentReads.contrib_posts.push({
-                documentId: d.slotId,
-                idsCount: d.ids?.length || 0,
+        contribReelDocs.forEach(doc => {
+            documentsRead.contrib_reels.push({
+                userId: userId,
+                slotId: doc.slotId,
+                idsCount: doc.ids?.length || 0,
                 readTime: Date.now() - t3
             });
-            totalDocuments++;
         });
 
         // ============================================================
-        // STEP 4: FETCH CONTENT SLOTS (STRICT)
+        // READ 8-10: posts collection
         // ============================================================
         const t4 = Date.now();
-
-        const reelDocs = await db.collection('reels').find(
-            { _id: { $in: reelSlotIds } },
-            { projection: { count: 1, index: 1 } }
+        const postDocs = await db.collection('posts').find(
+            { _id: { $in: postSlotsToRead.slice(0, 3) } },
+            { projection: { _id: 1, count: 1, index: 1 } }
         ).toArray();
+        reads.posts_collection = postDocs.length;
 
-        reelDocs.forEach(d => {
-            documentReads.reels.push({
-                documentId: d._id,
-                count: d.count,
-                index: d.index,
+        postDocs.forEach(doc => {
+            documentsRead.posts.push({
+                _id: doc._id,
+                count: doc.count,
+                index: doc.index,
                 readTime: Date.now() - t4
             });
-            totalDocuments++;
-        });
-
-        const t5 = Date.now();
-
-        const postDocs = await db.collection('posts').find(
-            { _id: { $in: postSlotIds } },
-            { projection: { count: 1, index: 1 } }
-        ).toArray();
-
-        postDocs.forEach(d => {
-            documentReads.posts.push({
-                documentId: d._id,
-                count: d.count,
-                index: d.index,
-                readTime: Date.now() - t5
-            });
-            totalDocuments++;
         });
 
         // ============================================================
-        // STEP 5: DAILY INTERACTION CACHE (ONE DOC)
+        // READ 11-13: contrib_posts
+        // ============================================================
+        const actualPostSlots = postDocs.map(d => d._id);
+        
+        const t5 = Date.now();
+        const contribPostDocs = await db.collection('contrib_posts').find(
+            { 
+                userId: userId,
+                slotId: { $in: actualPostSlots }
+            },
+            { projection: { slotId: 1, ids: 1 } }
+        ).toArray();
+        reads.contrib_posts = contribPostDocs.length;
+
+        contribPostDocs.forEach(doc => {
+            documentsRead.contrib_posts.push({
+                userId: userId,
+                slotId: doc.slotId,
+                idsCount: doc.ids?.length || 0,
+                readTime: Date.now() - t5
+            });
+        });
+
+        // ============================================================
+        // READ 14: user_interaction_cache (1 document)
         // ============================================================
         const today = new Date().toISOString().slice(0, 10);
         const cacheKey = `${userId}_session_${today}`;
 
         const t6 = Date.now();
-
         const cacheDoc = await db.collection('user_interaction_cache').findOne(
             { _id: cacheKey },
             { projection: { viewedToday: 1, likedToday: 1, retentionContributed: 1 } }
         );
-
+        
         if (cacheDoc) {
-            documentReads.user_interaction_cache.push({
-                documentId: cacheKey,
+            reads.user_interaction_cache = 1;
+            documentsRead.user_interaction_cache.push({
+                _id: cacheKey,
                 viewedCount: cacheDoc.viewedToday?.length || 0,
                 likedCount: cacheDoc.likedToday?.length || 0,
                 retentionCount: cacheDoc.retentionContributed?.length || 0,
                 readTime: Date.now() - t6
             });
-            totalDocuments++;
         }
 
         // ============================================================
-        // FINAL RESPONSE
+        // FINAL SUMMARY
         // ============================================================
+        const totalReads = Object.values(reads).reduce((sum, val) => sum + val, 0);
         const totalTime = Date.now() - analysisStart;
+
+        const summary = `
+╔════════════════════════════════════════════════════════════════════╗
+║  FEED ANALYSIS REPORT - User: ${userId.substring(0, 20)}...
+╠════════════════════════════════════════════════════════════════════╣
+║  Total Reads: ${totalReads} documents in ${totalTime}ms
+║  
+║  READ BREAKDOWN:
+║    1. user_status        : ${reads.user_status} read
+║    2. reels collection   : ${reads.reels_collection} reads
+║    3. contrib_reels      : ${reads.contrib_reels} reads
+║    4. posts collection   : ${reads.posts_collection} reads
+║    5. contrib_posts      : ${reads.contrib_posts} reads
+║    6. interaction_cache  : ${reads.user_interaction_cache} read
+║
+║  DOCUMENTS READ:
+║  └─ user_status: ${documentsRead.user_status.map(d => d._id).join(', ') || 'none'}
+║  └─ reels: ${documentsRead.reels.map(d => d._id).join(', ') || 'none'}
+║  └─ contrib_reels: ${documentsRead.contrib_reels.map(d => `${d.slotId}(${d.idsCount})`).join(', ') || 'none'}
+║  └─ posts: ${documentsRead.posts.map(d => d._id).join(', ') || 'none'}
+║  └─ contrib_posts: ${documentsRead.contrib_posts.map(d => `${d.slotId}(${d.idsCount})`).join(', ') || 'none'}
+║
+║  OPTIMIZATION STATUS: ${totalReads <= 14 ? '✅ EXCELLENT' : '⚠️ NEEDS OPTIMIZATION'}
+╚════════════════════════════════════════════════════════════════════╝
+        `;
+
+        console.log(summary);
 
         return res.json({
             success: true,
             userId,
-            feedType,
             summary: {
-                totalDocumentsRead: totalDocuments,
-                totalAnalysisTime: totalTime,
-                timestamp: new Date().toISOString()
+                totalReads,
+                totalTime,
+                breakdown: reads,
+                isOptimized: totalReads <= 14
             },
-            documentReads,
-            optimization: {
-                isProductionReady: totalDocuments <= 12,
-                isOptimized: totalDocuments <= 8,
-                recommendation:
-                    totalDocuments <= 8
-                        ? 'Excellent optimization.'
-                        : 'Acceptable for deep scrolls. Redis optional.'
-            }
+            documentsRead,
+            plainTextReport: summary
         });
 
     } catch (err) {
@@ -5696,127 +5786,132 @@ duration: Date.now() - startTime
 
 
 
-/**
-* POST /api/user-status/:userId
-* Update slot IDs in user_status (WRITE only - no read)
-*/
 app.post('/api/user-status/:userId', async (req, res) => {
-const startTime = Date.now();
-const { userId } = req.params;
-const { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId } = req.body;
+  const startTime = Date.now();
+  const { userId } = req.params;
+  const { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId } = req.body;
 
-try {
-console.log(`[post_algorithm] [UPDATE-USER-STATUS] userId=${userId} | latestReel=${latestReelSlotId} | normalReel=${normalReelSlotId} | latestPost=${latestPostSlotId} | normalPost=${normalPostSlotId}`);
+  try {
+    // ✅ CRITICAL FIX: Validate inputs
+    if (!latestReelSlotId && !normalReelSlotId && !latestPostSlotId && !normalPostSlotId) {
+      console.warn(`[post_algorithm] [UPDATE-USER-STATUS-SKIP] No slot IDs provided`);
+      return res.status(400).json({
+        success: false,
+        error: 'At least one slot ID must be provided',
+        received: { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId }
+      });
+    }
 
-const updateData = {
-updatedAt: new Date()
-};
+    console.log(`[post_algorithm] [UPDATE-USER-STATUS] userId=${userId} | latestReel=${latestReelSlotId || 'not_provided'} | normalReel=${normalReelSlotId || 'not_provided'} | latestPost=${latestPostSlotId || 'not_provided'} | normalPost=${normalPostSlotId || 'not_provided'}`);
 
-// Only update fields that are provided
-if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
-if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
-if (latestPostSlotId) updateData.latestPostSlotId = latestPostSlotId;
-if (normalPostSlotId) updateData.normalPostSlotId = normalPostSlotId;
+    const updateData = {
+      userId: userId, // ✅ Always set userId
+      updatedAt: new Date()
+    };
 
-// ✅ CRITICAL: Write to document where _id = userId
-const result = await db.collection('user_status').updateOne(
-{ _id: userId },
-{
-$set: updateData,
-$setOnInsert: { userId, createdAt: new Date() }
-},
-{ upsert: true }
-);
+    // Only update fields that are provided
+    if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
+    if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
+    if (latestPostSlotId) updateData.latestPostSlotId = latestPostSlotId;
+    if (normalPostSlotId) updateData.normalPostSlotId = normalPostSlotId;
 
-const duration = Date.now() - startTime;
+    const result = await db.collection('user_status').updateOne(
+      { _id: userId },
+      {
+        $set: updateData,
+        $setOnInsert: { createdAt: new Date() }
+      },
+      { upsert: true }
+    );
 
-console.log(`[post_algorithm] [UPDATE-SUCCESS] matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount} | duration=${duration}ms`);
+    const duration = Date.now() - startTime;
 
-return res.json({
-success: true,
-message: 'Slot IDs updated',
-writes: 1,
-duration
+    console.log(`[post_algorithm] [UPDATE-SUCCESS] matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount} | duration=${duration}ms | Updated fields: ${Object.keys(updateData).join(', ')}`);
+
+    return res.json({
+      success: true,
+      message: 'Slot IDs updated',
+      updated: updateData,
+      writes: 1,
+      duration
+    });
+
+  } catch (error) {
+    console.error(`[post_algorithm] [UPDATE-ERROR] ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to update user_status: ' + error.message,
+      writes: 0,
+      duration: Date.now() - startTime
+    });
+  }
 });
 
-} catch (error) {
-console.error(`[post_algorithm] [UPDATE-ERROR] ${error.message}`);
-return res.status(500).json({
-success: false,
-error: 'Failed to update user_status: ' + error.message,
-writes: 0,
-duration: Date.now() - startTime
-});
-}
-});
 
 
-
-/**
-* GET /api/contrib-check/:userId/:slotId/:type
-* Returns ids array and count from contrib_posts or contrib_reels
-* READ COUNT: 1 (single document read by _id = slotId)
-*/
 app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
-const startTime = Date.now();
-const { userId, slotId, type } = req.params;
+  const startTime = Date.now();
+  const { userId, slotId, type } = req.params;
 
-if (!['posts', 'reels'].includes(type)) {
-return res.status(400).json({ success: false, error: 'Invalid type (must be posts or reels)' });
-}
+  if (!['posts', 'reels'].includes(type)) {
+    return res.status(400).json({ success: false, error: 'Invalid type (must be posts or reels)' });
+  }
 
-const collectionName = type === 'posts' ? 'contrib_posts' : 'contrib_reels';
-const readNum = req.headers['x-read-number'] || '?';
+  const collectionName = type === 'posts' ? 'contrib_posts' : 'contrib_reels';
+  const readNum = req.headers['x-read-number'] || '?';
 
-try {
-console.log(`[post_algorithm] [READ-${readNum}-START] ${collectionName} lookup for slotId=${slotId} | userId=${userId}`);
+  try {
+    console.log(`[post_algorithm] [READ-${readNum}-START] ${collectionName} lookup for userId=${userId} | slotId=${slotId}`);
 
-// ✅ FIXED: Use userId_slotId as _id
-const uniqueDocId = `${userId}_${slotId}`;
+    // ✅ CRITICAL FIX: Query using BOTH userId AND slotId as filters
+    const contribDoc = await db.collection(collectionName).findOne(
+      { 
+        userId: userId,
+        slotId: slotId
+      },
+      { projection: { ids: 1, slotId: 1, userId: 1 } }
+    );
 
-const contribDoc = await db.collection(collectionName).findOne(
-{ _id: uniqueDocId }, // Changed from { _id: slotId, userId: userId }
-{ projection: { ids: 1, _id: 1, slotId: 1 } }
-);
+    const duration = Date.now() - startTime;
 
-const duration = Date.now() - startTime;
+    if (contribDoc && contribDoc.ids) {
+      const count = contribDoc.ids.length;
 
-if (contribDoc && contribDoc.ids) {
-const count = contribDoc.ids.length;
+      console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} userId=${userId} slotId=${slotId} | found ${count} viewed IDs | duration=${duration}ms`);
 
-console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} slotId=${slotId} | count=${count}/6 | duration=${duration}ms`);
+      return res.json({
+        success: true,
+        slotId: slotId,
+        userId: userId,
+        ids: contribDoc.ids,
+        count: count,
+        reads: 1,
+        duration
+      });
+    } else {
+      console.log(`[post_algorithm] [READ-${readNum}-NOT-FOUND] ${collectionName} no contributions for userId=${userId} slotId=${slotId}`);
 
-return res.json({
-success: true,
-slotId: slotId,
-ids: contribDoc.ids,
-count: count,
-reads: 1,
-duration
-});
-} else {
-console.log(`[post_algorithm] [READ-${readNum}-NOT-FOUND] ${collectionName} slotId=${slotId} doesn't exist for userId=${userId}`);
+      return res.json({
+        success: true,
+        slotId: slotId,
+        userId: userId,
+        ids: [],
+        count: 0,
+        reads: 1,
+        duration,
+        isNewSlot: true
+      });
+    }
 
-return res.json({
-success: true,
-slotId: slotId,
-ids: [],
-count: 0,
-reads: 1,
-duration,
-isNewSlot: true
-});
-}
-
-} catch (error) {
-console.error(`[post_algorithm] [READ-${readNum}-ERROR] ${error.message}`);
-return res.status(500).json({
-success: false,
-error: `Failed to read ${collectionName}: ${error.message}`,
-reads: 1,
-duration: Date.now() - startTime
-});
-}
+  } catch (error) {
+    console.error(`[post_algorithm] [READ-${readNum}-ERROR] ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      error: `Failed to read ${collectionName}: ${error.message}`,
+      reads: 1,
+      duration: Date.now() - startTime
+    });
+  }
 });
 
 /**
