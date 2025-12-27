@@ -19,7 +19,6 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@clus
 const DB_NAME = process.env.DB_NAME || 'appdb';
 const axios = require('axios');
 const Redis = require('ioredis');
-import LRU from 'lru-cache';
 const activeRequestsWithTimestamp = new Map();
 const REQUEST_DEDUP_TTL = 5000; // 5 seconds
 const requestDeduplication = new Map();
@@ -77,35 +76,77 @@ console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entrie
 }, 60000);
 
 
-// ✅ NEW CODE (USE THIS)
-// Request deduplication with automatic cleanup (prevents memory leaks)
-const activeRequests = new LRU({
-  max: 1000,              // Max 1000 concurrent requests
-  ttl: 5000,              // 5 second TTL (5000ms)
-  updateAgeOnGet: false,  // Don't refresh on access
-  updateAgeOnHas: false,
-  
-  // Automatic cleanup callback
-  dispose: (value, key) => {
-    console.log(`[REQUEST-CLEANUP] Removed expired request: ${key}`);
+
+
+class SimpleLRU {
+  constructor(max = 1000, ttl = 5000) {
+    this.max = max;
+    this.ttl = ttl;
+    this.cache = new Map(); // maintains insertion order
   }
-});
+
+  _cleanup() {
+    const now = Date.now();
+    for (const [key, { timestamp }] of this.cache.entries()) {
+      if (now - timestamp > this.ttl) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  get(key) {
+    this._cleanup();
+    const item = this.cache.get(key);
+    if (!item) return undefined;
+    // refresh usage order
+    this.cache.delete(key);
+    this.cache.set(key, item);
+    return item.value;
+  }
+
+  set(key, value) {
+    this._cleanup();
+    if (this.cache.size >= this.max) {
+      const oldestKey = this.cache.keys().next().value;
+      this.cache.delete(oldestKey);
+    }
+    this.cache.set(key, { value, timestamp: Date.now() });
+  }
+
+  has(key) {
+    this._cleanup();
+    return this.cache.has(key);
+  }
+
+  delete(key) {
+    this.cache.delete(key);
+  }
+
+  size() {
+    this._cleanup();
+    return this.cache.size;
+  }
+}
+
+
+
+
+const activeRequests = new SimpleLRU(1000, 5000);
 
 const getOrCreateRequest = (key, requestFactory) => {
-  // Check if request already exists
   if (activeRequests.has(key)) {
-    console.log(`[REQUEST-DEDUP] ${key} - using existing request | Active: ${activeRequests.size}`);
+    console.log(`[REQUEST-DEDUP] ${key} - using existing request`);
     return activeRequests.get(key);
   }
 
-  // Create new request
   const promise = requestFactory().finally(() => {
-    activeRequests.delete(key);  // Auto-cleanup
+    activeRequests.delete(key);
   });
 
   activeRequests.set(key, promise);
   return promise;
 };
+
   
 
 // CRITICAL: Enhanced logging with collection scan detection
