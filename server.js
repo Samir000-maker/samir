@@ -3188,26 +3188,7 @@ async function getSlotForPost(postId) {
   return slotId;
 }
 
-// Helper: Get slot ID for a reel (with caching)
-async function getSlotForReel(reelId) {
-  const cacheKey = `slot:reel:${reelId}`;
-  
-  if (slotCache.has(cacheKey)) {
-    return slotCache.get(cacheKey);
-  }
 
-  const doc = await db.collection('reels').findOne(
-    { 'reelsList.postId': reelId },
-    { projection: { _id: 1 } }
-  );
-
-  const slotId = doc?._id || null;
-  if (slotId) {
-    slotCache.set(cacheKey, slotId);
-  }
-  
-  return slotId;
-}
 
 async function getSlotForReel(reelId) {
   const cacheKey = `slot:reel:${reelId}`;
