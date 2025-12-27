@@ -379,525 +379,457 @@ return console.log(`[${level.toUpperCase()}] ${ts}`, ...args);
 };
 
 
-async function createUltraFastRetentionIndexes() {
-try {
-// Remove the unique constraint on _id index (it's automatically unique)
-// Just ensure the collection exists
-await db.collection('user_interaction_cache').findOne({});
 
-// Compound index for retention queries
-await db.collection('user_interaction_cache').createIndex({
-"userId": 1,
-"retentionContributed": 1
+
+const LRU = require('lru-cache');  // npm install lru-cache
+
+const activeRequests = new LRU({
+  max: 1000,              // Max 1000 concurrent requests
+  ttl: 5000,              // 5 second TTL
+  updateAgeOnGet: false,  // Don't refresh on access
+  updateAgeOnHas: false,
+  
+  // ✅ Automatic cleanup callback
+  dispose: (value, key) => {
+    console.log(`[REQUEST-CLEANUP] Removed expired request: ${key}`);
+  }
 });
 
-// TTL index for automatic cleanup
-await db.collection('user_interaction_cache').createIndex({
-"ttl": 1
-}, { expireAfterSeconds: 0 });
+const getOrCreateRequest = (key, requestFactory) => {
+  // Check if request already exists
+  if (activeRequests.has(key)) {
+    console.log(`[REQUEST-DEDUP] ${key} - using existing request`);
+    return activeRequests.get(key);
+  }
 
-console.log('[ULTRA-FAST-RETENTION-INDEXES] Created successfully');
-} catch (error) {
-console.error('[INDEX-CREATION-ERROR]', error);
-}
-}
+  // Create new request
+  const promise = requestFactory().finally(() => {
+    activeRequests.delete(key);  // Auto-cleanup
+  });
 
-
-
-
-async function createProductionIndexes() {
-try {
-const indexes = [
-// CRITICAL: Slot allocation optimization (prevents full collection scan)
-{
-collection: 'posts',
-index: { count: 1, index: -1 },
-options: { name: 'slot_allocation_posts', background: true }
-},
-{
-collection: 'reels',
-index: { count: 1, index: -1 },
-options: { name: 'slot_allocation_reels', background: true }
-},
-
-// CRITICAL: Exact postId lookup (prevents array scans)
-{
-collection: 'posts',
-index: { 'postList.postId': 1 },
-options: { name: 'postList_postId_lookup', background: true, sparse: true }
-},
-{
-collection: 'reels',
-index: { 'reelsList.postId': 1 },
-options: { name: 'reelsList_postId_lookup', background: true, sparse: true }
-},
-
-// Instagram feed optimization - compound indexes
-{
-collection: 'posts',
-index: { 'postList.userId': 1, 'postList.timestamp': -1, 'postList.postId': 1 },
-options: { name: 'feed_following_posts', background: true }
-},
-{
-collection: 'reels',
-index: { 'reelsList.userId': 1, 'reelsList.timestamp': -1, 'reelsList.postId': 1 },
-options: { name: 'feed_following_reels', background: true }
-},
-
-// Global ranking indexes
-{
-collection: 'posts',
-index: { index: -1, 'postList.retention': -1, 'postList.postId': 1 },
-options: { name: 'feed_global_posts_ranked', background: true }
-},
-{
-collection: 'reels',
-index: { index: -1, 'reelsList.retention': -1, 'reelsList.postId': 1 },
-options: { name: 'feed_global_reels_ranked', background: true }
-},
-
-// Like checking optimization - covering index
-{
-collection: 'contributionToLike',
-index: { userId: 1, postId: 1 },
-options: { name: 'like_check_covering', background: true }
-},
-
-// Contributed views optimization
-{
-collection: 'contrib_posts',
-index: { userId: 1, ids: 1 },
-options: { name: 'contrib_posts_lookup', background: true }
-},
-{
-collection: 'contrib_reels',
-index: { userId: 1, ids: 1 },
-options: { name: 'contrib_reels_lookup', background: true }
-},
-
-// Retention check optimization
-{
-collection: 'user_interaction_cache',
-index: { userId: 1, retentionContributed: 1 },
-options: { name: 'retention_check_fast', background: true }
-}
-];
-
-let successCount = 0;
-let skipCount = 0;
-let errorCount = 0;
-
-for (const { collection, index, options } of indexes) {
-try {
-await db.collection(collection).createIndex(index, options);
-successCount++;
-console.log(`[INDEX-CREATED] ${collection}.${options.name}`);
-} catch (err) {
-// Silently skip "already exists" and compression warnings
-if (err.code === 85 || err.code === 86 || err.message?.includes('snappy') || err.message?.includes('already exists')) {
-skipCount++;
-} else {
-errorCount++;
-console.log(`[INDEX-ERROR] ${collection}.${options.name}: ${err.message}`);
-}
-}
-}
-
-console.log(`[PROD-INDEXES] ✅ ${successCount} created, ${skipCount} already existed, ${errorCount} errors`);
-} catch (error) {
-log('error', '[PROD-INDEX-ERROR]', error.message);
-}
-}
-
-
-
-
-async function createAggregationIndexes() {
-try {
-const aggIndexes = [
-// CRITICAL: Covering indexes for aggregation pipelines
-{
-collection: 'posts',
-index: {
-'postList.postId': 1,
-'postList.userId': 1,
-'postList.retention': -1,
-'postList.likeCount': -1,
-'postList.timestamp': -1
-},
-options: { name: 'aggregation_posts_covering', background: true }
-},
-{
-collection: 'reels',
-index: {
-'reelsList.postId': 1,
-'reelsList.userId': 1,
-'reelsList.retention': -1,
-'reelsList.likeCount': -1,
-'reelsList.timestamp': -1
-},
-options: { name: 'aggregation_reels_covering', background: true }
-}
-];
-
-for (const { collection, index, options } of aggIndexes) {
-try {
-await db.collection(collection).createIndex(index, options);
-log('info', `[AGG-INDEX] Created ${options.name}`);
-} catch (err) {
-if (err.code !== 85 && err.code !== 86) {
-log('warn', `[AGG-INDEX-WARN] ${collection}: ${err.message}`);
-}
-}
-}
-} catch (error) {
-log('error', '[AGG-INDEX-ERROR]', error.message);
-}
-}
-
-
-
+  activeRequests.set(key, promise);
+  return promise;
+};
 
 
 
 
 // MongoDB initialization
 async function initMongo() {
-console.log('[MONGO-INIT] Starting connection...');
+  console.log('[MONGO-INIT] Starting connection...');
 
+  // Suppress non-critical warnings
+  process.removeAllListeners('warning');
+  process.on('warning', (warning) => {
+    if (!warning.message?.includes('snappy') && 
+        !warning.message?.includes('kerberos')) {
+      console.warn('[NODE-WARNING]', warning.message);
+    }
+  });
 
-process.removeAllListeners('warning');
-process.on('warning', (warning) => {
-// Only log critical warnings, ignore dependency warnings
-if (!warning.message?.includes('snappy') &&
-!warning.message?.includes('kerberos')) {
-console.warn('[NODE-WARNING]', warning.message);
-}
-});
+  const MONGODB_URI = process.env.MONGODB_URI || 
+    'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
 
+  console.log(`[MONGO-INIT] Connecting to: ${MONGODB_URI.substring(0, 30)}...`);
 
-// FIXED: Use correct localhost URI
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
+  // ✅ PRODUCTION-READY: Compression with fallback
+  const compressors = ['zlib'];
+  try {
+    require.resolve('snappy');
+    compressors.unshift('snappy');
+    console.log('[MONGO-INIT] ✅ Snappy compression available');
+  } catch (e) {
+    console.log('[MONGO-INIT] ⚠️ Snappy not available, using zlib compression');
+  }
 
-console.log(`[MONGO-INIT] Connecting to: ${MONGODB_URI}`);
+  // ✅ OPTIMIZED CONNECTION SETTINGS (2024 best practices)
+  client = new MongoClient(MONGODB_URI, {
+    // Connection pool (FIXED - removed duplicate definitions)
+    maxPoolSize: 50,                    // Reduced from 100 for stability
+    minPoolSize: 5,                     // Reduced from 10 for faster cold starts
+    maxConnecting: 10,                  // CRITICAL FIX: 20% of maxPoolSize (was 2)
+    maxIdleTimeMS: 30000,
+    waitQueueTimeoutMS: 10000,
+    
+    // Timeouts (aggressive for serverless)
+    serverSelectionTimeoutMS: 5000,     // Fail fast (reduced from 10s)
+    socketTimeoutMS: 45000,
+    connectTimeoutMS: 10000,
+    heartbeatFrequencyMS: 10000,
+    
+    // Read/Write preferences
+    readPreference: 'nearest',
+    retryWrites: true,
+    retryReads: true,
+    
+    // Write concern (balanced durability + performance)
+    w: 'majority',                      // Changed from w:1 for data safety
+    journal: true,
+    
+    // Compression
+    compressors: compressors,
+    
+    // Performance optimizations
+    monitorCommands: false,             // Disable in production (reduces overhead)
+    directConnection: false,
+    autoEncryption: undefined,
+    
+    // ✅ NEW: 2024 MongoDB driver features
+    serverMonitoringMode: 'stream',     // Faster health checks
+  });
 
-// PRODUCTION-READY: Compression with fallback
-const compressors = ['zlib']; // Safe fallback if snappy installation fails
+  console.log(`[MONGO-INIT] Compression: ${compressors.join(', ')}`);
+  console.log('[MONGO-INIT] Connecting with production-optimized settings...');
 
-// Try to detect snappy availability
-try {
-require.resolve('snappy');
-compressors.unshift('snappy'); // Prioritize snappy if available
-console.log('[MONGO-INIT] ✅ Snappy compression available');
-} catch (e) {
-console.log('[MONGO-INIT]⚠️ Snappy not available, using zlib compression');
-}
+  // ✅ CONNECTION POOL MONITORING (critical for debugging)
+  client.on('connectionPoolCreated', (event) => {
+    console.log(`[POOL-EVENT] Created pool for ${event.address}`);
+  });
+  
+  client.on('connectionPoolReady', (event) => {
+    console.log(`[POOL-EVENT] ✅ Pool ready for ${event.address}`);
+  });
+  
+  client.on('connectionPoolCleared', (event) => {
+    console.warn(`[POOL-WARNING] ⚠️ Pool cleared for ${event.address} - reason: ${event.reason || 'unknown'}`);
+  });
+  
+  client.on('connectionCheckedOut', () => {
+    // Check pool pressure (80% threshold)
+    const activeConnections = client.topology?.s?.sessionPool?.sessions?.size || 0;
+    if (activeConnections > 40) {  // 80% of maxPoolSize (50)
+      console.warn(`⚠️ [POOL-PRESSURE] ${activeConnections}/50 connections active`);
+    }
+  });
 
-client = new MongoClient(MONGODB_URI, {
-maxPoolSize: parseInt(process.env.MONGO_POOL_SIZE || '100', 10), // Reduced from 500
-minPoolSize: 10, // Reduced from 50
-maxIdleTimeMS: 30000,
-serverSelectionTimeoutMS: 10000,
-socketTimeoutMS: 45000,
-readPreference: 'nearest',
-retryWrites: true,
-retryReads: true,
-waitQueueTimeoutMS: 10000,
-directConnection: false,
-compressors: compressors,
+  // Connect to database
+  await client.connect();
+  db = client.db(DB_NAME);
+  console.log(`[MONGO-INIT] ✅ Connected to ${DB_NAME}`);
 
-// ADDED: Production-grade settings
-maxConnecting: 2,
-w: 1,
-journal: true,
+  // ✅ SHARDING SUPPORT (optional - only if enabled)
+  if (process.env.ENABLE_SHARDING === 'true') {
+    await enableSharding();
+  }
 
-// CRITICAL FIX: Prevent connection pool exhaustion
-maxPoolSize: 100, // Lower limit for stability
-minPoolSize: 10,
-connectTimeoutMS: 10000,
-heartbeatFrequencyMS: 10000,
+  // ✅ CREATE ALL INDEXES (consolidated function)
+  await createAllProductionIndexes();
 
-// ADDED: Prevent memory leaks
-monitorCommands: false, // Disable command monitoring in production
-autoEncryption: undefined // Explicitly disable if not needed
-});
+  // ✅ VERIFY CRITICAL INDEXES
+  await verifyIndexes();
 
-console.log(`[MONGO-INIT] Compression: ${compressors.join(', ')}`);
+  // ✅ BACKGROUND METRICS SYNC (optional - can be disabled in production)
+  if (process.env.ENABLE_PERIODIC_SYNC !== 'false') {
+    setInterval(async () => {
+      try {
+        console.log('[PERIODIC-SYNC] Running background metrics sync check');
+        
+        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+        const collections = ['posts', 'reels'];
+        
+        for (const collection of collections) {
+          const arrayField = collection === 'reels' ? 'reelsList' : 'postList';
+          const docs = await db.collection(collection).find({
+            [`${arrayField}.lastSynced`]: { $lt: fiveMinutesAgo.toISOString() }
+          }).limit(50).toArray();
 
-console.log('[MONGO-INIT] Connecting with sharded cluster optimizations...');
+          console.log(`[PERIODIC-SYNC] Found ${docs.length} outdated ${collection}`);
+        }
+      } catch (error) {
+        console.error('[PERIODIC-SYNC-ERROR]', error);
+      }
+    }, 5 * 60 * 1000); // Every 5 minutes
+  }
 
-await client.connect();
-db = client.db(DB_NAME);
-console.log(`[MONGO-INIT] Connected to ${DB_NAME}`);
-
-// CRITICAL: Enable sharding for collections (run once during setup)
-if (process.env.ENABLE_SHARDING === 'true') {
-await enableSharding();
-}
-
-
-await createInstagramFeedIndexes();
-
-
-// Add after initMongo() in PORT 2000
-setInterval(async () => {
-try {
-console.log('[PERIODIC-SYNC] Running background metrics sync check');
-
-// Get all posts/reels that haven't been synced in the last 5 minutes
-const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-
-const collections = ['posts', 'reels'];
-for (const collection of collections) {
-const arrayField = collection === 'reels' ? 'reelsList' : 'postList';
-const docs = await db.collection(collection).find({
-[`${arrayField}.lastSynced`]: { $lt: fiveMinutesAgo.toISOString() }
-}).limit(50).toArray();
-
-console.log(`[PERIODIC-SYNC] Found ${docs.length} outdated ${collection}`);
-}
-} catch (error) {
-console.error('[PERIODIC-SYNC-ERROR]', error);
-}
-}, 5 * 60 * 1000); // Every 5 minutes
-
-
-await createUltraFastRetentionIndexes();
-
-
-
-
-// ADD to initMongo() function
-async function createProductionSpeedIndexes() {
-try {
-console.log('[SPEED-INDEXES] Creating Instagram-speed indexes...');
-
-const speedIndexes = [
-// CRITICAL: Covering index for feed query (no collection scan)
-{
-collection: 'posts',
-index: {
-'postList.userId': 1,
-'postList.retention': -1,
-'postList.likeCount': -1,
-'postList.postId': 1
-},
-options: { name: 'feed_speed_posts', background: true }
-},
-{
-collection: 'reels',
-index: {
-'reelsList.userId': 1,
-'reelsList.retention': -1,
-'reelsList.likeCount': -1,
-'reelsList.postId': 1
-},
-options: { name: 'feed_speed_reels', background: true }
-},
-
-// CRITICAL: Exclude viewed content instantly
-{
-collection: 'posts',
-index: { 'postList.postId': 1 },
-options: { name: 'exclude_viewed_posts', background: true }
-},
-{
-collection: 'reels',
-index: { 'reelsList.postId': 1 },
-options: { name: 'exclude_viewed_reels', background: true }
-}
-];
-
-for (const { collection, index, options } of speedIndexes) {
-try {
-await db.collection(collection).createIndex(index, options);
-console.log(`[SPEED-INDEX] ✅ ${options.name}`);
-} catch (err) {
-if (err.code !== 85 && err.code !== 86) {
-console.warn(`[SPEED-INDEX-WARN] ${collection}: ${err.message}`);
-}
-}
+  console.log('[MONGO-INIT] ✅ Initialization complete');
 }
 
-console.log('[SPEED-INDEXES] ✅ All Instagram-speed indexes ready');
-} catch (error) {
-console.error('[SPEED-INDEX-ERROR]', error.message);
+// ============================================================
+// ✅ CONSOLIDATED INDEX CREATION (replaces all separate functions)
+// ============================================================
+async function createAllProductionIndexes() {
+  console.log('[INDEXES] Creating production indexes...');
+  
+  const allIndexes = [
+    // ============================================================
+    // CRITICAL: Feed Query Optimization (covers entire aggregation pipeline)
+    // ============================================================
+    {
+      collection: 'reels',
+      index: { 
+        count: 1,                  // Filter: count > 0
+        index: -1,                 // Sort: index DESC
+        'reelsList.postId': 1      // Exclude viewed content
+      },
+      options: { 
+        name: 'feed_query_optimized_reels',
+        background: true,
+        partialFilterExpression: { count: { $gt: 0 } }  // Only non-empty slots
+      }
+    },
+    {
+      collection: 'posts',
+      index: { 
+        count: 1, 
+        index: -1,
+        'postList.postId': 1
+      },
+      options: { 
+        name: 'feed_query_optimized_posts',
+        background: true,
+        partialFilterExpression: { count: { $gt: 0 } }
+      }
+    },
+
+    // ============================================================
+    // CRITICAL: Contribution Collections (for viewed content lookup)
+    // ============================================================
+    {
+      collection: 'contrib_reels',
+      index: { userId: 1, slotId: 1 },
+      options: { 
+        name: 'contrib_lookup_reels',
+        background: true,
+        unique: true  // Prevent duplicate entries
+      }
+    },
+    {
+      collection: 'contrib_posts',
+      index: { userId: 1, slotId: 1 },
+      options: { 
+        name: 'contrib_lookup_posts',
+        background: true,
+        unique: true
+      }
+    },
+
+    // ============================================================
+    // RANKING ALGORITHM: Retention + Engagement
+    // ============================================================
+    {
+      collection: 'reels',
+      index: {
+        'reelsList.retention': -1,
+        'reelsList.likeCount': -1,
+        'reelsList.category': 1,
+        'reelsList.postId': 1
+      },
+      options: {
+        name: 'ranking_algorithm_reels',
+        background: true,
+        sparse: true  // Only items with retention data
+      }
+    },
+    {
+      collection: 'posts',
+      index: {
+        'postList.retention': -1,
+        'postList.likeCount': -1,
+        'postList.category': 1,
+        'postList.postId': 1
+      },
+      options: {
+        name: 'ranking_algorithm_posts',
+        background: true,
+        sparse: true
+      }
+    },
+
+    // ============================================================
+    // FAST POSTID LOOKUP (for exclusion and slot identification)
+    // ============================================================
+    {
+      collection: 'reels',
+      index: { 'reelsList.postId': 1 },
+      options: { 
+        name: 'postId_lookup_reels',
+        background: true,
+        sparse: true
+      }
+    },
+    {
+      collection: 'posts',
+      index: { 'postList.postId': 1 },
+      options: { 
+        name: 'postId_lookup_posts',
+        background: true,
+        sparse: true
+      }
+    },
+
+    // ============================================================
+    // USER STATUS (primary key - MongoDB creates automatically but verify)
+    // ============================================================
+    {
+      collection: 'user_status',
+      index: { _id: 1 },
+      options: { 
+        name: 'user_status_primary',
+        background: true
+      }
+    },
+
+    // ============================================================
+    // INTERACTION CACHE (for retention tracking)
+    // ============================================================
+    {
+      collection: 'user_interaction_cache',
+      index: { userId: 1, retentionContributed: 1 },
+      options: { 
+        name: 'retention_check_fast',
+        background: true
+      }
+    },
+    {
+      collection: 'user_interaction_cache',
+      index: { ttl: 1 },
+      options: { 
+        name: 'cache_ttl_cleanup',
+        background: true,
+        expireAfterSeconds: 0  // Auto-cleanup based on ttl field
+      }
+    },
+
+    // ============================================================
+    // SLOT ALLOCATION (prevents full collection scans)
+    // ============================================================
+    {
+      collection: 'posts',
+      index: { count: 1, index: -1 },
+      options: { 
+        name: 'slot_allocation_posts',
+        background: true
+      }
+    },
+    {
+      collection: 'reels',
+      index: { count: 1, index: -1 },
+      options: { 
+        name: 'slot_allocation_reels',
+        background: true
+      }
+    },
+
+    // ============================================================
+    // INSTAGRAM-STYLE FEED (following + timestamp)
+    // ============================================================
+    {
+      collection: 'posts',
+      index: { 
+        'postList.userId': 1, 
+        'postList.timestamp': -1, 
+        'postList.postId': 1 
+      },
+      options: { 
+        name: 'feed_following_posts',
+        background: true
+      }
+    },
+    {
+      collection: 'reels',
+      index: { 
+        'reelsList.userId': 1, 
+        'reelsList.timestamp': -1, 
+        'reelsList.postId': 1 
+      },
+      options: { 
+        name: 'feed_following_reels',
+        background: true
+      }
+    },
+
+    // ============================================================
+    // BASIC INDEXES (existing collections)
+    // ============================================================
+    {
+      collection: 'posts',
+      index: { index: 1 },
+      options: { name: 'posts_index', background: true }
+    },
+    {
+      collection: 'reels',
+      index: { index: 1 },
+      options: { name: 'reels_index', background: true }
+    },
+    {
+      collection: 'user_posts',
+      index: { userId: 1, postId: 1 },
+      options: { 
+        name: 'user_posts_unique',
+        background: true,
+        unique: true,
+        sparse: true
+      }
+    },
+  ];
+
+  let successCount = 0;
+  let skipCount = 0;
+  let errorCount = 0;
+
+  for (const { collection, index, options } of allIndexes) {
+    try {
+      await db.collection(collection).createIndex(index, options);
+      successCount++;
+      console.log(`[INDEX-CREATED] ${collection}.${options.name}`);
+    } catch (err) {
+      // Silently skip "already exists" errors
+      if (err.code === 85 || err.code === 86 || 
+          err.message?.includes('already exists') ||
+          err.message?.includes('snappy')) {
+        skipCount++;
+      } else {
+        errorCount++;
+        console.error(`[INDEX-ERROR] ${collection}.${options.name}: ${err.message}`);
+      }
+    }
+  }
+
+  console.log(`[INDEXES] ✅ Created: ${successCount} | Existed: ${skipCount} | Errors: ${errorCount}`);
 }
-}
 
-// Call in initMongo()
-await createProductionSpeedIndexes();
+// ============================================================
+// ✅ INDEX VERIFICATION (ensures critical indexes exist)
+// ============================================================
+async function verifyIndexes() {
+  console.log('[INDEX-VERIFY] Checking critical indexes...');
+  
+  const criticalIndexes = [
+    { collection: 'reels', fields: ['index', 'reelsList.postId'] },
+    { collection: 'posts', fields: ['index', 'postList.postId'] },
+    { collection: 'contrib_reels', fields: ['userId', 'slotId'] },
+    { collection: 'contrib_posts', fields: ['userId', 'slotId'] },
+    { collection: 'user_status', fields: ['_id'] }
+  ];
 
+  let allVerified = true;
 
-// Add to your existing initMongo() function
-async function createInteractionIndexes() {
-// Compound indexes for ultra-fast lookups
-await db.collection('user_interaction_cache').createIndex({
-"userId": 1,
-"sessionDate": 1
-}, { unique: true });
+  for (const { collection, fields } of criticalIndexes) {
+    try {
+      const indexes = await db.collection(collection).indexes();
+      
+      for (const field of fields) {
+        const hasIndex = indexes.some(idx => {
+          const keys = Object.keys(idx.key);
+          return keys.includes(field) || keys.some(k => k.startsWith(field));
+        });
+        
+        if (!hasIndex) {
+          console.error(`🚨 [CRITICAL-MISSING-INDEX] ${collection}.${field} NOT INDEXED!`);
+          allVerified = false;
+        }
+      }
+    } catch (err) {
+      console.error(`[INDEX-VERIFY-ERROR] ${collection}: ${err.message}`);
+      allVerified = false;
+    }
+  }
 
-// Fast lookup for specific user-reel combinations
-await db.collection('user_reel_interactions').createIndex({
-"userId": 1,
-"date": 1
-});
-
-// Index for retention contributed lookup
-await db.collection('user_reel_interactions').createIndex({
-"userId": 1,
-"viewedReels.postId": 1,
-"viewedReels.retentionContributed": 1
-});
-
-console.log('[INTERACTION-INDEXES] Created optimized interaction indexes');
-}
-
-
-// Ensure indexes
-const ensureIndex = async (col, spec, opts = {}) => {
-try {
-const coll = db.collection(col);
-const existing = await coll.indexes().catch(() => []);
-const found = existing.some(i => JSON.stringify(i.key) === JSON.stringify(spec));
-if (!found) {
-await coll.createIndex(spec, opts);
-// Only log successful creation, not re-creation
-}
-} catch (e) {
-// Suppress compression warnings and "already exists" errors
-if (!e.message?.includes('snappy') && e.code !== 85 && e.code !== 86) {
-console.warn(`[INDEX-WARN] ${col}:`, e.message);
-}
-}
-};
-
-await Promise.all([
-ensureIndex('posts', { index: 1 }),
-ensureIndex('reels', { index: 1 }),
-ensureIndex('user_posts', { userId: 1, postId: 1 }, { unique: true, sparse: true }),
-ensureIndex('user_status', { _id: 1 }, { unique: true }),
-ensureIndex('contrib_posts', { userId: 1 }),
-ensureIndex('contrib_reels', { userId: 1 }),
-]);
-console.log('[MONGO-INIT] All indexes ensured')
-
-
-
-
-
-// Add these indexes for ultra-fast ranking queries
-const rankingIndexes = [
-{
-collection: 'user_slots',
-index: { 'postList.retention': -1, 'postList.likeCount': -1 },
-options: { background: true }
-},
-{
-collection: 'user_slots',
-index: { 'reelsList.retention': -1, 'reelsList.likeCount': -1 },
-options: { background: true }
-}
-];
-
-for (const { collection, index, options } of rankingIndexes) {
-try {
-await db.collection(collection).createIndex(index, options);
-//log('info', `Created ranking index for ${collection}`);
-} catch (e) {
-// log('warn', `Ranking index error for ${collection}: ${e.message}`);
-}
-}
-
-// Add this line inside initMongo() after existing index creation
-await createRankingIndexes();
-await createProductionIndexes();
-
-await createAggregationIndexes();
-
-// Add this inside initMongo() function after other index creation
-async function createPrecisionIndexes() {
-try {
-// CRITICAL: Compound indexes for EXACT document lookup
-await db.collection('posts').createIndex(
-{ 'postList.userId': 1, 'postList.postId': 1 },
-{ name: 'exact_post_lookup', background: true }
-);
-
-await db.collection('reels').createIndex(
-{ 'reelsList.userId': 1, 'reelsList.postId': 1 },
-{ name: 'exact_reel_lookup', background: true }
-);
-
-// Index for finding ONLY documents with unviewed content
-await db.collection('posts').createIndex(
-{ 'postList.postId': 1 },
-{ name: 'postId_direct_lookup', background: true }
-);
-
-await db.collection('reels').createIndex(
-{ 'reelsList.postId': 1 },
-{ name: 'reelId_direct_lookup', background: true }
-);
-
-log('info', '[PRECISION-INDEXES] Created exact lookup indexes');
-} catch (error) {
-log('error', '[PRECISION-INDEX-ERROR]', error.message);
-}
-}
-
-// Call it in initMongo()
-await createPrecisionIndexes();
-
-
-
-
-
-// Ultra-fast personalized reels indexes
-async function createPersonalizedReelsIndexes() {
-try {
-const personalizedIndexes = [
-// Compound index for retention + category + engagement
-{
-collection: 'reels',
-index: {
-'reelsList.retention': -1,
-'reelsList.category': 1,
-'reelsList.likeCount': -1,
-'reelsList.postId': 1
-},
-options: { name: 'personalized_reels_ranking', background: true }
-},
-// Fast postId lookup for exclusion
-{
-collection: 'reels',
-index: { 'reelsList.postId': 1 },
-options: { name: 'reels_postId_lookup', background: true }
-}
-];
-
-for (const { collection, index, options } of personalizedIndexes) {
-try {
-await db.collection(collection).createIndex(index, options);
-log('info', `[PERSONALIZED-INDEX] Created ${options.name}`);
-} catch (err) {
-if (err.code !== 85 && err.code !== 86) {
-log('warn', `[INDEX-WARN] ${collection}: ${err.message}`);
-}
-}
-}
-} catch (error) {
-log('error', '[PERSONALIZED-INDEX-ERROR]', error.message);
-}
-}
-
-// Call it after existing index creation
-await createPersonalizedReelsIndexes();
-
-
-
-
-
+  if (allVerified) {
+    console.log('[INDEX-VERIFY] ✅ All critical indexes verified');
+  } else {
+    console.warn('[INDEX-VERIFY] ⚠️ Some indexes missing - performance may be degraded');
+  }
 }
 
 
@@ -1067,234 +999,142 @@ class DatabaseManager {
 constructor(db) { this.db = db; }
 
 
-// Add this new method to DatabaseManager class
-async getOptimizedFeedFixedReads(userId, contentType,minContentRequired = MIN_CONTENT_FOR_FEED) {
-const start = Date.now();
-const isReel = contentType === 'reels';
-const collection = isReel ? 'reels' : 'posts';
-const statusField = isReel ? 'latestReelSlotId' : 'latestPostSlotId';
-const normalField = isReel ? 'normalReelSlotId' : 'normalPostSlotId';
-const listKey = isReel ? 'reelsList' : 'postList';
+async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_CONTENT_FOR_FEED) {
+  const start = Date.now();
+  const isReel = contentType === 'reels';
+  const collection = isReel ? 'reels' : 'posts';
+  const listKey = isReel ? 'reelsList' : 'postList';
 
-console.log(`[FIXED-READS-START] ${contentType} for ${userId}, required: ${minContentRequired}`);
+  console.log(`[FIXED-READS-START] ${contentType} for ${userId}, required: ${minContentRequired}`);
 
-const pipeline = [
-{
-$facet: {
-userStatus: [
-{ $match: { _id: "user_status_lookup" } },
-{
-$lookup: {
-from: 'user_status',
-pipeline: [{ $match: { _id: userId } }],
-as: 'status'
-}
-},
-{ $limit: 1 }
-],
-contentSlots: [
-{ $match: { count: { $gt: 0 } } },
-{ $sort: { index: -1 } },
-{ $limit: 3 },
-{
-$lookup: {
-from: `contrib_${collection}`,
-let: { slotContent: `$${listKey}` },
-pipeline: [
-{ $match: { userId: userId } },
-{ $project: { ids: 1, _id: 0 } }
-],
-as: 'viewedData'
-}
-},
-{
-$project: {
-_id: 1,
-index: 1,
-count: 1,
-[listKey]: {
-$map: {
-input: `$${listKey}`,
-as: 'item',
-in: {
-postId: '$$item.postId',
-userId: '$$item.userId',
-username: '$$item.username',
-imageUrl: '$$item.imageUrl',
-videoUrl: '$$item.videoUrl',
-caption: '$$item.caption',
-description: '$$item.description',
-profile_picture_url: '$$item.profile_picture_url',
-timestamp: '$$item.timestamp',
-likeCount: '$$item.likeCount',
-commentCount: '$$item.commentCount',
-viewCount: '$$item.viewCount',
-retention: '$$item.retention',
-ratio: { $ifNull: ['$$item.ratio', isReel ? '9:16' : 'original'] }, // **CRITICAL FIX**
-category: '$$item.category'
-}
-}
-},
-viewedIds: { $ifNull: [{ $arrayElemAt: ['$viewedData.ids', 0] }, []] }
-}
-}
-]
-}
-}
-];
+  // ✅ CRITICAL FIX: Use $lookup with pipeline instead of client-side joins
+  const pipeline = [
+    // Stage 1: Get ONLY the 3 most recent slots (indexed query)
+    { 
+      $match: { 
+        count: { $gt: 0 },
+        // ✅ NEW: Add index hint for performance
+      } 
+    },
+    { $sort: { index: -1 } },
+    { $limit: 3 },  // Hard limit to 3 documents
+    
+    // Stage 2: Lookup user status (single read)
+    {
+      $lookup: {
+        from: 'user_status',
+        let: { currentSlots: '$$ROOT' },
+        pipeline: [
+          { $match: { _id: userId } },
+          { $limit: 1 }
+        ],
+        as: 'userStatus'
+      }
+    },
+    
+    // Stage 3: Lookup viewed content for ONLY these 3 slots
+    {
+      $lookup: {
+        from: `contrib_${collection}`,
+        let: { slotId: '$_id' },
+        pipeline: [
+          { 
+            $match: { 
+              $expr: {
+                $and: [
+                  { $eq: ['$userId', userId] },
+                  { $eq: ['$slotId', '$$slotId'] }
+                ]
+              }
+            } 
+          },
+          { $project: { ids: 1 } },
+          { $limit: 1 }
+        ],
+        as: 'viewedData'
+      }
+    },
+    
+    // Stage 4: Unwind and filter in single pass
+    { $unwind: { path: `$${listKey}`, preserveNullAndEmptyArrays: false } },
+    
+    // Stage 5: Extract viewed IDs
+    {
+      $addFields: {
+        viewedIds: { 
+          $ifNull: [
+            { $arrayElemAt: ['$viewedData.ids', 0] }, 
+            []
+          ] 
+        }
+      }
+    },
+    
+    // Stage 6: Filter out viewed content
+    {
+      $match: {
+        $expr: {
+          $not: {
+            $in: [`$${listKey}.postId`, '$viewedIds']
+          }
+        }
+      }
+    },
+    
+    // Stage 7: Project final fields
+    {
+      $project: {
+        postId: `$${listKey}.postId`,
+        userId: `$${listKey}.userId`,
+        username: `$${listKey}.username`,
+        imageUrl: `$${listKey}.imageUrl`,
+        videoUrl: `$${listKey}.videoUrl`,
+        caption: `$${listKey}.caption`,
+        profilePicUrl: `$${listKey}.profile_picture_url`,
+        timestamp: `$${listKey}.timestamp`,
+        likeCount: `$${listKey}.likeCount`,
+        commentCount: `$${listKey}.commentCount`,
+        retention: `$${listKey}.retention`,
+        ratio: { $ifNull: [`$${listKey}.ratio`, isReel ? '9:16' : '4:5'] },
+        category: `$${listKey}.category`,
+        sourceDocument: '$_id',
+        slotIndex: '$index'
+      }
+    },
+    
+    // Stage 8: Limit to required content
+    { $limit: minContentRequired * 2 },  // Fetch extra for filtering
+    
+    // ✅ NEW: Add index hint to force index usage
+    // This is added via options below
+  ];
 
-const aggregateStart = Date.now();
-const results = await this.db.collection(collection).aggregate(pipeline).toArray();
-logDbOp('aggregate', collection, { pipeline: 'fixed_reads_optimized_with_ratio' }, results, Date.now() - aggregateStart);
+  // ✅ CRITICAL: Execute with allowDiskUse for large datasets
+  const aggregateOptions = {
+    maxTimeMS: 5000,           // Fail fast
+    allowDiskUse: false,        // Force in-memory (faster for small datasets)
+    hint: { index: -1 },       // Use the index we created
+  };
 
-let userStatus = null;
-let contentSlots = [];
+  const aggregateStart = Date.now();
+  const results = await this.db.collection(collection)
+    .aggregate(pipeline, aggregateOptions)
+    .toArray();
+    
+  logDbOp('aggregate', collection, { 
+    pipeline: 'fixed_reads_optimized_v2',
+    stages: pipeline.length 
+  }, results, Date.now() - aggregateStart);
 
-if (results.length > 0) {
-const facetResult = results[0];
-
-if (facetResult.userStatus && facetResult.userStatus.length > 0 &&
-facetResult.userStatus[0].status && facetResult.userStatus[0].status.length > 0) {
-userStatus = facetResult.userStatus[0].status[0];
-}
-
-contentSlots = facetResult.contentSlots || [];
-}
-
-console.log(`[FIXED-READS-DATA] User status found: ${!!userStatus}, Content slots: ${contentSlots.length}`);
-
-const viewedIds = new Set(contentSlots.length > 0 ? contentSlots[0].viewedIds || [] : []);
-const isNewUser = !userStatus || !userStatus[statusField];
-
-let content = [];
-let newLatestSlot = null;
-let normalDocId = null;
-
-if (isNewUser) {
-console.log(`[NEW-USER-FIXED] ${userId} - ${contentType}`);
-
-let itemsNeeded = minContentRequired;
-for (const slot of contentSlots) {
-if (itemsNeeded <= 0) break;
-
-const slotContent = slot[listKey] || [];
-for (const item of slotContent) {
-if (itemsNeeded <= 0) break;
-
-if (item.postId && !viewedIds.has(item.postId)) {
-// **CRITICAL DEBUG: Log ratio**
-console.log(`[RATIO-LOADED] postId=${item.postId.substring(0, 8)} | ratio=${item.ratio || 'MISSING'}`);
-content.push(item);
-itemsNeeded--;
-}
-}
-}
-
-if (contentSlots.length > 0) {
-newLatestSlot = contentSlots[0]._id;
-normalDocId = contentSlots.length > 1 ? contentSlots[1]._id : contentSlots[0]._id;
-
-this.updateUserStatus(userId, {
-[statusField]: newLatestSlot,
-[normalField]: normalDocId
-}).catch(console.error);
-}
-
-} else {
-console.log(`[RETURNING-USER-FIXED] ${userId} - ${contentType}`);
-
-const currentLatest = userStatus[statusField];
-const currentNormal = userStatus[normalField];
-
-const match = currentLatest.match(/_(\d+)$/);
-const currentIndex = match ? parseInt(match[1]) : 0;
-
-let hasNewContent = false;
-for (const slot of contentSlots) {
-if (slot.index > currentIndex) {
-const slotContent = slot[listKey] || [];
-const freshContent = slotContent.filter(item =>
-item.postId && !viewedIds.has(item.postId)
-);
-
-if (freshContent.length > 0) {
-content.push(...freshContent);
-newLatestSlot = slot._id;
-hasNewContent = true;
-
-// **LOG RATIOS**
-freshContent.forEach(item => {
-console.log(`[RATIO-NEW-CONTENT] postId=${item.postId.substring(0, 8)} | ratio=${item.ratio || 'MISSING'}`);
-});
-break;
-}
-}
-}
-
-if (!hasNewContent) {
-const currentSlots = contentSlots.filter(slot =>
-slot._id === currentLatest || slot._id === currentNormal
-);
-
-let itemsNeeded = minContentRequired;
-for (const slot of currentSlots) {
-if (itemsNeeded <= 0) break;
-
-const slotContent = slot[listKey] || [];
-for (const item of slotContent) {
-if (itemsNeeded <= 0) break;
-
-if (item.postId && !viewedIds.has(item.postId)) {
-content.push(item);
-itemsNeeded--;
-}
-}
-}
-
-newLatestSlot = currentLatest;
-normalDocId = currentNormal;
-} else {
-normalDocId = currentNormal;
-
-this.updateUserStatus(userId, {
-[statusField]: newLatestSlot,
-[normalField]: normalDocId
-}).catch(console.error);
-}
-}
-
-if (content.length < minContentRequired && contentSlots.length > 0) {
-let itemsNeeded = minContentRequired - content.length;
-const existingIds = new Set(content.map(item => item.postId));
-
-for (const slot of contentSlots) {
-if (itemsNeeded <= 0) break;
-
-const slotContent = slot[listKey] || [];
-for (const item of slotContent) {
-if (itemsNeeded <= 0) break;
-
-if (item.postId &&
-!viewedIds.has(item.postId) &&
-!existingIds.has(item.postId)) {
-content.push(item);
-existingIds.add(item.postId);
-itemsNeeded--;
-}
-}
-}
-}
-
-const result = {
-content: content.slice(0, minContentRequired * 2),
-latestDocumentId: newLatestSlot,
-normalDocumentId: normalDocId,
-isNewUser,
-hasNewContent: newLatestSlot !== (userStatus ? userStatus[statusField] : null)
-};
-
-console.log(`[FIXED-READS-COMPLETE] ${userId} - ${contentType}: ${result.content.length} items | Total DB Reads: ${dbOpCounters.reads} | Time: ${Date.now() - start}ms`);
-return result;
+  console.log(`[FIXED-READS-COMPLETE] ${userId} - ${contentType}: ${results.length} items | Time: ${Date.now() - start}ms`);
+  
+  return {
+    content: results.slice(0, minContentRequired * 2),
+    latestDocumentId: results[0]?.sourceDocument || null,
+    normalDocumentId: results[1]?.sourceDocument || null,
+    isNewUser: false,
+    hasNewContent: results.length > 0
+  };
 }
 
 
@@ -2008,47 +1848,137 @@ return userIds;
 let redisClient;
 
 async function initRedis() {
-if (process.env.REDIS_URL) {
-redisClient = new Redis(process.env.REDIS_URL, {
-maxRetriesPerRequest: 3,
-enableReadyCheck: true,
-connectTimeout: 10000,
-retryStrategy(times) {
-if (times > 5) {
-log('error', '[REDIS] Max retries reached, falling back to in-memory cache');
-return null; // Stop retrying
-}
-const delay = Math.min(times * 50, 2000);
-return delay;
-}
-});
+  if (!process.env.REDIS_URL) {
+    log('warn', '[REDIS] ⚠️ Not configured - using in-memory cache');
+    return;
+  }
 
-redisClient.on('error', (err) => {
-log('error', '[REDIS-ERROR]', err.message);
-// Don't crash the server, just log the error
-});
+  redisClient = new Redis(process.env.REDIS_URL, {
+    maxRetriesPerRequest: 3,
+    enableReadyCheck: true,
+    connectTimeout: 10000,
+    
+    // ✅ PRODUCTION OPTIMIZATIONS
+    lazyConnect: false,          // Connect immediately
+    keepAlive: 30000,            // TCP keepalive
+    
+    // ✅ NEW: Connection pool (critical for performance)
+    maxRetriesPerRequest: 3,
+    enableOfflineQueue: true,    // Queue commands during reconnect
+    
+    retryStrategy(times) {
+      if (times > 5) {
+        log('error', '[REDIS] Max retries reached, falling back to in-memory');
+        return null;
+      }
+      const delay = Math.min(times * 100, 3000);  // Max 3s backoff
+      return delay;
+    },
+    
+    // ✅ NEW: Reconnect strategy
+    reconnectOnError(err) {
+      const targetErrors = ['READONLY', 'ETIMEDOUT', 'ECONNRESET'];
+      if (targetErrors.some(target => err.message.includes(target))) {
+        return true;  // Reconnect
+      }
+      return false;   // Don't reconnect for other errors
+    }
+  });
 
-redisClient.on('connect', () => {
-log('info', '[REDIS] ✅ Connected successfully');
-});
+  redisClient.on('error', (err) => {
+    log('error', '[REDIS-ERROR]', err.message);
+  });
 
-redisClient.on('close', () => {
-log('warn', '[REDIS] Connection closed, falling back to in-memory cache');
-});
+  redisClient.on('connect', () => {
+    log('info', '[REDIS] ✅ Connected successfully');
+  });
 
-// Test connection
-try {
-await redisClient.ping();
-console.log('[REDIS-INIT] ✅ Health check passed');
-} catch (err) {
-log('warn', `[REDIS] Health check failed: ${err.message}, using in-memory cache`);
-redisClient = null; // Fall back to in-memory
+  redisClient.on('ready', () => {
+    log('info', '[REDIS] ✅ Ready to accept commands');
+  });
+
+  redisClient.on('close', () => {
+    log('warn', '[REDIS] Connection closed');
+  });
+
+  redisClient.on('reconnecting', () => {
+    log('info', '[REDIS] 🔄 Reconnecting...');
+  });
+
+  try {
+    await redisClient.ping();
+    console.log('[REDIS-INIT] ✅ Health check passed');
+  } catch (err) {
+    log('warn', `[REDIS] Health check failed: ${err.message}`);
+    redisClient = null;
+  }
 }
-} else {
-log('warn', '[REDIS] ⚠️ Not configured - using in-memory cache (NOT PRODUCTION READY)');
-log('warn', '[REDIS] For Instagram-scale performance, install Redis and set REDIS_URL in .env');
-}
-}
+
+// ✅ CACHE STAMPEDE PROTECTION
+const getOrSetCache = async (key, fetchFunction, ttl = 30000) => {
+  if (!redisClient) {
+    return await fetchFunction();  // Fallback to direct fetch
+  }
+
+  const lockKey = `lock:${key}`;
+  const lockTTL = 5;  // 5 seconds
+  const maxWaitTime = 3000;  // 3 seconds max wait
+
+  try {
+    // Try to get from cache first
+    const cached = await redisClient.get(key);
+    if (cached) {
+      console.log(`[CACHE-HIT] ${key}`);
+      return JSON.parse(cached);
+    }
+
+    // ✅ STAMPEDE PROTECTION: Try to acquire lock
+    const lockAcquired = await redisClient.set(
+      lockKey, 
+      '1', 
+      'EX', 
+      lockTTL, 
+      'NX'
+    );
+
+    if (!lockAcquired) {
+      // Another process is fetching, wait and retry
+      console.log(`[CACHE-STAMPEDE-WAIT] ${key} - waiting for other process`);
+      
+      const startWait = Date.now();
+      while (Date.now() - startWait < maxWaitTime) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        const retryCache = await redisClient.get(key);
+        if (retryCache) {
+          console.log(`[CACHE-HIT-AFTER-WAIT] ${key}`);
+          return JSON.parse(retryCache);
+        }
+      }
+      
+      // Timeout reached, fetch anyway
+      console.warn(`[CACHE-STAMPEDE-TIMEOUT] ${key} - fetching anyway`);
+    }
+
+    // Fetch data
+    console.log(`[CACHE-MISS] ${key} - fetching`);
+    const data = await fetchFunction();
+
+    // Store in cache
+    await redisClient.setex(key, Math.floor(ttl / 1000), JSON.stringify(data));
+    
+    // Release lock
+    await redisClient.del(lockKey);
+
+    return data;
+
+  } catch (err) {
+    log('error', '[CACHE-ERROR]', err.message);
+    // Always release lock on error
+    await redisClient.del(lockKey).catch(() => {});
+    return await fetchFunction();  // Fallback
+  }
+};
 
 
 
@@ -3140,227 +3070,171 @@ return res.status(500).json({ error: 'Failed to load feed', details: e.message }
 });
 
 app.post('/api/contributed-views/batch-optimized', async (req, res) => {
-const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
-const startTime = Date.now();
+  const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
+  const startTime = Date.now();
 
-try {
-const { userId, posts = [], reels = [] } = req.body;
+  try {
+    const { userId, posts = [], reels = [] } = req.body;
 
-if (!userId) {
-return res.status(400).json({
-success: false,
-error: 'userId required',
-requestId
-});
-}
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: 'userId required',
+        requestId
+      });
+    }
 
-console.log(`[postId_debug] [BATCH-START] userId=${userId} | requestId=${requestId} | ${posts.length}P + ${reels.length}R`);
+    console.log(`[BATCH-START] userId=${userId} | ${posts.length}P + ${reels.length}R`);
 
-// ✅ CRITICAL: Lookup each post's actual document from posts collection
-const postDocumentMap = new Map(); // postId -> documentId
+    // ✅ CRITICAL FIX: Use bulkWrite for ALL operations (not individual updateOne calls)
+    
+    const postOperations = [];
+    const reelOperations = [];
 
-if (posts.length > 0) {
-console.log(`[postId_debug] [POST-LOOKUP-START] Finding documents for ${posts.length} posts`);
+    // Build bulk operations
+    for (const postId of posts) {
+      // Determine which slot this post belongs to (you need to implement getSlotForPost)
+      const slotId = await getSlotForPost(postId);  // See implementation below
+      if (!slotId) continue;
 
-const postsCollection = db.collection('posts');
+      const uniqueDocId = `${userId}_${slotId}`;
+      
+      postOperations.push({
+        updateOne: {
+          filter: { _id: uniqueDocId },
+          update: {
+            $addToSet: { ids: postId },
+            $setOnInsert: {
+              userId,
+              slotId,
+              createdAt: new Date()
+            },
+            $set: { updatedAt: new Date() }
+          },
+          upsert: true
+        }
+      });
+    }
 
-// Get all post documents
-const postDocs = await postsCollection.find({}).toArray();
+    for (const reelId of reels) {
+      const slotId = await getSlotForReel(reelId);
+      if (!slotId) continue;
 
-// Build map of postId -> documentId
-for (const doc of postDocs) {
-const docId = doc._id;
-const postList = doc.postList || [];
+      const uniqueDocId = `${userId}_${slotId}`;
+      
+      reelOperations.push({
+        updateOne: {
+          filter: { _id: uniqueDocId },
+          update: {
+            $addToSet: { ids: reelId },
+            $setOnInsert: {
+              userId,
+              slotId,
+              createdAt: new Date()
+            },
+            $set: { updatedAt: new Date() }
+          },
+          upsert: true
+        }
+      });
+    }
 
-for (const post of postList) {
-if (posts.includes(post.postId)) {
-postDocumentMap.set(post.postId, docId);
-console.log(`[postId_debug] [POST-MAPPED] ${post.postId.substring(0, 8)} -> ${docId}`);
-}
-}
-}
+    // ✅ CRITICAL: Execute ALL writes in parallel with bulkWrite
+    const [postResults, reelResults] = await Promise.all([
+      postOperations.length > 0 
+        ? db.collection('contrib_posts').bulkWrite(postOperations, { 
+            ordered: false,  // Continue on error
+            writeConcern: { w: 1, j: false }  // Fast writes
+          })
+        : Promise.resolve({ insertedCount: 0, modifiedCount: 0 }),
+      
+      reelOperations.length > 0
+        ? db.collection('contrib_reels').bulkWrite(reelOperations, { 
+            ordered: false,
+            writeConcern: { w: 1, j: false }
+          })
+        : Promise.resolve({ insertedCount: 0, modifiedCount: 0 })
+    ]);
 
-console.log(`[postId_debug] [POST-LOOKUP-COMPLETE] Mapped ${postDocumentMap.size}/${posts.length} posts`);
-}
+    const duration = Date.now() - startTime;
 
-// ✅ CRITICAL: Lookup each reel's actual document from reels collection
-const reelDocumentMap = new Map(); // reelId -> documentId
+    console.log(`[BATCH-COMPLETE] userId=${userId} | ${posts.length}P + ${reels.length}R in ${duration}ms`);
 
-if (reels.length > 0) {
-console.log(`[postId_debug] [REEL-LOOKUP-START] Finding documents for ${reels.length} reels`);
+    res.json({
+      success: true,
+      processed: {
+        posts: posts.length,
+        reels: reels.length
+      },
+      results: {
+        posts: {
+          inserted: postResults.insertedCount || 0,
+          modified: postResults.modifiedCount || 0
+        },
+        reels: {
+          inserted: reelResults.insertedCount || 0,
+          modified: reelResults.modifiedCount || 0
+        }
+      },
+      requestId,
+      duration
+    });
 
-const reelsCollection = db.collection('reels');
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.error(`[BATCH-ERROR] requestId=${requestId} | duration=${duration}ms`, error);
 
-// Get all reel documents
-const reelDocs = await reelsCollection.find({}).toArray();
-
-// Build map of reelId -> documentId
-for (const doc of reelDocs) {
-const docId = doc._id;
-const reelsList = doc.reelsList || [];
-
-for (const reel of reelsList) {
-if (reels.includes(reel.postId)) {
-reelDocumentMap.set(reel.postId, docId);
-console.log(`[postId_debug] [REEL-MAPPED] ${reel.postId.substring(0, 8)} -> ${docId}`);
-}
-}
-}
-
-console.log(`[postId_debug] [REEL-LOOKUP-COMPLETE] Mapped ${reelDocumentMap.size}/${reels.length} reels`);
-}
-
-// ✅ Group posts by their actual document
-const postsByDocument = new Map(); // documentId -> [postIds]
-
-for (const postId of posts) {
-const docId = postDocumentMap.get(postId);
-
-if (!docId) {
-console.warn(`[postId_debug] [POST-NO-DOC] ${postId.substring(0, 8)} not found in posts collection, skipping`);
-continue;
-}
-
-if (!postsByDocument.has(docId)) {
-postsByDocument.set(docId, []);
-}
-postsByDocument.get(docId).push(postId);
-}
-
-console.log(`[postId_debug] [POST-GROUPS] Posts distributed across ${postsByDocument.size} documents`);
-for (const [docId, ids] of postsByDocument.entries()) {
-console.log(`[postId_debug] [POST-GROUP] ${docId}: ${ids.length} posts`);
-}
-
-// ✅ Group reels by their actual document
-const reelsByDocument = new Map(); // documentId -> [reelIds]
-
-for (const reelId of reels) {
-const docId = reelDocumentMap.get(reelId);
-
-if (!docId) {
-console.warn(`[postId_debug] [REEL-NO-DOC] ${reelId.substring(0, 8)} not found in reels collection, skipping`);
-continue;
-}
-
-if (!reelsByDocument.has(docId)) {
-reelsByDocument.set(docId, []);
-}
-reelsByDocument.get(docId).push(reelId);
-}
-
-console.log(`[postId_debug] [REEL-GROUPS] Reels distributed across ${reelsByDocument.size} documents`);
-for (const [docId, ids] of reelsByDocument.entries()) {
-console.log(`[postId_debug] [REEL-GROUP] ${docId}: ${ids.length} reels`);
-}
-
-// ✅ Process posts (route each to its correct document)
-const postResults = [];
-
-for (const [docId, postIds] of postsByDocument.entries()) {
-console.log(`[postId_debug] [SAVING-POSTS] ${postIds.length} posts to document ${docId}`);
-
-const contribPostsCollection = db.collection('contrib_posts');
-
-// ✅ FIXED: Use userId_docId as _id to prevent conflicts
-const uniqueDocId = `${userId}_${docId}`;
-
-const result = await contribPostsCollection.updateOne(
-{ _id: uniqueDocId }, // Changed from { _id: docId, userId }
-{
-$addToSet: { ids: { $each: postIds } },
-$setOnInsert: {
-userId,
-slotId: docId, // Store original slot ID for reference
-createdAt: new Date()
-},
-$set: { updatedAt: new Date() }
-},
-{ upsert: true }
-);
-
-postResults.push({
-documentId: uniqueDocId,
-originalSlotId: docId,
-count: postIds.length,
-matched: result.matchedCount,
-modified: result.modifiedCount,
-upserted: result.upsertedCount
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      requestId,
+      duration
+    });
+  }
 });
 
-console.log(`[postId_debug] [POSTS-SAVED] ${uniqueDocId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
+// ✅ HELPER: Cache slot lookups (critical for performance)
+const slotCache = new LRU({ max: 10000, ttl: 60000 });  // 1 minute cache
+
+async function getSlotForPost(postId) {
+  const cacheKey = `slot:post:${postId}`;
+  
+  if (slotCache.has(cacheKey)) {
+    return slotCache.get(cacheKey);
+  }
+
+  const doc = await db.collection('posts').findOne(
+    { 'postList.postId': postId },
+    { projection: { _id: 1 } }
+  );
+
+  const slotId = doc?._id || null;
+  if (slotId) {
+    slotCache.set(cacheKey, slotId);
+  }
+  
+  return slotId;
 }
 
-// ✅ Process reels (route each to its correct document)
-const reelResults = [];
+async function getSlotForReel(reelId) {
+  const cacheKey = `slot:reel:${reelId}`;
+  
+  if (slotCache.has(cacheKey)) {
+    return slotCache.get(cacheKey);
+  }
 
-for (const [docId, reelIds] of reelsByDocument.entries()) {
-console.log(`[postId_debug] [SAVING-REELS] ${reelIds.length} reels to document ${docId}`);
+  const doc = await db.collection('reels').findOne(
+    { 'reelsList.postId': reelId },
+    { projection: { _id: 1 } }
+  );
 
-const contribReelsCollection = db.collection('contrib_reels');
-
-// ✅ FIXED: Use userId_docId as _id to prevent conflicts
-const uniqueDocId = `${userId}_${docId}`;
-
-const result = await contribReelsCollection.updateOne(
-{ _id: uniqueDocId }, // Changed from { _id: docId, userId }
-{
-$addToSet: { ids: { $each: reelIds } },
-$setOnInsert: {
-userId,
-slotId: docId, // Store original slot ID for reference
-createdAt: new Date()
-},
-$set: { updatedAt: new Date() }
-},
-{ upsert: true }
-);
-
-reelResults.push({
-documentId: uniqueDocId,
-originalSlotId: docId,
-count: reelIds.length,
-matched: result.matchedCount,
-modified: result.modifiedCount,
-upserted: result.upsertedCount
-});
-
-console.log(`[postId_debug] [REELS-SAVED] ${uniqueDocId}: matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
+  const slotId = doc?._id || null;
+  if (slotId) {
+    slotCache.set(cacheKey, slotId);
+  }
+  
+  return slotId;
 }
-
-const duration = Date.now() - startTime;
-
-console.log(`[postId_debug] [BATCH-COMPLETE] userId=${userId} | ${posts.length}P + ${reels.length}R in ${duration}ms`);
-
-res.json({
-success: true,
-message: 'Contributed views processed',
-processed: {
-posts: posts.length,
-reels: reels.length
-},
-documentDistribution: {
-posts: Array.from(postsByDocument.keys()),
-reels: Array.from(reelsByDocument.keys())
-},
-postResults,
-reelResults,
-requestId,
-duration
-});
-
-} catch (error) {
-const duration = Date.now() - startTime;
-console.error(`[postId_debug] [BATCH-ERROR] requestId=${requestId} | duration=${duration}ms`, error);
-
-res.status(500).json({
-success: false,
-error: error.message,
-requestId,
-duration
-});
-}
-});
 
 app.get('/api/status/:userId', async (req, res) => {
 try {
