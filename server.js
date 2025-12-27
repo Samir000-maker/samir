@@ -1012,137 +1012,258 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
   const start = Date.now();
   const isReel = contentType === 'reels';
   const collection = isReel ? 'reels' : 'posts';
+  const statusField = isReel ? 'latestReelSlotId' : 'latestPostSlotId';
+  const normalField = isReel ? 'normalReelSlotId' : 'normalPostSlotId';
   const listKey = isReel ? 'reelsList' : 'postList';
 
-  console.log(`[FIXED-READS-START] ${contentType} for ${userId}, required: ${minContentRequired}`);
+  console.log(`[SLOT-ALGORITHM] START userId=${userId} | type=${contentType} | minRequired=${minContentRequired}`);
 
-  // ✅ CRITICAL FIX: Use $lookup with pipeline instead of client-side joins
-  const pipeline = [
-    // Stage 1: Get ONLY the 3 most recent slots (indexed query)
-    { 
-      $match: { 
-        count: { $gt: 0 },
-        // ✅ NEW: Add index hint for performance
-      } 
-    },
-    { $sort: { index: -1 } },
-    { $limit: 3 },  // Hard limit to 3 documents
-    
-    // Stage 2: Lookup user status (single read)
-    {
-      $lookup: {
-        from: 'user_status',
-        let: { currentSlots: '$$ROOT' },
-        pipeline: [
-          { $match: { _id: userId } },
-          { $limit: 1 }
-        ],
-        as: 'userStatus'
-      }
-    },
-    
-    // Stage 3: Lookup viewed content for ONLY these 3 slots
-    {
-      $lookup: {
-        from: `contrib_${collection}`,
-        let: { slotId: '$_id' },
-        pipeline: [
-          { 
-            $match: { 
-              $expr: {
-                $and: [
-                  { $eq: ['$userId', userId] },
-                  { $eq: ['$slotId', '$$slotId'] }
-                ]
-              }
-            } 
-          },
-          { $project: { ids: 1 } },
-          { $limit: 1 }
-        ],
-        as: 'viewedData'
-      }
-    },
-    
-    // Stage 4: Unwind and filter in single pass
-    { $unwind: { path: `$${listKey}`, preserveNullAndEmptyArrays: false } },
-    
-    // Stage 5: Extract viewed IDs
-    {
-      $addFields: {
-        viewedIds: { 
-          $ifNull: [
-            { $arrayElemAt: ['$viewedData.ids', 0] }, 
-            []
-          ] 
-        }
-      }
-    },
-    
-    // Stage 6: Filter out viewed content
-    {
-      $match: {
-        $expr: {
-          $not: {
-            $in: [`$${listKey}.postId`, '$viewedIds']
-          }
-        }
-      }
-    },
-    
-    // Stage 7: Project final fields
-    {
-      $project: {
-        postId: `$${listKey}.postId`,
-        userId: `$${listKey}.userId`,
-        username: `$${listKey}.username`,
-        imageUrl: `$${listKey}.imageUrl`,
-        videoUrl: `$${listKey}.videoUrl`,
-        caption: `$${listKey}.caption`,
-        profilePicUrl: `$${listKey}.profile_picture_url`,
-        timestamp: `$${listKey}.timestamp`,
-        likeCount: `$${listKey}.likeCount`,
-        commentCount: `$${listKey}.commentCount`,
-        retention: `$${listKey}.retention`,
-        ratio: { $ifNull: [`$${listKey}.ratio`, isReel ? '9:16' : '4:5'] },
-        category: `$${listKey}.category`,
-        sourceDocument: '$_id',
-        slotIndex: '$index'
-      }
-    },
-    
-    // Stage 8: Limit to required content
-    { $limit: minContentRequired * 2 },  // Fetch extra for filtering
-    
-    // ✅ NEW: Add index hint to force index usage
-    // This is added via options below
-  ];
-
-  // ✅ CRITICAL: Execute with allowDiskUse for large datasets
-  const aggregateOptions = {
-    maxTimeMS: 5000,           // Fail fast
-    allowDiskUse: false,        // Force in-memory (faster for small datasets)
-    hint: { index: -1 },       // Use the index we created
-  };
-
-  const aggregateStart = Date.now();
-  const results = await this.db.collection(collection)
-    .aggregate(pipeline, aggregateOptions)
-    .toArray();
-    
-  logDbOp('aggregate', collection, { 
-    pipeline: 'fixed_reads_optimized_v2',
-    stages: pipeline.length 
-  }, results, Date.now() - aggregateStart);
-
-  console.log(`[FIXED-READS-COMPLETE] ${userId} - ${contentType}: ${results.length} items | Time: ${Date.now() - start}ms`);
+  // ============================================================
+  // READ 1: Get user status
+  // ============================================================
+  const userStatus = await this.db.collection('user_status').findOne(
+    { _id: userId },
+    { projection: { [statusField]: 1, [normalField]: 1 } }
+  );
   
+  const isNewUser = !userStatus || !userStatus[statusField];
+  
+  console.log(`[SLOT-ALGORITHM] User status: ${isNewUser ? 'NEW USER' : `latestSlot=${userStatus[statusField]}, normalSlot=${userStatus[normalField]}`}`);
+
+  // Get user interests for filtering
+  let userInterests = [];
+  try {
+    const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
+    if (userResponse.status === 200 && userResponse.data.success) {
+      userInterests = userResponse.data.user.interests || [];
+    }
+  } catch (e) {
+    console.warn(`[SLOT-ALGORITHM] Interests fetch failed: ${e.message}`);
+  }
+
+  console.log(`[SLOT-ALGORITHM] User interests: [${userInterests.join(', ')}]`);
+
+  let slotsToRead = [];
+  let newLatestSlot = null;
+  let newNormalSlot = null;
+
+  // ============================================================
+  // DETERMINE WHICH SLOTS TO READ (MAX 3)
+  // ============================================================
+  if (isNewUser) {
+    // FRESH USER: Read latest 3 slots (e.g., reel_8, reel_7, reel_6)
+    const latestSlot = await this.getLatestSlotOptimized(collection);
+    if (!latestSlot) {
+      console.warn(`[SLOT-ALGORITHM] No slots found in ${collection}`);
+      return { content: [], latestDocumentId: null, normalDocumentId: null, isNewUser: true };
+    }
+
+    const latestIndex = latestSlot.index;
+    slotsToRead = [
+      `${collection.slice(0, -1)}_${latestIndex}`,
+      `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`,
+      `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`
+    ];
+
+    newLatestSlot = slotsToRead[0];
+    newNormalSlot = slotsToRead[2];
+
+    console.log(`[SLOT-ALGORITHM] NEW USER slots: [${slotsToRead.join(', ')}]`);
+
+  } else {
+    // RETURNING USER: Check for newer slots FIRST
+    const currentLatestSlot = userStatus[statusField];
+    const currentNormalSlot = userStatus[normalField];
+    
+    const latestMatch = currentLatestSlot.match(/_(\d+)$/);
+    const latestIndex = latestMatch ? parseInt(latestMatch[1]) : 0;
+
+    // ✅ CRITICAL: Always check for NEWER document first
+    const newerSlotId = `${collection.slice(0, -1)}_${latestIndex + 1}`;
+    const newerSlotExists = await this.db.collection(collection).findOne(
+      { _id: newerSlotId },
+      { projection: { _id: 1 } }
+    );
+
+    if (newerSlotExists) {
+      console.log(`[SLOT-ALGORITHM] ✅ NEWER SLOT FOUND: ${newerSlotId}`);
+      
+      // Read: newerSlot, normalSlot, normalSlot-1
+      const normalMatch = currentNormalSlot.match(/_(\d+)$/);
+      const normalIndex = normalMatch ? parseInt(normalMatch[1]) : 0;
+
+      slotsToRead = [
+        newerSlotId,
+        currentNormalSlot,
+        `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`
+      ];
+
+      newLatestSlot = newerSlotId;
+      newNormalSlot = slotsToRead[2];
+
+    } else {
+      console.log(`[SLOT-ALGORITHM] No newer slot after ${currentLatestSlot}, reading backward from normalSlot`);
+      
+      // Read: normalSlot, normalSlot-1, normalSlot-2
+      const normalMatch = currentNormalSlot.match(/_(\d+)$/);
+      const normalIndex = normalMatch ? parseInt(normalMatch[1]) : 0;
+
+      slotsToRead = [
+        currentNormalSlot,
+        `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`,
+        `${collection.slice(0, -1)}_${Math.max(normalIndex - 2, 0)}`
+      ];
+
+      newLatestSlot = currentLatestSlot; // Unchanged
+      newNormalSlot = slotsToRead[2];
+    }
+
+    console.log(`[SLOT-ALGORITHM] RETURNING USER slots: [${slotsToRead.join(', ')}]`);
+  }
+
+  // ============================================================
+  // READ 2-4: Fetch content from determined slots (MAX 3 READS)
+  // ============================================================
+  const slotContents = [];
+  for (const slotId of slotsToRead) {
+    const slotDoc = await this.db.collection(collection).findOne(
+      { _id: slotId },
+      { projection: { [listKey]: 1, index: 1, count: 1 } }
+    );
+
+    if (slotDoc && slotDoc[listKey]) {
+      slotContents.push({
+        slotId: slotId,
+        content: slotDoc[listKey]
+      });
+      console.log(`[SLOT-ALGORITHM] READ ${slotId}: ${slotDoc[listKey].length} items`);
+    } else {
+      console.log(`[SLOT-ALGORITHM] READ ${slotId}: EMPTY or NOT FOUND`);
+    }
+  }
+
+  // ============================================================
+  // READ 5-7: Fetch viewed content for ONLY these 3 slots (MAX 3 READS)
+  // ============================================================
+  const viewedIds = new Set();
+  for (const { slotId } of slotContents) {
+    const uniqueDocId = `${userId}_${slotId}`;
+    const contribDoc = await this.db.collection(`contrib_${collection}`).findOne(
+      { _id: uniqueDocId },
+      { projection: { ids: 1 } }
+    );
+
+    if (contribDoc && contribDoc.ids) {
+      contribDoc.ids.forEach(id => viewedIds.add(id));
+      console.log(`[SLOT-ALGORITHM] VIEWED in ${slotId}: ${contribDoc.ids.length} items`);
+    }
+  }
+
+  console.log(`[SLOT-ALGORITHM] Total viewed IDs: ${viewedIds.size}`);
+
+  // ============================================================
+  // PHASE 1: Interest-based filtering
+  // ============================================================
+  let filteredContent = [];
+
+  for (const { slotId, content } of slotContents) {
+    for (const item of content) {
+      // Skip if already viewed
+      if (viewedIds.has(item.postId)) continue;
+
+      // ✅ INTEREST FILTERING: Match category with user interests
+      if (userInterests.length > 0) {
+        if (item.category && userInterests.includes(item.category)) {
+          filteredContent.push(item);
+        }
+      } else {
+        // No interests defined, include all
+        filteredContent.push(item);
+      }
+    }
+  }
+
+  console.log(`[SLOT-ALGORITHM] PHASE 1 (Interest-filtered): ${filteredContent.length} items`);
+
+  // ============================================================
+  // PHASE 2: Fill remainder with high-engagement content
+  // ============================================================
+  if (filteredContent.length < minContentRequired) {
+    console.log(`[SLOT-ALGORITHM] PHASE 2: Need ${minContentRequired - filteredContent.length} more items`);
+
+    const existingIds = new Set(filteredContent.map(item => item.postId));
+    const remainderContent = [];
+
+    for (const { content } of slotContents) {
+      for (const item of content) {
+        if (!viewedIds.has(item.postId) && !existingIds.has(item.postId)) {
+          remainderContent.push(item);
+        }
+      }
+    }
+
+    // ✅ ENGAGEMENT RANKING: retention > likes > comments > views
+    remainderContent.sort((a, b) => {
+      const retentionDiff = (b.retention || 0) - (a.retention || 0);
+      if (Math.abs(retentionDiff) > 1) return retentionDiff;
+
+      const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+      if (likesDiff !== 0) return likesDiff;
+
+      const commentsDiff = (b.commentCount || 0) - (a.commentCount || 0);
+      if (commentsDiff !== 0) return commentsDiff;
+
+      return (b.viewCount || 0) - (a.viewCount || 0);
+    });
+
+    const needed = minContentRequired - filteredContent.length;
+    filteredContent.push(...remainderContent.slice(0, needed));
+
+    console.log(`[SLOT-ALGORITHM] PHASE 2 (High-engagement): Added ${Math.min(remainderContent.length, needed)} items`);
+  }
+
+  // ============================================================
+  // FINAL RANKING: Sort by engagement
+  // ============================================================
+  filteredContent.sort((a, b) => {
+    const retentionDiff = (b.retention || 0) - (a.retention || 0);
+    if (Math.abs(retentionDiff) > 1) return retentionDiff;
+
+    const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+    if (likesDiff !== 0) return likesDiff;
+
+    const commentsDiff = (b.commentCount || 0) - (a.commentCount || 0);
+    if (commentsDiff !== 0) return commentsDiff;
+
+    return (b.viewCount || 0) - (a.viewCount || 0);
+  });
+
+  // ============================================================
+  // UPDATE USER STATUS (if slots changed)
+  // ============================================================
+  if (newLatestSlot && newNormalSlot) {
+    await this.updateUserStatus(userId, {
+      [statusField]: newLatestSlot,
+      [normalField]: newNormalSlot
+    });
+    console.log(`[SLOT-ALGORITHM] Updated user_status: latest=${newLatestSlot}, normal=${newNormalSlot}`);
+  }
+
+  const duration = Date.now() - start;
+  console.log(`[SLOT-ALGORITHM] COMPLETE: ${filteredContent.length} items | ${duration}ms | Reads: ${1 + slotContents.length + slotContents.length} (1 user_status + ${slotContents.length} slots + ${slotContents.length} contrib)`);
+
   return {
-    content: results.slice(0, minContentRequired * 2),
-    latestDocumentId: results[0]?.sourceDocument || null,
-    normalDocumentId: results[1]?.sourceDocument || null,
-    isNewUser: false,
-    hasNewContent: results.length > 0
+    content: filteredContent.slice(0, minContentRequired * 2),
+    latestDocumentId: newLatestSlot,
+    normalDocumentId: newNormalSlot,
+    isNewUser,
+    hasNewContent: filteredContent.length > 0,
+    metadata: {
+      slotsRead: slotsToRead,
+      interestFiltered: filteredContent.length,
+      totalReads: 1 + slotContents.length + slotContents.length,
+      userInterests
+    }
   };
 }
 
@@ -1194,27 +1315,26 @@ setCache(`user_status_${userId}`, { _id: userId, ...updates, updatedAt: new Date
 }
 
 async getLatestSlotOptimized(collection) {
-const cacheKey = `latest_${collection}`;
-const cached = getCache(cacheKey);
-if (cached) {
-return cached;
-}
+  const cacheKey = `latest_${collection}`;
+  const cached = await getCache(cacheKey);
+  if (cached) {
+    return cached;
+  }
 
-const start = Date.now();
-const latestSlot = await this.db.collection(collection).findOne(
-{},
-{
-sort: { index: -1 },
-projection: { _id: 1, index: 1, count: 1 }
-}
-);
-logDbOp('findOne', collection, { sort: { index: -1 } }, latestSlot, Date.now() - start);
+  const start = Date.now();
+  const latestSlot = await this.db.collection(collection).findOne(
+    {},
+    {
+      sort: { index: -1 },
+      projection: { _id: 1, index: 1, count: 1 }
+    }
+  );
+  logDbOp('findOne', collection, { sort: { index: -1 } }, latestSlot, Date.now() - start);
 
-if (latestSlot) {
-setCache(cacheKey, latestSlot, CACHE_TTL_LONG); // Extended to 15 minutes
-console.log(`[DB-READ] latest_${collection} | Total Reads: ${dbOpCounters.reads}`);
-}
-return latestSlot;
+  if (latestSlot) {
+    await setCache(cacheKey, latestSlot, CACHE_TTL_MEDIUM);
+  }
+  return latestSlot;
 }
 
 async getOptimizedFeed(userId, contentType, minContentRequired = MIN_CONTENT_FOR_FEED) {
@@ -2975,107 +3095,79 @@ return res.status(500).json({ error: 'Failed to check batch retention' });
 
 
 app.get('/api/feed/:contentType/:userId', async (req, res) => {
-try {
-const { contentType, userId } = req.params;
-const { minContent = MIN_CONTENT_FOR_FEED } = req.query;
+  try {
+    const { contentType, userId } = req.params;
+    const { minContent = MIN_CONTENT_FOR_FEED } = req.query;
 
-if (!['posts', 'reels'].includes(contentType)) {
-return res.status(400).json({ error: 'Invalid content type' });
-}
+    if (!['posts', 'reels'].includes(contentType)) {
+      return res.status(400).json({ error: 'Invalid content type' });
+    }
 
-const requestKey = `${contentType}_${userId}_${minContent}`;
+    const requestKey = `${contentType}_${userId}_${minContent}`;
 
-console.log(`[FEED-REQUEST] User: ${userId} | Type: ${contentType} | Min: ${minContent}`);
+    console.log(`[FEED-REQUEST] User: ${userId} | Type: ${contentType} | Min: ${minContent}`);
 
-// Check duplicate requests
-if (activeRequests.has(requestKey)) {
-console.log(`[DUPLICATE-BLOCKED] ${requestKey}`);
-const result = await activeRequests.get(requestKey);
-return res.json({ ...result, servedFromDuplicatePrevention: true });
-}
+    // Check for duplicate requests
+    if (activeRequests.has(requestKey)) {
+      console.log(`[DUPLICATE-BLOCKED] ${requestKey}`);
+      const result = await activeRequests.get(requestKey);
+      return res.json({ ...result, servedFromDuplicatePrevention: true });
+    }
 
-// Check cache
-const cacheKey = `feed_${contentType}_${userId}`;
-const cached = getCache(cacheKey);
-if (cached && cached.content && cached.content.length >= parseInt(minContent)) {
-console.log(`[CACHE-SERVED] ${requestKey} | Items: ${cached.content.length}`);
-return res.json({ ...cached, servedFromCache: true });
-}
+    // Check cache
+    const cacheKey = `feed_${contentType}_${userId}`;
+    const cached = await getCache(cacheKey);
+    if (cached && cached.content && cached.content.length >= parseInt(minContent)) {
+      console.log(`[CACHE-SERVED] ${requestKey} | Items: ${cached.content.length}`);
+      return res.json({ ...cached, servedFromCache: true });
+    }
 
-const requestPromise = (async () => {
-try {
-const dbReadsBefore = dbOpCounters.reads;
+    const requestPromise = (async () => {
+      try {
+        const dbReadsBefore = dbOpCounters.reads;
 
-const feedData = await dbManager.getOptimizedFeedFixedReads(userId, contentType, parseInt(minContent));
-const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
+        // ✅ USE STRICT SLOT ALGORITHM
+        const feedData = await dbManager.getOptimizedFeedFixedReads(
+          userId, 
+          contentType, 
+          parseInt(minContent)
+        );
+        
+        const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
 
-console.log(`[FEED-DB-QUERY] ${requestKey} | DB reads: ${dbReadsUsed} | Items: ${feedData.content?.length || 0}`);
+        console.log(`[FEED-DB-QUERY] ${requestKey} | DB reads: ${dbReadsUsed} | Items: ${feedData.content?.length || 0}`);
 
-if (feedData.content && feedData.content.length > 0) {
-// **APPLY INSTAGRAM-STYLE SORTING**
-// Note: This is post-query sorting. For better performance,
-// the scoring should be done in the database query itself.
+        // ✅ Verify read count (should be MAX 7)
+        if (dbReadsUsed > 7) {
+          console.warn(`⚠️ [READ-LIMIT-EXCEEDED] ${contentType} used ${dbReadsUsed} reads (limit: 7)`);
+        }
 
-// Find max values for normalization
-const maxLikes = Math.max(...feedData.content.map(item => item.likeCount || 0), 1);
-const maxComments = Math.max(...feedData.content.map(item => item.commentCount || 0), 1);
-const maxRetention = Math.max(...feedData.content.map(item => item.retention || 0), 1);
+        // Cache for 30 seconds
+        if (feedData.content && feedData.content.length > 0) {
+          await setCache(cacheKey, feedData, 30000);
+        }
 
-feedData.content.forEach(item => {
-const retention = item.retention || 0;
-const normalizedLikes = (item.likeCount || 0) / maxLikes * 100;
-const normalizedComments = (item.commentCount || 0) / maxComments * 100;
+        return {
+          success: true,
+          ...feedData,
+          requestedMinimum: parseInt(minContent),
+          actualDelivered: feedData.content ? feedData.content.length : 0,
+          dbReadsUsed,
+          readLimitCompliant: dbReadsUsed <= 7
+        };
+      } finally {
+        activeRequests.delete(requestKey);
+      }
+    })();
 
-// Calculate composite score
-item.compositeScore =
-(retention * 0.50) + // 50% retention
-(normalizedLikes * 0.30) + // 30% likes
-(normalizedComments * 0.20); // 20% comments
-});
+    activeRequests.set(requestKey, requestPromise);
+    const result = await requestPromise;
+    return res.json(result);
 
-// Sort by composite score
-feedData.content.sort((a, b) => {
-// First by composite score
-if (Math.abs(a.compositeScore - b.compositeScore) > 1) {
-return b.compositeScore - a.compositeScore;
-}
-
-// If scores are very close, use timestamp as tiebreaker
-const timeA = new Date(a.timestamp || a.serverTimestamp || 0);
-const timeB = new Date(b.timestamp || b.serverTimestamp || 0);
-return timeB - timeA;
-});
-
-// Cache for 60 seconds
-setCache(cacheKey, feedData, 60000);
-
-console.log(`[INSTAGRAM-SORT] Applied weighted scoring (Retention=50%, Likes=30%, Comments=20%)`);
-}
-
-return {
-success: true,
-...feedData,
-requestedMinimum: parseInt(minContent),
-actualDelivered: feedData.content ? feedData.content.length : 0,
-dbReadsUsed,
-algorithm: {
-weights: { retention: 50, likes: 30, comments: 20 },
-normalization: { maxLikes, maxComments, maxRetention }
-}
-};
-} finally {
-activeRequests.delete(requestKey);
-}
-})();
-
-activeRequests.set(requestKey, requestPromise);
-const result = await requestPromise;
-return res.json(result);
-
-} catch (e) {
-console.error(`[FEED-ERROR] ${e.message}`);
-return res.status(500).json({ error: 'Failed to load feed', details: e.message });
-}
+  } catch (e) {
+    console.error(`[FEED-ERROR] ${e.message}`);
+    return res.status(500).json({ error: 'Failed to load feed', details: e.message });
+  }
 });
 
 app.post('/api/contributed-views/batch-optimized', async (req, res) => {
@@ -5896,136 +5988,67 @@ duration: Date.now() - startTime
 
 
 
-/**
-* POST /api/feed/mixed-optimized
-* Returns mixed posts + reels with 6-content guarantee
-* Implements progressive slot fallback
-*/
 app.post('/api/feed/mixed-optimized', async (req, res) => {
-const startTime = Date.now();
-const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
+  const startTime = Date.now();
+  const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
 
-try {
-console.log(`[post_algorithm] [MIXED-FEED-START] userId=${userId} | target=${limit}`);
+  try {
+    console.log(`[MIXED-FEED] START userId=${userId} | limit=${limit}`);
 
-const mixedContent = [];
-const TARGET_CONTENT = Math.max(limit, DEFAULT_CONTENT_BATCH_SIZE);
+    const dbReadsBefore = dbOpCounters.reads;
 
-// Phase 1: Latest Reels
-console.log(`[post_algorithm] [PHASE-1] Fetching latest reels`);
-const latestReelsResult = await dbManager.getOptimizedFeedFixedReads(
-userId, 'reels', TARGET_CONTENT
-);
+    // ✅ Fetch reels and posts using strict algorithm (in parallel)
+    const [reelsResult, postsResult] = await Promise.all([
+      dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(limit * 0.6)),
+      dbManager.getOptimizedFeedFixedReads(userId, 'posts', Math.ceil(limit * 0.4))
+    ]);
 
-mixedContent.push(...latestReelsResult.content);
-console.log(`[post_algorithm] [PHASE-1-COMPLETE] Got ${latestReelsResult.content.length} reels | Total: ${mixedContent.length}/${TARGET_CONTENT}`);
+    // Merge and sort by engagement
+    const mixedContent = [...reelsResult.content, ...postsResult.content];
+    
+    mixedContent.sort((a, b) => {
+      const retentionDiff = (b.retention || 0) - (a.retention || 0);
+      if (Math.abs(retentionDiff) > 1) return retentionDiff;
 
-if (mixedContent.length >= TARGET_CONTENT) {
-console.log(`[post_algorithm] [TARGET-REACHED-PHASE-1] ✅ Sufficient content from latest reels only`);
-return sendMixedResponse(res, mixedContent, startTime, 1);
-}
+      const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+      if (likesDiff !== 0) return likesDiff;
 
-// Phase 2: Latest Posts
-console.log(`[post_algorithm] [PHASE-2] Need ${TARGET_CONTENT - mixedContent.length} more - fetching latest posts`);
-const latestPostsResult = await dbManager.getOptimizedFeedFixedReads(
-userId, 'posts', TARGET_CONTENT - mixedContent.length
-);
+      return (b.commentCount || 0) - (a.commentCount || 0);
+    });
 
-mixedContent.push(...latestPostsResult.content);
-console.log(`[post_algorithm] [PHASE-2-COMPLETE] Got ${latestPostsResult.content.length} posts | Total: ${mixedContent.length}/${TARGET_CONTENT}`);
+    const dbReadsUsed = dbOpCounters.reads - dbReadsBefore;
+    const duration = Date.now() - startTime;
 
-if (mixedContent.length >= TARGET_CONTENT) {
-console.log(`[post_algorithm] [TARGET-REACHED-PHASE-2] ✅ Sufficient content from latest slots`);
-return sendMixedResponse(res, mixedContent, startTime, 2);
-}
+    console.log(`[MIXED-FEED] COMPLETE: ${mixedContent.length} items (${reelsResult.content.length}R + ${postsResult.content.length}P) | ${duration}ms | Reads: ${dbReadsUsed}`);
 
-// Phase 3: Normal Reels
-console.log(`[post_algorithm] [PHASE-3] Need ${TARGET_CONTENT - mixedContent.length} more - fetching normal reels`);
-const normalReelsResult = await dbManager.getOptimizedFeedFixedReads(
-userId, 'reels', TARGET_CONTENT - mixedContent.length
-);
+    return res.json({
+      success: true,
+      content: mixedContent.slice(0, limit),
+      metadata: {
+        totalItems: mixedContent.length,
+        reelsCount: reelsResult.content.length,
+        postsCount: postsResult.content.length,
+        dbReadsUsed,
+        duration,
+        readLimitCompliant: dbReadsUsed <= 14, // 7 per content type
+        slotsRead: {
+          reels: reelsResult.metadata?.slotsRead || [],
+          posts: postsResult.metadata?.slotsRead || []
+        }
+      }
+    });
 
-const normalReelsFiltered = normalReelsResult.content.filter(item =>
-!mixedContent.some(existing => existing.postId === item.postId)
-);
-
-mixedContent.push(...normalReelsFiltered);
-console.log(`[post_algorithm] [PHASE-3-COMPLETE] Got ${normalReelsFiltered.length} new reels | Total: ${mixedContent.length}/${TARGET_CONTENT}`);
-
-if (mixedContent.length >= TARGET_CONTENT) {
-console.log(`[post_algorithm] [TARGET-REACHED-PHASE-3] ✅ Sufficient content including normal reels`);
-return sendMixedResponse(res, mixedContent, startTime, 3);
-}
-
-// Phase 4: Normal Posts
-console.log(`[post_algorithm] [PHASE-4] Need ${TARGET_CONTENT - mixedContent.length} more - fetching normal posts`);
-const normalPostsResult = await dbManager.getOptimizedFeedFixedReads(
-userId, 'posts', TARGET_CONTENT - mixedContent.length
-);
-
-const normalPostsFiltered = normalPostsResult.content.filter(item =>
-!mixedContent.some(existing => existing.postId === item.postId)
-);
-
-mixedContent.push(...normalPostsFiltered);
-console.log(`[post_algorithm] [PHASE-4-COMPLETE] Got ${normalPostsFiltered.length} new posts | Total: ${mixedContent.length}/${TARGET_CONTENT}`);
-
-if (mixedContent.length >= TARGET_CONTENT) {
-console.log(`[post_algorithm] [TARGET-REACHED-PHASE-4] ✅ Sufficient content from all normal slots`);
-return sendMixedResponse(res, mixedContent, startTime, 4);
-}
-
-// Phase 5: Previous slots (if still insufficient)
-console.log(`[post_algorithm] [PHASE-5] ⚠️ Still need ${TARGET_CONTENT - mixedContent.length} more - trying previous slots`);
-
-// Get user status to find previous slot
-const userStatus = await db.collection('user_status').findOne({ _id: userId });
-
-if (userStatus && userStatus.normalReelSlotId) {
-const previousSlotId = calculatePreviousSlot(userStatus.normalReelSlotId);
-
-if (previousSlotId) {
-console.log(`[post_algorithm] [PHASE-5-PREVIOUS] Trying slot: ${previousSlotId}`);
-
-const previousResult = await db.collection('reels').aggregate([
-{ $match: { _id: previousSlotId } },
-{ $unwind: '$reelsList' },
-{ $limit: TARGET_CONTENT - mixedContent.length },
-{ $project: { content: '$reelsList' } }
-]).toArray();
-
-const previousContent = previousResult.map(r => r.content);
-const previousFiltered = previousContent.filter(item =>
-!mixedContent.some(existing => existing.postId === item.postId)
-);
-
-mixedContent.push(...previousFiltered);
-console.log(`[post_algorithm] [PHASE-5-COMPLETE] Got ${previousFiltered.length} from previous | Total: ${mixedContent.length}/${TARGET_CONTENT}`);
-}
-}
-
-// Final check
-if (mixedContent.length < TARGET_CONTENT) {
-console.warn(`[post_algorithm] [INSUFFICIENT-CONTENT] ⚠️ Only got ${mixedContent.length}/${TARGET_CONTENT} items after all phases`);
-} else {
-console.log(`[post_algorithm] [TARGET-REACHED-FINAL] ✅ Got ${mixedContent.length} items total`);
-}
-
-return sendMixedResponse(res, mixedContent, startTime, 5);
-
-} catch (error) {
-console.error(`[post_algorithm] [MIXED-FEED-ERROR]`, error);
-return res.status(500).json({
-success: false,
-error: error.message,
-duration: Date.now() - startTime
-});
-}
+  } catch (error) {
+    console.error(`[MIXED-FEED] ERROR: ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+      duration: Date.now() - startTime
+    });
+  }
 });
 
-/**
-* Helper: Send mixed content response with metadata
-*/
+
 function sendMixedResponse(res, mixedContent, startTime, phaseReached) {
 const duration = Date.now() - startTime;
 
