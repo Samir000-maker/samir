@@ -594,6 +594,32 @@ async function createAllProductionIndexes() {
     // ============================================================
     // CRITICAL: Feed Query Optimization (covers entire aggregation pipeline)
     // ============================================================
+    
+    
+    
+    // ============================================================
+// FAST SLOT LOOKUP FOR CONTRIBUTION TRACKING
+// ============================================================
+{
+  collection: 'reels',
+  index: { 'reelsList.postId': 1 },
+  options: { 
+    name: 'postId_to_slot_lookup_reels',
+    background: true,
+    sparse: true
+  }
+},
+{
+  collection: 'posts',
+  index: { 'postList.postId': 1 },
+  options: { 
+    name: 'postId_to_slot_lookup_posts',
+    background: true,
+    sparse: true
+  }
+},
+    
+    
     {
       collection: 'reels',
       index: { 
@@ -3288,27 +3314,36 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
-    // ✅ NEW FORMAT: Client sends { postId, slotId }
-    // Example: reels = [{ postId: "abc123", slotId: "reel_10" }, ...]
-    
     console.log(`[BATCH-START] userId=${userId} | ${posts.length}P + ${reels.length}R`);
 
     const postOperations = [];
     const reelOperations = [];
+    
+    // ✅ Track which slots we need to query
+    const reelSlotLookups = [];
+    const postSlotLookups = [];
 
-    // ✅ Process posts (client provides slotId)
-    for (const item of posts) {
+    // ✅ Process reels - get slot for each postId
+    for (const item of reels) {
       const postId = typeof item === 'string' ? item : item.postId;
-      const slotId = typeof item === 'object' ? item.slotId : await getSlotForPost(postId);
+      
+      // Check if client provided slotId
+      let slotId = typeof item === 'object' ? item.slotId : null;
       
       if (!slotId) {
-        console.warn(`[BATCH-SKIP-POST] ${postId} - slot not found`);
+        console.log(`[BATCH-REEL-LOOKUP] ${postId.substring(0, 8)} - client didn't provide slotId, looking up...`);
+        slotId = await getSlotForReel(postId);
+        reelSlotLookups.push(postId);
+      }
+      
+      if (!slotId) {
+        console.warn(`[BATCH-SKIP-REEL] ${postId} - slot not found in any document`);
         continue;
       }
 
-      console.log(`[BATCH-POST] ${postId.substring(0, 8)} → ${slotId}`);
+      console.log(`[BATCH-REEL] ${postId.substring(0, 8)} → ${slotId}`);
 
-      postOperations.push({
+      reelOperations.push({
         updateOne: {
           filter: { 
             userId: userId,
@@ -3328,26 +3363,32 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
-    // ✅ Process reels (client provides slotId)
-    for (const item of reels) {
-      const reelId = typeof item === 'string' ? item : item.postId;
-      const slotId = typeof item === 'object' ? item.slotId : await getSlotForReel(reelId);
+    // ✅ Process posts (same logic)
+    for (const item of posts) {
+      const postId = typeof item === 'string' ? item : item.postId;
+      let slotId = typeof item === 'object' ? item.slotId : null;
       
       if (!slotId) {
-        console.warn(`[BATCH-SKIP-REEL] ${reelId} - slot not found`);
+        console.log(`[BATCH-POST-LOOKUP] ${postId.substring(0, 8)} - client didn't provide slotId, looking up...`);
+        slotId = await getSlotForPost(postId);
+        postSlotLookups.push(postId);
+      }
+      
+      if (!slotId) {
+        console.warn(`[BATCH-SKIP-POST] ${postId} - slot not found`);
         continue;
       }
 
-      console.log(`[BATCH-REEL] ${reelId.substring(0, 8)} → ${slotId}`);
+      console.log(`[BATCH-POST] ${postId.substring(0, 8)} → ${slotId}`);
 
-      reelOperations.push({
+      postOperations.push({
         updateOne: {
           filter: { 
             userId: userId,
             slotId: slotId
           },
           update: {
-            $addToSet: { ids: reelId },
+            $addToSet: { ids: postId },
             $setOnInsert: {
               userId: userId,
               slotId: slotId,
@@ -3380,6 +3421,10 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
     const duration = Date.now() - startTime;
 
     console.log(`[BATCH-COMPLETE] userId=${userId} | ${postOperations.length}P + ${reelOperations.length}R operations in ${duration}ms`);
+    
+    if (reelSlotLookups.length > 0 || postSlotLookups.length > 0) {
+      console.warn(`[BATCH-PERFORMANCE] Had to lookup ${reelSlotLookups.length} reel slots + ${postSlotLookups.length} post slots - client should provide slotId`);
+    }
 
     res.json({
       success: true,
@@ -3401,6 +3446,10 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
           modified: reelResults.modifiedCount || 0
         }
       },
+      performance: {
+        reelSlotLookups: reelSlotLookups.length,
+        postSlotLookups: postSlotLookups.length
+      },
       requestId,
       duration
     });
@@ -3420,7 +3469,6 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
 
 const slotCache = new SimpleLRU(10000, 60000); // same config as before
 
-// Helper: Get slot ID for a post (with caching)
 async function getSlotForPost(postId) {
   const cacheKey = `slot:post:${postId}`;
   
@@ -3428,14 +3476,20 @@ async function getSlotForPost(postId) {
     return slotCache.get(cacheKey);
   }
 
-  const doc = await db.collection('posts').findOne(
-    { 'postList.postId': postId },
-    { projection: { _id: 1 } }
-  );
+  // ✅ CRITICAL FIX: Use aggregation to find exact slot
+  const result = await db.collection('posts').aggregate([
+    { $match: { 'postList.postId': postId } },
+    { $limit: 1 },
+    { $project: { _id: 1 } }
+  ]).toArray();
 
-  const slotId = doc?._id || null;
+  const slotId = result.length > 0 ? result[0]._id : null;
+  
   if (slotId) {
     slotCache.set(cacheKey, slotId);
+    console.log(`[SLOT-LOOKUP] ${postId.substring(0, 8)} found in ${slotId}`);
+  } else {
+    console.warn(`[SLOT-LOOKUP-FAILED] ${postId.substring(0, 8)} not found in any slot`);
   }
   
   return slotId;
@@ -3450,14 +3504,20 @@ async function getSlotForReel(reelId) {
     return slotCache.get(cacheKey);
   }
 
-  const doc = await db.collection('reels').findOne(
-    { 'reelsList.postId': reelId },
-    { projection: { _id: 1 } }
-  );
+  // ✅ CRITICAL FIX: Use aggregation to find exact slot
+  const result = await db.collection('reels').aggregate([
+    { $match: { 'reelsList.postId': reelId } },
+    { $limit: 1 },
+    { $project: { _id: 1 } }
+  ]).toArray();
 
-  const slotId = doc?._id || null;
+  const slotId = result.length > 0 ? result[0]._id : null;
+  
   if (slotId) {
     slotCache.set(cacheKey, slotId);
+    console.log(`[SLOT-LOOKUP] ${reelId.substring(0, 8)} found in ${slotId}`);
+  } else {
+    console.warn(`[SLOT-LOOKUP-FAILED] ${reelId.substring(0, 8)} not found in any slot`);
   }
   
   return slotId;
