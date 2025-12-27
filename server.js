@@ -19,6 +19,7 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@clus
 const DB_NAME = process.env.DB_NAME || 'appdb';
 const axios = require('axios');
 const Redis = require('ioredis');
+const LRU = require('lru-cache');
 const activeRequestsWithTimestamp = new Map();
 const REQUEST_DEDUP_TTL = 5000; // 5 seconds
 const requestDeduplication = new Map();
@@ -76,18 +77,15 @@ console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entrie
 }, 60000);
 
 
-const getOrCreateRequest = (key, requestFactory) => {
-const now = Date.now();
-
-const LRU = require('lru-cache');  // npm install lru-cache
-
+// ✅ NEW CODE (USE THIS)
+// Request deduplication with automatic cleanup (prevents memory leaks)
 const activeRequests = new LRU({
   max: 1000,              // Max 1000 concurrent requests
-  ttl: 5000,              // 5 second TTL
+  ttl: 5000,              // 5 second TTL (5000ms)
   updateAgeOnGet: false,  // Don't refresh on access
   updateAgeOnHas: false,
   
-  // ✅ Automatic cleanup callback
+  // Automatic cleanup callback
   dispose: (value, key) => {
     console.log(`[REQUEST-CLEANUP] Removed expired request: ${key}`);
   }
@@ -96,7 +94,7 @@ const activeRequests = new LRU({
 const getOrCreateRequest = (key, requestFactory) => {
   // Check if request already exists
   if (activeRequests.has(key)) {
-    console.log(`[REQUEST-DEDUP] ${key} - using existing request`);
+    console.log(`[REQUEST-DEDUP] ${key} - using existing request | Active: ${activeRequests.size}`);
     return activeRequests.get(key);
   }
 
@@ -3190,9 +3188,13 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
   }
 });
 
-// ✅ HELPER: Cache slot lookups (critical for performance)
-const slotCache = new LRU({ max: 10000, ttl: 60000 });  // 1 minute cache
+// ✅ Slot lookup cache (critical for batch operations performance)
+const slotCache = new LRU({ 
+  max: 10000,      // Cache up to 10,000 postId -> slotId mappings
+  ttl: 60000       // 1 minute cache (60,000ms)
+});
 
+// Helper: Get slot ID for a post (with caching)
 async function getSlotForPost(postId) {
   const cacheKey = `slot:post:${postId}`;
   
@@ -3202,6 +3204,27 @@ async function getSlotForPost(postId) {
 
   const doc = await db.collection('posts').findOne(
     { 'postList.postId': postId },
+    { projection: { _id: 1 } }
+  );
+
+  const slotId = doc?._id || null;
+  if (slotId) {
+    slotCache.set(cacheKey, slotId);
+  }
+  
+  return slotId;
+}
+
+// Helper: Get slot ID for a reel (with caching)
+async function getSlotForReel(reelId) {
+  const cacheKey = `slot:reel:${reelId}`;
+  
+  if (slotCache.has(cacheKey)) {
+    return slotCache.get(cacheKey);
+  }
+
+  const doc = await db.collection('reels').findOne(
+    { 'reelsList.postId': reelId },
     { projection: { _id: 1 } }
   );
 
