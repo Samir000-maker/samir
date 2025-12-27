@@ -13,7 +13,6 @@ const express = require('express');
 const { MongoClient } = require('mongodb');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const activeRequests = new Map();
 const app = express();
 const PORT = process.env.PORT || 7000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/appdb?retryWrites=true&w=majority';
@@ -80,6 +79,37 @@ console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entrie
 const getOrCreateRequest = (key, requestFactory) => {
 const now = Date.now();
 
+const LRU = require('lru-cache');  // npm install lru-cache
+
+const activeRequests = new LRU({
+  max: 1000,              // Max 1000 concurrent requests
+  ttl: 5000,              // 5 second TTL
+  updateAgeOnGet: false,  // Don't refresh on access
+  updateAgeOnHas: false,
+  
+  // ✅ Automatic cleanup callback
+  dispose: (value, key) => {
+    console.log(`[REQUEST-CLEANUP] Removed expired request: ${key}`);
+  }
+});
+
+const getOrCreateRequest = (key, requestFactory) => {
+  // Check if request already exists
+  if (activeRequests.has(key)) {
+    console.log(`[REQUEST-DEDUP] ${key} - using existing request`);
+    return activeRequests.get(key);
+  }
+
+  // Create new request
+  const promise = requestFactory().finally(() => {
+    activeRequests.delete(key);  // Auto-cleanup
+  });
+
+  activeRequests.set(key, promise);
+  return promise;
+};
+  
+  
 // Quick inline cleanup (don't iterate entire map)
 if (activeRequestsWithTimestamp.size > 1000) {
 console.warn(`[REQUEST-MAP-WARNING] Map size: ${activeRequestsWithTimestamp.size} - forcing cleanup`);
@@ -376,39 +406,6 @@ const ts = new Date().toISOString();
 if (level === 'error') return console.error(`[${level.toUpperCase()}] ${ts}`, ...args);
 if (level === 'warn') return console.warn(`[${level.toUpperCase()}] ${ts}`, ...args);
 return console.log(`[${level.toUpperCase()}] ${ts}`, ...args);
-};
-
-
-
-
-const LRU = require('lru-cache');  // npm install lru-cache
-
-const activeRequests = new LRU({
-  max: 1000,              // Max 1000 concurrent requests
-  ttl: 5000,              // 5 second TTL
-  updateAgeOnGet: false,  // Don't refresh on access
-  updateAgeOnHas: false,
-  
-  // ✅ Automatic cleanup callback
-  dispose: (value, key) => {
-    console.log(`[REQUEST-CLEANUP] Removed expired request: ${key}`);
-  }
-});
-
-const getOrCreateRequest = (key, requestFactory) => {
-  // Check if request already exists
-  if (activeRequests.has(key)) {
-    console.log(`[REQUEST-DEDUP] ${key} - using existing request`);
-    return activeRequests.get(key);
-  }
-
-  // Create new request
-  const promise = requestFactory().finally(() => {
-    activeRequests.delete(key);  // Auto-cleanup
-  });
-
-  activeRequests.set(key, promise);
-  return promise;
 };
 
 
