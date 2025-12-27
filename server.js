@@ -3202,11 +3202,7 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
   }
 });
 
-// ✅ Slot lookup cache (critical for batch operations performance)
-const slotCache = new LRU({ 
-  max: 10000,      // Cache up to 10,000 postId -> slotId mappings
-  ttl: 60000       // 1 minute cache (60,000ms)
-});
+const slotCache = new SimpleLRU(10000, 60000); // same config as before
 
 // Helper: Get slot ID for a post (with caching)
 async function getSlotForPost(postId) {
