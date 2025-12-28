@@ -5382,38 +5382,152 @@ app.post('/api/debug/feed-analysis', async (req, res) => {
         let postSlotsToRead = [];
 
         if (isNewUser) {
-            // ✅ FRESH USER: Read latest, latest-1, latest-2
-            const latestReelDoc = await db.collection('reels').findOne(
-                {},
-                { sort: { index: -1 }, projection: { index: 1 } }
-            );
+  // ✅ FRESH USER: Read latest, latest-1, latest-2
+  const latestReelDoc = await db.collection('reels').findOne(
+    {},
+    { sort: { index: -1 }, projection: { index: 1 } }
+  );
 
-            const latestPostDoc = await db.collection('posts').findOne(
-                {},
-                { sort: { index: -1 }, projection: { index: 1 } }
-            );
+  const latestPostDoc = await db.collection('posts').findOne(
+    {},
+    { sort: { index: -1 }, projection: { index: 1 } }
+  );
 
-            if (latestReelDoc) {
-                const latestIndex = latestReelDoc.index;
-                reelSlotsToRead = [
-                    `reel_${latestIndex}`,
-                    `reel_${Math.max(latestIndex - 1, 0)}`,
-                    `reel_${Math.max(latestIndex - 2, 0)}`
-                ];
-            }
+  if (latestReelDoc) {
+    const latestIndex = latestReelDoc.index;
+    reelSlotsToRead = [
+      `reel_${latestIndex}`,
+      `reel_${Math.max(latestIndex - 1, 0)}`,
+      `reel_${Math.max(latestIndex - 2, 0)}`
+    ];
+  }
 
-            if (latestPostDoc) {
-                const latestIndex = latestPostDoc.index;
-                postSlotsToRead = [
-                    `post_${latestIndex}`,
-                    `post_${Math.max(latestIndex - 1, 0)}`,
-                    `post_${Math.max(latestIndex - 2, 0)}`
-                ];
-            }
+  if (latestPostDoc) {
+    const latestIndex = latestPostDoc.index;
+    postSlotsToRead = [
+      `post_${latestIndex}`,
+      `post_${Math.max(latestIndex - 1, 0)}`,
+      `post_${Math.max(latestIndex - 2, 0)}`
+    ];
+  }
 
-            console.log(`[FEED-ANALYSIS] NEW USER | Will read: reels=[${reelSlotsToRead.join(', ')}] posts=[${postSlotsToRead.join(', ')}]`);
+  console.log(`[FEED-ANALYSIS] NEW USER | Will read: reels=[${reelSlotsToRead.join(', ')}] posts=[${postSlotsToRead.join(', ')}]`);
+  console.log(`[FEED-ANALYSIS] NEW USER | After viewing, will save: latestReel=${reelSlotsToRead[0]}, normalReel=${reelSlotsToRead[2]}`);
 
-        } else {
+} else {
+  // ✅ RETURNING USER: Check for newer slot first
+  const latestReelNum = parseInt(userStatus.latestReelSlotId?.split('_')[1] || '0');
+  const normalReelNum = parseInt(userStatus.normalReelSlotId?.split('_')[1] || '0');
+  
+  const latestPostNum = parseInt(userStatus.latestPostSlotId?.split('_')[1] || '0');
+  const normalPostNum = parseInt(userStatus.normalPostSlotId?.split('_')[1] || '0');
+
+  // ✅ CRITICAL: Check for newer reel slot (reel_11 if latest is reel_10)
+  const newerReelSlotId = `reel_${latestReelNum + 1}`;
+  const newerReelExists = await db.collection('reels').findOne(
+    { _id: newerReelSlotId },
+    { projection: { _id: 1 } }
+  );
+
+  if (newerReelExists) {
+    // Found newer slot: read [reel_11, reel_8, reel_7]
+    reelSlotsToRead = [
+      newerReelSlotId,                                    // reel_11
+      userStatus.normalReelSlotId,                        // reel_8
+      `reel_${Math.max(normalReelNum - 1, 0)}`          // reel_7
+    ];
+    
+    console.log(`[FEED-ANALYSIS] RETURNING USER | Found newer slot ${newerReelSlotId}`);
+    console.log(`[FEED-ANALYSIS] RETURNING USER | Will read: [${reelSlotsToRead.join(', ')}]`);
+    console.log(`[FEED-ANALYSIS] RETURNING USER | After viewing, will save: latestReel=${newerReelSlotId}, normalReel=${reelSlotsToRead[2]}`);
+  } else {
+    // No newer slot: read backward from normalSlot
+    // ✅ SPECIAL CASE: If normalReelSlotId is reel_0, can't go backward
+    if (normalReelNum === 0) {
+      console.log(`[FEED-ANALYSIS] RETURNING USER | Reached reel_0, checking for any newer slots beyond ${userStatus.latestReelSlotId}`);
+      
+      // Check if there are ANY newer slots beyond latestSlot
+      const allNewerSlots = [];
+      for (let i = latestReelNum + 1; i <= latestReelNum + 10; i++) {
+        const checkSlot = `reel_${i}`;
+        const exists = await db.collection('reels').findOne(
+          { _id: checkSlot },
+          { projection: { _id: 1 } }
+        );
+        if (exists) allNewerSlots.push(checkSlot);
+        else break;
+      }
+
+      if (allNewerSlots.length > 0) {
+        // Found newer slots, read latest 3
+        reelSlotsToRead = allNewerSlots.slice(-3);
+        console.log(`[FEED-ANALYSIS] RETURNING USER | Found ${allNewerSlots.length} newer slots, reading latest 3: [${reelSlotsToRead.join(', ')}]`);
+      } else {
+        // No newer slots, re-read from latestSlot backward
+        reelSlotsToRead = [
+          userStatus.latestReelSlotId,                    // reel_10
+          `reel_${Math.max(latestReelNum - 1, 0)}`,      // reel_9
+          `reel_${Math.max(latestReelNum - 2, 0)}`       // reel_8
+        ];
+        console.log(`[FEED-ANALYSIS] RETURNING USER | No newer slots, re-reading: [${reelSlotsToRead.join(', ')}]`);
+      }
+    } else {
+      // Normal case: read backward from normalSlot
+      reelSlotsToRead = [
+        userStatus.normalReelSlotId,                      // reel_8
+        `reel_${Math.max(normalReelNum - 1, 0)}`,        // reel_7
+        `reel_${Math.max(normalReelNum - 2, 0)}`         // reel_6
+      ];
+      
+      console.log(`[FEED-ANALYSIS] RETURNING USER | No newer slot, reading backward from normalSlot`);
+      console.log(`[FEED-ANALYSIS] RETURNING USER | Will read: [${reelSlotsToRead.join(', ')}]`);
+      console.log(`[FEED-ANALYSIS] RETURNING USER | After viewing, will save: latestReel=${userStatus.latestReelSlotId} (unchanged), normalReel=${reelSlotsToRead[2]}`);
+    }
+  }
+
+  // Same logic for posts
+  const newerPostSlotId = `post_${latestPostNum + 1}`;
+  const newerPostExists = await db.collection('posts').findOne(
+    { _id: newerPostSlotId },
+    { projection: { _id: 1 } }
+  );
+
+  if (newerPostExists) {
+    postSlotsToRead = [
+      newerPostSlotId,
+      userStatus.normalPostSlotId,
+      `post_${Math.max(normalPostNum - 1, 0)}`
+    ];
+  } else {
+    if (normalPostNum === 0) {
+      const allNewerSlots = [];
+      for (let i = latestPostNum + 1; i <= latestPostNum + 10; i++) {
+        const checkSlot = `post_${i}`;
+        const exists = await db.collection('posts').findOne({ _id: checkSlot }, { projection: { _id: 1 } });
+        if (exists) allNewerSlots.push(checkSlot);
+        else break;
+      }
+
+      if (allNewerSlots.length > 0) {
+        postSlotsToRead = allNewerSlots.slice(-3);
+      } else {
+        postSlotsToRead = [
+          userStatus.latestPostSlotId,
+          `post_${Math.max(latestPostNum - 1, 0)}`,
+          `post_${Math.max(latestPostNum - 2, 0)}`
+        ];
+      }
+    } else {
+      postSlotsToRead = [
+        userStatus.normalPostSlotId,
+        `post_${Math.max(normalPostNum - 1, 0)}`,
+        `post_${Math.max(normalPostNum - 2, 0)}`
+      ];
+    }
+  }
+
+  console.log(`[FEED-ANALYSIS] RETURNING USER | Posts: [${postSlotsToRead.join(', ')}]`);
+} else {
             // ✅ RETURNING USER: Check for newer slot first
             const latestReelNum = parseInt(userStatus.latestReelSlotId?.split('_')[1] || '0');
             const normalReelNum = parseInt(userStatus.normalReelSlotId?.split('_')[1] || '0');
@@ -5798,229 +5912,212 @@ res.status(500).json({ success: false, error: err.message });
 
 
 
-// REPLACE all optimized endpoints in server.js with these FIXED versions
-// Tag: post_algorithm
-
-/**
-* GET /api/user-status/optimized/:userId
-* Returns slot IDs from user_status collection
-* For NEW users: Auto-detects latest reel/post documents and creates user_status
-* READ COUNT: 1-3 (user_status + optional reels/posts collection check for new users)
-*/
 app.get('/api/user-status/:userId', async (req, res) => {
-const startTime = Date.now();
-const { userId } = req.params;
+  const startTime = Date.now();
+  const { userId } = req.params;
 
-try {
-console.log(`[post_algorithm] [READ-1-START] user_status lookup for userId=${userId}`);
+  try {
+    console.log(`[post_algorithm] [READ-1-START] user_status lookup for userId=${userId}`);
 
-// ✅ CRITICAL FIX: Read document where _id = userId
-const userStatus = await db.collection('user_status').findOne(
-{ _id: userId },
-{
-projection: {
-_id: 1,
-userId: 1,
-latestReelSlotId: 1,
-normalReelSlotId: 1,
-latestPostSlotId: 1,
-normalPostSlotId: 1
-}
-}
-);
+    const userStatus = await db.collection('user_status').findOne(
+      { _id: userId },
+      {
+        projection: {
+          _id: 1,
+          userId: 1,
+          latestReelSlotId: 1,
+          normalReelSlotId: 1,
+          latestPostSlotId: 1,
+          normalPostSlotId: 1
+        }
+      }
+    );
 
-const duration = Date.now() - startTime;
+    const duration = Date.now() - startTime;
 
-if (userStatus && userStatus.latestReelSlotId) {
-// ✅ CASE 1: User status exists with correct fields - return it
-let latestReelSlot = userStatus.latestReelSlotId || 'reel_0';
-let normalReelSlot = userStatus.normalReelSlotId || 'reel_0';
+    if (userStatus && userStatus.latestReelSlotId) {
+      // Case 1: User exists with correct fields
+      let latestReelSlot = userStatus.latestReelSlotId || 'reel_0';
+      let normalReelSlot = userStatus.normalReelSlotId || 'reel_0';
 
-// Standardize naming (reel_ not reels_)
-if (latestReelSlot.startsWith('reels_')) {
-latestReelSlot = latestReelSlot.replace('reels_', 'reel_');
-}
-if (normalReelSlot.startsWith('reels_')) {
-normalReelSlot = normalReelSlot.replace('reels_', 'reel_');
-}
+      if (latestReelSlot.startsWith('reels_')) {
+        latestReelSlot = latestReelSlot.replace('reels_', 'reel_');
+      }
+      if (normalReelSlot.startsWith('reels_')) {
+        normalReelSlot = normalReelSlot.replace('reels_', 'reel_');
+      }
 
-console.log(`[post_algorithm] [READ-1-SUCCESS] user_status EXISTS | duration=${duration}ms | latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${userStatus.latestPostSlotId || 'post_0'} | normalPost=${userStatus.normalPostSlotId || 'post_0'}`);
+      console.log(`[post_algorithm] [READ-1-SUCCESS] user_status EXISTS | duration=${duration}ms | latestReel=${latestReelSlot} | normalReel=${normalReelSlot}`);
 
-return res.json({
-success: true,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: userStatus.latestPostSlotId || 'post_0',
-normalPostSlotId: userStatus.normalPostSlotId || 'post_0',
-reads: 1,
-duration
-});
-} else if (userStatus && !userStatus.latestReelSlotId) {
-// ✅ CASE 2: Document exists but missing fields (old format) - UPDATE it
-console.log(`[post_algorithm] [READ-1-INCOMPLETE] Document exists but missing slot fields - updating`);
+      return res.json({
+        success: true,
+        latestReelSlotId: latestReelSlot,
+        normalReelSlotId: normalReelSlot,
+        latestPostSlotId: userStatus.latestPostSlotId || 'post_0',
+        normalPostSlotId: userStatus.normalPostSlotId || 'post_0',
+        reads: 1,
+        duration
+      });
+    } else if (userStatus && !userStatus.latestReelSlotId) {
+      // Case 2: Document exists but missing fields
+      console.log(`[post_algorithm] [READ-1-INCOMPLETE] Document exists but missing slot fields - updating`);
 
-const detectionStart = Date.now();
+      const detectionStart = Date.now();
 
-// Get all reel document IDs and find the latest
-const reelDocs = await db.collection('reels')
-.find({}, { projection: { _id: 1 } })
-.toArray();
+      const reelDocs = await db.collection('reels')
+        .find({}, { projection: { _id: 1 } })
+        .toArray();
 
-const postDocs = await db.collection('posts')
-.find({}, { projection: { _id: 1 } })
-.toArray();
+      const postDocs = await db.collection('posts')
+        .find({}, { projection: { _id: 1 } })
+        .toArray();
 
-// Extract and sort reel IDs (e.g., reel_0, reel_1, reel_2, ...)
-const reelIds = reelDocs
-.map(doc => doc._id)
-.filter(id => id.startsWith('reel_'))
-.sort((a, b) => {
-const numA = parseInt(a.replace('reel_', ''), 10) || 0;
-const numB = parseInt(b.replace('reel_', ''), 10) || 0;
-return numB - numA; // Descending order (latest first)
-});
+      const reelIds = reelDocs
+        .map(doc => doc._id)
+        .filter(id => id.startsWith('reel_'))
+        .sort((a, b) => {
+          const numA = parseInt(a.replace('reel_', ''), 10) || 0;
+          const numB = parseInt(b.replace('reel_', ''), 10) || 0;
+          return numB - numA;
+        });
 
-// Extract and sort post IDs
-const postIds = postDocs
-.map(doc => doc._id)
-.filter(id => id.startsWith('post_'))
-.sort((a, b) => {
-const numA = parseInt(a.replace('post_', ''), 10) || 0;
-const numB = parseInt(b.replace('post_', ''), 10) || 0;
-return numB - numA; // Descending order (latest first)
-});
+      const postIds = postDocs
+        .map(doc => doc._id)
+        .filter(id => id.startsWith('post_'))
+        .sort((a, b) => {
+          const numA = parseInt(a.replace('post_', ''), 10) || 0;
+          const numB = parseInt(b.replace('post_', ''), 10) || 0;
+          return numB - numA;
+        });
 
-// Determine latest and normal (previous) slots
-const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
-const normalReelSlot = reelIds.length > 1 ? reelIds[1] : reelIds[0] || 'reel_0';
+      // ✅ CRITICAL FIX: For fresh user, normal = latest - 2 (not latest - 1)
+      const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
+      const normalReelSlot = reelIds.length > 2 ? reelIds[2] : (reelIds[0] || 'reel_0');  // ✅ FIXED: index 2, not 1
 
-const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
-const normalPostSlot = postIds.length > 1 ? postIds[1] : postIds[0] || 'post_0';
+      const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
+      const normalPostSlot = postIds.length > 2 ? postIds[2] : (postIds[0] || 'post_0');  // ✅ FIXED: index 2, not 1
 
-const detectionDuration = Date.now() - detectionStart;
+      const detectionDuration = Date.now() - detectionStart;
 
-console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
-console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
+      console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
+      console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
 
-// ✅ UPDATE existing document (don't insert)
-const updateResult = await db.collection('user_status').updateOne(
-{ _id: userId },
-{
-$set: {
-userId: userId,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: latestPostSlot,
-normalPostSlotId: normalPostSlot,
-updatedAt: new Date()
-},
-$setOnInsert: {
-createdAt: new Date()
-}
-}
-);
+      await db.collection('user_status').updateOne(
+        { _id: userId },
+        {
+          $set: {
+            userId: userId,
+            latestReelSlotId: latestReelSlot,
+            normalReelSlotId: normalReelSlot,
+            latestPostSlotId: latestPostSlot,
+            normalPostSlotId: normalPostSlot,
+            updatedAt: new Date()
+          },
+          $setOnInsert: {
+            createdAt: new Date()
+          }
+        }
+      );
 
-const totalDuration = Date.now() - startTime;
+      const totalDuration = Date.now() - startTime;
 
-console.log(`[post_algorithm] [READ-1-UPDATED] Document updated with detected slots | total_duration=${totalDuration}ms | reads=3`);
+      console.log(`[post_algorithm] [READ-1-UPDATED] Document updated with detected slots | total_duration=${totalDuration}ms | reads=3`);
 
-return res.json({
-success: true,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: latestPostSlot,
-normalPostSlotId: normalPostSlot,
-reads: 3,
-duration: totalDuration,
-wasIncomplete: true
-});
-} else {
-// ✅ CASE 3: No document exists at all - CREATE new one
-console.log(`[post_algorithm] [READ-1-NEW-USER] User status doesn't exist - auto-detecting latest documents`);
+      return res.json({
+        success: true,
+        latestReelSlotId: latestReelSlot,
+        normalReelSlotId: normalReelSlot,
+        latestPostSlotId: latestPostSlot,
+        normalPostSlotId: normalPostSlot,
+        reads: 3,
+        duration: totalDuration,
+        wasIncomplete: true
+      });
+    } else {
+      // Case 3: No document exists at all - CREATE new one
+      console.log(`[post_algorithm] [READ-1-NEW-USER] User status doesn't exist - auto-detecting latest documents`);
 
-const detectionStart = Date.now();
+      const detectionStart = Date.now();
 
-// Get all reel document IDs and find the latest
-const reelDocs = await db.collection('reels')
-.find({}, { projection: { _id: 1 } })
-.toArray();
+      const reelDocs = await db.collection('reels')
+        .find({}, { projection: { _id: 1 } })
+        .toArray();
 
-const postDocs = await db.collection('posts')
-.find({}, { projection: { _id: 1 } })
-.toArray();
+      const postDocs = await db.collection('posts')
+        .find({}, { projection: { _id: 1 } })
+        .toArray();
 
-// Extract and sort reel IDs (e.g., reel_0, reel_1, reel_2, ...)
-const reelIds = reelDocs
-.map(doc => doc._id)
-.filter(id => id.startsWith('reel_'))
-.sort((a, b) => {
-const numA = parseInt(a.replace('reel_', ''), 10) || 0;
-const numB = parseInt(b.replace('reel_', ''), 10) || 0;
-return numB - numA; // Descending order (latest first)
-});
+      const reelIds = reelDocs
+        .map(doc => doc._id)
+        .filter(id => id.startsWith('reel_'))
+        .sort((a, b) => {
+          const numA = parseInt(a.replace('reel_', ''), 10) || 0;
+          const numB = parseInt(b.replace('reel_', ''), 10) || 0;
+          return numB - numA;
+        });
 
-// Extract and sort post IDs
-const postIds = postDocs
-.map(doc => doc._id)
-.filter(id => id.startsWith('post_'))
-.sort((a, b) => {
-const numA = parseInt(a.replace('post_', ''), 10) || 0;
-const numB = parseInt(b.replace('post_', ''), 10) || 0;
-return numB - numA; // Descending order (latest first)
-});
+      const postIds = postDocs
+        .map(doc => doc._id)
+        .filter(id => id.startsWith('post_'))
+        .sort((a, b) => {
+          const numA = parseInt(a.replace('post_', ''), 10) || 0;
+          const numB = parseInt(b.replace('post_', ''), 10) || 0;
+          return numB - numA;
+        });
 
-// Determine latest and normal (previous) slots
-const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
-const normalReelSlot = reelIds.length > 1 ? reelIds[1] : reelIds[0] || 'reel_0';
+      // ✅ CRITICAL FIX: For fresh user, normal = latest - 2 (not latest - 1)
+      // Example: If latest is reel_10, read [reel_10, reel_9, reel_8]
+      // So: latestReelSlotId = reel_10, normalReelSlotId = reel_8
+      const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
+      const normalReelSlot = reelIds.length > 2 ? reelIds[2] : (reelIds[0] || 'reel_0');  // ✅ FIXED: index 2, not 1
 
-const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
-const normalPostSlot = postIds.length > 1 ? postIds[1] : postIds[0] || 'post_0';
+      const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
+      const normalPostSlot = postIds.length > 2 ? postIds[2] : (postIds[0] || 'post_0');  // ✅ FIXED: index 2, not 1
 
-const detectionDuration = Date.now() - detectionStart;
+      const detectionDuration = Date.now() - detectionStart;
 
-console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
-console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
+      console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
+      console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
+      console.log(`[post_algorithm] [FRESH-USER-EXPLANATION] Will read slots: [${latestReelSlot}, ${reelIds[1] || 'N/A'}, ${normalReelSlot}]`);
 
-// Create user_status document with detected slots
-const defaultStatus = {
-_id: userId,
-userId: userId,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: latestPostSlot,
-normalPostSlotId: normalPostSlot,
-createdAt: new Date(),
-updatedAt: new Date()
-};
+      const defaultStatus = {
+        _id: userId,
+        userId: userId,
+        latestReelSlotId: latestReelSlot,
+        normalReelSlotId: normalReelSlot,
+        latestPostSlotId: latestPostSlot,
+        normalPostSlotId: normalPostSlot,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
 
-await db.collection('user_status').insertOne(defaultStatus);
+      await db.collection('user_status').insertOne(defaultStatus);
 
-const totalDuration = Date.now() - startTime;
+      const totalDuration = Date.now() - startTime;
 
-console.log(`[post_algorithm] [READ-1-CREATED] New user_status created | total_duration=${totalDuration}ms | reads=3 (user_status + reels + posts)`);
+      console.log(`[post_algorithm] [READ-1-CREATED] New user_status created | total_duration=${totalDuration}ms | reads=3`);
 
-return res.json({
-success: true,
-latestReelSlotId: latestReelSlot,
-normalReelSlotId: normalReelSlot,
-latestPostSlotId: latestPostSlot,
-normalPostSlotId: normalPostSlot,
-reads: 3, // user_status (1) + reels collection (1) + posts collection (1)
-duration: totalDuration,
-isNewUser: true
-});
-}
+      return res.json({
+        success: true,
+        latestReelSlotId: latestReelSlot,
+        normalReelSlotId: normalReelSlot,
+        latestPostSlotId: latestPostSlot,
+        normalPostSlotId: normalPostSlot,
+        reads: 3,
+        duration: totalDuration,
+        isNewUser: true
+      });
+    }
 
-} catch (error) {
-console.error(`[post_algorithm] [READ-1-ERROR] ${error.message}`);
-console.error(`[post_algorithm] [READ-1-STACK]`, error.stack);
-return res.status(500).json({
-success: false,
-error: 'Failed to read user_status: ' + error.message,
-reads: 1,
-duration: Date.now() - startTime
-});
-}
+  } catch (error) {
+    console.error(`[post_algorithm] [READ-1-ERROR] ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to read user_status: ' + error.message,
+      reads: 1,
+      duration: Date.now() - startTime
+    });
+  }
 });
 
 
