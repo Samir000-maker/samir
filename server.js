@@ -600,7 +600,7 @@ async function createAllProductionIndexes() {
     name: 'slot_0_visit_tracking',
     background: true
   }
-}
+},
 
 
 {
