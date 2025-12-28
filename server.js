@@ -3690,7 +3690,7 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
       try {
         const dbReadsBefore = dbOpCounters.reads;
 
-        // ✅ USE STRICT SLOT ALGORITHM
+        // ✅ CRITICAL FIX: Call getOptimizedFeedFixedReads instead of getOptimizedFeed
         const feedData = await dbManager.getOptimizedFeedFixedReads(
           userId, 
           contentType, 
@@ -6068,7 +6068,7 @@ app.post('/api/user-status/:userId', async (req, res) => {
   const { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId } = req.body;
 
   try {
-    // ✅ CRITICAL FIX: Validate inputs
+
     if (!latestReelSlotId && !normalReelSlotId && !latestPostSlotId && !normalPostSlotId) {
       console.warn(`[post_algorithm] [UPDATE-USER-STATUS-SKIP] No slot IDs provided`);
       return res.status(400).json({
@@ -6085,7 +6085,7 @@ app.post('/api/user-status/:userId', async (req, res) => {
       updatedAt: new Date()
     };
 
-    // Only update fields that are provided
+
     if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
     if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
     if (latestPostSlotId) updateData.latestPostSlotId = latestPostSlotId;
@@ -6139,7 +6139,6 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
   try {
     console.log(`[post_algorithm] [READ-${readNum}-START] ${collectionName} lookup for userId=${userId} | slotId=${slotId}`);
 
-    // ✅ CRITICAL FIX: Query using BOTH userId AND slotId as filters
     const contribDoc = await db.collection(collectionName).findOne(
       { 
         userId: userId,
@@ -6190,11 +6189,7 @@ app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
   }
 });
 
-/**
-* POST /api/feed/optimized-reels
-* Fetches reels content from specific slot with ranking algorithm
-* READ COUNT: 1 (aggregation on reels collection filtered by slotId)
-*/
+
 app.post('/api/feed/optimized-reels', async (req, res) => {
 const startTime = Date.now();
 const { userId, slotId, excludedReelIds = [], limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
@@ -6211,7 +6206,7 @@ error: 'userId and slotId are required'
 });
 }
 
-// Fetch user interests for ranking
+
 let userInterests = [];
 try {
 const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
@@ -6241,7 +6236,7 @@ const maxComments = maxValues[0]?.maxComments || 1;
 
 console.log(`[post_algorithm] [NORMALIZATION] maxLikes=${maxLikes}, maxComments=${maxComments}, userInterests=${userInterests.length}`);
 
-// ✅ CRITICAL: Aggregation reads ONLY from document with _id = slotId
+
 const pipeline = [
 { $match: { _id: slotId, 'reelsList': { $exists: true, $ne: [] } } },
 { $unwind: '$reelsList' },
@@ -6331,7 +6326,7 @@ return res.json({
 success: true,
 content: reels,
 slotUsed: slotId,
-reads: 1, // Single aggregation counts as 1 read
+reads: 1, 
 duration,
 metadata: {
 userInterests,
@@ -6401,7 +6396,7 @@ app.post('/api/feed/mixed-optimized', async (req, res) => {
         postsCount: postsResult.content.length,
         dbReadsUsed,
         duration,
-        readLimitCompliant: dbReadsUsed <= 14, // 7 per content type
+        readLimitCompliant: dbReadsUsed <= 14, 
         slotsRead: {
           reels: reelsResult.metadata?.slotsRead || [],
           posts: postsResult.metadata?.slotsRead || []
@@ -6423,12 +6418,12 @@ app.post('/api/feed/mixed-optimized', async (req, res) => {
 function sendMixedResponse(res, mixedContent, startTime, phaseReached) {
 const duration = Date.now() - startTime;
 
-// Sort by composite score (if available)
+
 const sortedContent = mixedContent.sort((a, b) =>
 (b.compositeScore || b.retention || 0) - (a.compositeScore || a.retention || 0)
 );
 
-// Separate for metadata
+
 const posts = sortedContent.filter(item => !item.isReel);
 const reels = sortedContent.filter(item => item.isReel);
 
@@ -6449,9 +6444,7 @@ reads: dbOpCounters.reads
 });
 }
 
-/**
-* Helper: Calculate previous slot ID
-*/
+
 function calculatePreviousSlot(currentSlotId) {
 const match = currentSlotId.match(/_(\d+)$/);
 if (!match) return null;
@@ -6480,7 +6473,7 @@ error: 'userId and slotId are required'
 });
 }
 
-// Fetch user interests (best-effort)
+
 let userInterests = [];
 try {
 const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000, validateStatus: s => s >= 200 && s < 500 });
@@ -6500,7 +6493,7 @@ const pipeline = [
 $addFields: {
 likeCountNum: { $toInt: { $ifNull: ['$postList.likeCount', 0] } },
 commentCountNum: { $toInt: { $ifNull: ['$postList.commentCount', 0] } },
-// interestScore logic: if user has interests and category matches -> 100, else 0; if user has no interests -> 50
+
 interestScore: {
 $cond: {
 if: { $in: ['$postList.category', userInterests] },
@@ -6530,9 +6523,9 @@ $project: {
 postId: '$postList.postId',
 userId: '$postList.userId',
 username: '$postList.username',
-// Primary image (fallbacks kept for compatibility)
+
 imageUrl: { $ifNull: ['$postList.imageUrl', '$postList.imageUrl1'] },
-// multi-image support
+
 multiple_posts: { $ifNull: ['$postList.multiple_posts', false] },
 media_count: { $ifNull: ['$postList.media_count', 1] },
 imageUrl1: { $ifNull: ['$postList.imageUrl1', '$postList.imageUrl'] },
