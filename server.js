@@ -1677,9 +1677,6 @@ if (interestedContent.length < minContentRequired) {
 } else {
   console.log(`\n[MONITORING SAMIR] [PHASE-5] SKIP - Already have ${interestedContent.length} items (>= ${minContentRequired} required)`);
 }
-  } else {
-    console.log(`\n[MONITORING SAMIR] [PHASE-5] SKIP - Already have ${interestedContent.length} items (>= ${minContentRequired} required)`);
-  }
 
   // ============================================================
   // PHASE 6: FINAL RANKING
