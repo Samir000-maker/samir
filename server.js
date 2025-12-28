@@ -1074,76 +1074,83 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
   const listKey = isReel ? 'reelsList' : 'postList';
 
   console.log(`\n${'='.repeat(80)}`);
-  console.log(`[FEED-ALGORITHM-START] userId=${userId} | type=${contentType} | minRequired=${minContentRequired}`);
+  console.log(`[MONITORING SAMIR] [FEED-START] userId=${userId} | type=${contentType} | minRequired=${minContentRequired}`);
   console.log(`${'='.repeat(80)}`);
 
   // ============================================================
   // READ 1: Get user status
   // ============================================================
+  console.log(`[MONITORING SAMIR] [READ-1] Checking user_status collection for userId=${userId}`);
   const userStatusReadStart = Date.now();
+  
   const userStatus = await this.db.collection('user_status').findOne(
     { _id: userId },
     { projection: { [statusField]: 1, [normalField]: 1 } }
   );
-  console.log(`[READ-1] user_status | userId=${userId} | duration=${Date.now() - userStatusReadStart}ms | found=${!!userStatus}`);
+  
+  console.log(`[MONITORING SAMIR] [READ-1-COMPLETE] Duration: ${Date.now() - userStatusReadStart}ms | Found: ${!!userStatus}`);
   
   const isNewUser = !userStatus || !userStatus[statusField];
   
-  console.log(`[USER-STATUS] ${isNewUser ? 'NEW USER' : `RETURNING USER | latest=${userStatus[statusField]}, normal=${userStatus[normalField]}`}`);
+  if (isNewUser) {
+    console.log(`[MONITORING SAMIR] [USER-TYPE] FRESH USER (no user_status found)`);
+  } else {
+    console.log(`[MONITORING SAMIR] [USER-TYPE] RETURNING USER | latest=${userStatus[statusField]}, normal=${userStatus[normalField]}`);
+  }
 
   // Get user interests
   let userInterests = [];
   try {
+    const interestFetchStart = Date.now();
     const userResponse = await axios.get(`https://server1-ki1x.onrender.com/api/users/${userId}`, { timeout: 1000 });
     if (userResponse.status === 200 && userResponse.data.success) {
       userInterests = userResponse.data.user.interests || [];
     }
+    console.log(`[MONITORING SAMIR] [USER-INTERESTS] Fetched in ${Date.now() - interestFetchStart}ms | Interests: [${userInterests.join(', ')}] (${userInterests.length} total)`);
   } catch (e) {
-    console.warn(`[INTERESTS-FETCH-FAILED] ${e.message}`);
+    console.warn(`[MONITORING SAMIR] [USER-INTERESTS-FAILED] ${e.message} | Continuing without interests`);
   }
-
-  console.log(`[USER-INTERESTS] [${userInterests.join(', ')}] (${userInterests.length} interests)`);
 
   let slotsToRead = [];
   let newLatestSlot = null;
   let newNormalSlot = null;
+  const documentsChecked = []; // Track all documents we check (even if empty)
 
   // ============================================================
   // PHASE 1: DETERMINE WHICH SLOTS TO READ
   // ============================================================
   if (isNewUser) {
-    // ✅ FRESH USER LOGIC
-    const latestSlotReadStart = Date.now();
+    console.log(`[MONITORING SAMIR] [PHASE-1] FRESH USER LOGIC - Finding latest slot`);
+    
+    const latestSlotCheckStart = Date.now();
     const latestSlot = await this.getLatestSlotOptimized(collection);
-    console.log(`[READ-2] ${collection} latest slot query | duration=${Date.now() - latestSlotReadStart}ms | found=${latestSlot ? latestSlot._id : 'none'}`);
+    console.log(`[MONITORING SAMIR] [LATEST-SLOT-CHECK] Duration: ${Date.now() - latestSlotCheckStart}ms | Found: ${latestSlot?._id || 'NONE'}`);
     
     if (!latestSlot) {
-      console.warn(`[NO-SLOTS-FOUND] ${collection} collection is empty`);
+      console.warn(`[MONITORING SAMIR] [NO-SLOTS] ${collection} collection is empty`);
       return { content: [], latestDocumentId: null, normalDocumentId: null, isNewUser: true };
     }
 
     const latestIndex = latestSlot.index;
-    
-    // ✅ CRITICAL FIX: Read latest 3 slots BUT save different normalSlot
     slotsToRead = [
-      `${collection.slice(0, -1)}_${latestIndex}`,           // reel_10
-      `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`, // reel_9
-      `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`  // reel_8
+      `${collection.slice(0, -1)}_${latestIndex}`,
+      `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`,
+      `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`
     ];
 
-    // ✅ CORRECT ASSIGNMENT: normalSlot should be latestIndex - 4 (not -2)
-    // Example: If latestIndex = 10, read [reel_10, reel_9, reel_8]
-    // But save: latestReelSlotId = reel_10, normalReelSlotId = reel_6
-    newLatestSlot = slotsToRead[0]; // reel_10
-    newNormalSlot = `${collection.slice(0, -1)}_${Math.max(latestIndex - 4, 0)}`; // ✅ FIXED: reel_6
+    newLatestSlot = slotsToRead[0];
+    newNormalSlot = slotsToRead[2];
 
-    console.log(`[FRESH-USER-SLOTS-TO-READ] Will read: [${slotsToRead.join(', ')}]`);
-    console.log(`[FRESH-USER-SAVE-PLAN] latestSlot=${newLatestSlot}, normalSlot=${newNormalSlot} (NOT in read list - this is correct)`);
+    console.log(`[MONITORING SAMIR] [FRESH-USER-PLAN] Will read slots: [${slotsToRead.join(', ')}]`);
+    console.log(`[MONITORING SAMIR] [FRESH-USER-PLAN] Will save: latestSlot=${newLatestSlot}, normalSlot=${newNormalSlot}`);
 
   } else {
-    // ✅ RETURNING USER LOGIC
+    console.log(`[MONITORING SAMIR] [PHASE-1] RETURNING USER LOGIC`);
+    
     const currentLatestSlot = userStatus[statusField];
     const currentNormalSlot = userStatus[normalField];
+    
+    console.log(`[MONITORING SAMIR] [CURRENT-STATUS] latestSlot=${currentLatestSlot}, normalSlot=${currentNormalSlot}`);
     
     const latestMatch = currentLatestSlot.match(/_(\d+)$/);
     const latestIndex = latestMatch ? parseInt(latestMatch[1]) : 0;
@@ -1151,39 +1158,39 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     const normalMatch = currentNormalSlot.match(/_(\d+)$/);
     const normalIndex = normalMatch ? parseInt(normalMatch[1]) : 0;
 
-    // ✅ STEP 1: Check for NEWER document
+    // Check for newer slot
     const newerSlotId = `${collection.slice(0, -1)}_${latestIndex + 1}`;
+    console.log(`[MONITORING SAMIR] [CHECKING-NEWER] Looking for ${newerSlotId}`);
+    
     const newerCheckStart = Date.now();
     const newerSlotExists = await this.db.collection(collection).findOne(
       { _id: newerSlotId },
       { projection: { _id: 1 } }
     );
-    console.log(`[READ-2] ${collection} check newer slot ${newerSlotId} | duration=${Date.now() - newerCheckStart}ms | exists=${!!newerSlotExists}`);
+    documentsChecked.push({ slot: newerSlotId, exists: !!newerSlotExists, duration: Date.now() - newerCheckStart });
+    console.log(`[MONITORING SAMIR] [CHECKED-DOCUMENT] ${newerSlotId} | Exists: ${!!newerSlotExists} | Duration: ${Date.now() - newerCheckStart}ms`);
 
     if (newerSlotExists) {
-      console.log(`[NEWER-SLOT-FOUND] ${newerSlotId} exists!`);
+      console.log(`[MONITORING SAMIR] [NEWER-FOUND] ${newerSlotId} exists!`);
       
       slotsToRead = [
-        newerSlotId, // reel_11
-        currentNormalSlot, // reel_6
-        `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}` // reel_5
+        newerSlotId,
+        currentNormalSlot,
+        `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`
       ];
 
-      // ✅ UPDATE: latestSlot = reel_11, normalSlot = reel_5
       newLatestSlot = newerSlotId;
       newNormalSlot = slotsToRead[2];
 
-      console.log(`[RETURNING-USER-NEWER] Will read: [${slotsToRead.join(', ')}]`);
-      console.log(`[RETURNING-USER-SAVE] latestSlot=${newLatestSlot}, normalSlot=${newNormalSlot}`);
+      console.log(`[MONITORING SAMIR] [RETURNING-USER-NEWER-PLAN] Will read: [${slotsToRead.join(', ')}]`);
+      console.log(`[MONITORING SAMIR] [RETURNING-USER-NEWER-PLAN] Will save: latestSlot=${newLatestSlot}, normalSlot=${newNormalSlot}`);
 
     } else {
-      console.log(`[NO-NEWER-SLOT] ${newerSlotId} doesn't exist, reading backward from normalSlot`);
+      console.log(`[MONITORING SAMIR] [NO-NEWER] ${newerSlotId} doesn't exist`);
       
-      // ✅ SPECIAL CASE: normalSlot is reel_0
       if (normalIndex === 0) {
-        console.log(`[REACHED-REEL-0] Can't go backward, checking for latest documents`);
+        console.log(`[MONITORING SAMIR] [REACHED-REEL-0] Can't go backward, checking for multiple newer slots`);
         
-        // Check multiple newer slots
         const allNewerSlots = [];
         for (let i = latestIndex + 1; i <= latestIndex + 10; i++) {
           const checkSlot = `${collection.slice(0, -1)}_${i}`;
@@ -1192,7 +1199,9 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
             { _id: checkSlot },
             { projection: { _id: 1 } }
           );
-          console.log(`[READ-EXTRA] ${collection} check slot ${checkSlot} | duration=${Date.now() - checkStart}ms | exists=${!!exists}`);
+          const checkDuration = Date.now() - checkStart;
+          documentsChecked.push({ slot: checkSlot, exists: !!exists, duration: checkDuration });
+          console.log(`[MONITORING SAMIR] [CHECKED-DOCUMENT] ${checkSlot} | Exists: ${!!exists} | Duration: ${checkDuration}ms`);
           
           if (exists) allNewerSlots.push(checkSlot);
           else break;
@@ -1203,7 +1212,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
           newLatestSlot = slotsToRead[slotsToRead.length - 1];
           newNormalSlot = slotsToRead[0];
           
-          console.log(`[REEL-0-FOUND-NEWER] Will read: [${slotsToRead.join(', ')}]`);
+          console.log(`[MONITORING SAMIR] [REEL-0-NEWER-PLAN] Found ${allNewerSlots.length} newer slots, will read: [${slotsToRead.join(', ')}]`);
         } else {
           slotsToRead = [
             currentLatestSlot,
@@ -1214,11 +1223,10 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
           newLatestSlot = currentLatestSlot;
           newNormalSlot = slotsToRead[2];
           
-          console.log(`[REEL-0-NO-NEWER] Re-reading: [${slotsToRead.join(', ')}]`);
+          console.log(`[MONITORING SAMIR] [REEL-0-NO-NEWER-PLAN] Re-reading: [${slotsToRead.join(', ')}]`);
         }
         
       } else {
-        // ✅ NORMAL BACKWARD READING
         slotsToRead = [
           currentNormalSlot,
           `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`,
@@ -1228,48 +1236,51 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
         newLatestSlot = currentLatestSlot;
         newNormalSlot = slotsToRead[2];
 
-        console.log(`[RETURNING-USER-BACKWARD] Will read: [${slotsToRead.join(', ')}]`);
-        console.log(`[RETURNING-USER-SAVE] latestSlot=${newLatestSlot} (unchanged), normalSlot=${newNormalSlot}`);
+        console.log(`[MONITORING SAMIR] [RETURNING-USER-BACKWARD-PLAN] Will read: [${slotsToRead.join(', ')}]`);
+        console.log(`[MONITORING SAMIR] [RETURNING-USER-BACKWARD-PLAN] Will save: latestSlot=${newLatestSlot} (unchanged), normalSlot=${newNormalSlot}`);
       }
     }
   }
 
   // ============================================================
-  // PHASE 2: FETCH CONTENT FROM DETERMINED SLOTS (MAX 3)
+  // PHASE 2: FETCH CONTENT FROM SLOTS
   // ============================================================
-  console.log(`\n[CONTENT-FETCH-START] Reading ${slotsToRead.length} slots from ${collection}...`);
+  console.log(`\n[MONITORING SAMIR] [PHASE-2] CONTENT FETCHING - Reading ${slotsToRead.length} slots`);
   
   const slotContents = [];
-  let actualDocsRead = 0;
-  
   for (const slotId of slotsToRead) {
     const slotReadStart = Date.now();
     const slotDoc = await this.db.collection(collection).findOne(
       { _id: slotId },
       { projection: { [listKey]: 1, index: 1, count: 1 } }
     );
-    actualDocsRead++;
+    const slotReadDuration = Date.now() - slotReadStart;
     
-    const itemCount = slotDoc && slotDoc[listKey] ? slotDoc[listKey].length : 0;
-    console.log(`[READ-${actualDocsRead + 1}] ${collection} | slotId=${slotId} | duration=${Date.now() - slotReadStart}ms | found=${!!slotDoc} | items=${itemCount} | count=${slotDoc ? slotDoc.count : 'N/A'}`);
+    documentsChecked.push({ slot: slotId, exists: !!slotDoc, duration: slotReadDuration, hasContent: slotDoc && slotDoc[listKey] && slotDoc[listKey].length > 0 });
 
     if (slotDoc && slotDoc[listKey]) {
       slotContents.push({
         slotId: slotId,
         content: slotDoc[listKey]
       });
+      console.log(`[MONITORING SAMIR] [READ-DOCUMENT] ${slotId} | Items: ${slotDoc[listKey].length} (count=${slotDoc.count}) | Duration: ${slotReadDuration}ms | Status: SUCCESS`);
+    } else {
+      console.log(`[MONITORING SAMIR] [READ-DOCUMENT] ${slotId} | Items: 0 | Duration: ${slotReadDuration}ms | Status: EMPTY/NOT-FOUND`);
     }
   }
 
-  console.log(`[CONTENT-FETCH-COMPLETE] Read ${actualDocsRead} documents from ${collection}, got ${slotContents.length} non-empty slots`);
+  console.log(`[MONITORING SAMIR] [DOCUMENTS-READ-SUMMARY] Total documents checked: ${documentsChecked.length}`);
+  documentsChecked.forEach((doc, idx) => {
+    console.log(`[MONITORING SAMIR] [DOC-${idx + 1}] ${doc.slot} | Exists: ${doc.exists} | HasContent: ${doc.hasContent || false} | Duration: ${doc.duration}ms`);
+  });
 
   // ============================================================
-  // PHASE 3: FILTER VIEWED CONTENT (MAX 3 CONTRIB READS)
+  // PHASE 3: FILTER VIEWED CONTENT
   // ============================================================
-  console.log(`\n[FILTERING-START] Checking viewed content in contrib_${collection}...`);
+  console.log(`\n[MONITORING SAMIR] [PHASE-3] FILTERING VIEWED CONTENT - Checking contrib_${collection}`);
   
   const viewedIds = new Set();
-  let contribDocsRead = 0;
+  const contribDocsChecked = [];
   
   for (const { slotId } of slotContents) {
     const contribReadStart = Date.now();
@@ -1280,62 +1291,60 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
       },
       { projection: { ids: 1 } }
     );
-    contribDocsRead++;
-
-    const viewedCount = contribDoc && contribDoc.ids ? contribDoc.ids.length : 0;
-    console.log(`[READ-${actualDocsRead + contribDocsRead + 1}] contrib_${collection} | userId=${userId} | slotId=${slotId} | duration=${Date.now() - contribReadStart}ms | found=${!!contribDoc} | viewedIds=${viewedCount}`);
+    const contribReadDuration = Date.now() - contribReadStart;
+    
+    contribDocsChecked.push({ slotId, found: !!contribDoc, count: contribDoc?.ids?.length || 0, duration: contribReadDuration });
 
     if (contribDoc && contribDoc.ids) {
       contribDoc.ids.forEach(id => viewedIds.add(id));
+      console.log(`[MONITORING SAMIR] [READ-CONTRIB] ${slotId} | Viewed IDs: ${contribDoc.ids.length} | Duration: ${contribReadDuration}ms | Status: FOUND`);
+    } else {
+      console.log(`[MONITORING SAMIR] [READ-CONTRIB] ${slotId} | Viewed IDs: 0 | Duration: ${contribReadDuration}ms | Status: NOT-FOUND`);
     }
   }
 
-  console.log(`[TOTAL-VIEWED] ${viewedIds.size} unique IDs to exclude`);
-  console.log(`[TOTAL-DOCS-READ-SO-FAR] ${1 + actualDocsRead + contribDocsRead} (1 user_status + ${actualDocsRead} ${collection} + ${contribDocsRead} contrib_${collection})`);
+  console.log(`[MONITORING SAMIR] [CONTRIB-READ-SUMMARY] Total contrib docs checked: ${contribDocsChecked.length} | Total viewed IDs: ${viewedIds.size}`);
 
   // ============================================================
   // PHASE 4: INTEREST-BASED FILTERING
   // ============================================================
-  console.log(`\n[INTEREST-FILTERING-START] Matching with user interests...`);
+  console.log(`\n[MONITORING SAMIR] [PHASE-4] INTEREST FILTERING - Matching with user interests`);
   
   let interestedContent = [];
-  let totalItemsProcessed = 0;
+  let totalItemsBeforeFilter = 0;
   let interestMatchCount = 0;
+  let noInterestIncludeCount = 0;
 
   for (const { slotId, content } of slotContents) {
+    totalItemsBeforeFilter += content.length;
+    
     for (const item of content) {
-      totalItemsProcessed++;
-      
-      if (viewedIds.has(item.postId)) {
-        continue;
-      }
+      if (viewedIds.has(item.postId)) continue;
 
       if (userInterests.length > 0) {
         if (item.category && userInterests.includes(item.category)) {
           interestedContent.push(item);
           interestMatchCount++;
-          if (interestMatchCount <= 3) {
-            console.log(`[INTEREST-MATCH-${interestMatchCount}] postId=${item.postId.substring(0, 8)}... | category=${item.category} | from=${slotId}`);
-          }
         }
       } else {
         interestedContent.push(item);
+        noInterestIncludeCount++;
       }
     }
   }
 
-  console.log(`[INTEREST-FILTERED] Processed ${totalItemsProcessed} items, matched ${interestedContent.length} with interests`);
+  console.log(`[MONITORING SAMIR] [INTEREST-FILTER-RESULT] Total items before filter: ${totalItemsBeforeFilter} | After viewed filter: ${totalItemsBeforeFilter - viewedIds.size} | Interest matches: ${interestMatchCount} | No-interest includes: ${noInterestIncludeCount} | Final: ${interestedContent.length}`);
 
   // ============================================================
   // PHASE 5: FILL WITH HIGH-ENGAGEMENT CONTENT IF NEEDED
   // ============================================================
   if (interestedContent.length < minContentRequired) {
-    console.log(`\n[ENGAGEMENT-FILL-START] Have ${interestedContent.length}, need ${minContentRequired} (shortage: ${minContentRequired - interestedContent.length})`);
+    console.log(`\n[MONITORING SAMIR] [PHASE-5] ENGAGEMENT FILL - Need ${minContentRequired - interestedContent.length} more items`);
     
     const existingIds = new Set(interestedContent.map(item => item.postId));
     const remainderContent = [];
 
-    for (const { slotId, content } of slotContents) {
+    for (const { content } of slotContents) {
       for (const item of content) {
         if (!viewedIds.has(item.postId) && !existingIds.has(item.postId)) {
           remainderContent.push(item);
@@ -1359,19 +1368,24 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     const needed = minContentRequired - interestedContent.length;
     const fillContent = remainderContent.slice(0, needed);
     
+    console.log(`[MONITORING SAMIR] [ENGAGEMENT-FILL-RESULT] Available for fill: ${remainderContent.length} | Taking: ${fillContent.length}`);
+    
     fillContent.forEach((item, idx) => {
-      if (idx < 3) {
-        console.log(`[ENGAGEMENT-FILL-${idx + 1}] postId=${item.postId.substring(0, 8)}... | retention=${item.retention}% | likes=${item.likeCount} | comments=${item.commentCount}`);
+      if (idx < 3) { // Only log first 3
+        console.log(`[MONITORING SAMIR] [FILL-ITEM-${idx + 1}] postId=${item.postId.substring(0, 8)} | retention=${item.retention}% | likes=${item.likeCount} | comments=${item.commentCount} | views=${item.viewCount}`);
       }
     });
     
     interestedContent.push(...fillContent);
-    console.log(`[ENGAGEMENT-FILLED] Added ${fillContent.length} high-engagement items (total now: ${interestedContent.length})`);
+  } else {
+    console.log(`\n[MONITORING SAMIR] [PHASE-5] SKIP - Already have ${interestedContent.length} items (>= ${minContentRequired} required)`);
   }
 
   // ============================================================
   // PHASE 6: FINAL RANKING
   // ============================================================
+  console.log(`\n[MONITORING SAMIR] [PHASE-6] FINAL RANKING - Sorting by engagement`);
+  
   interestedContent.sort((a, b) => {
     const retentionDiff = (b.retention || 0) - (a.retention || 0);
     if (Math.abs(retentionDiff) > 1) return retentionDiff;
@@ -1389,25 +1403,32 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
   // PHASE 7: UPDATE USER STATUS
   // ============================================================
   if (newLatestSlot && newNormalSlot) {
+    console.log(`\n[MONITORING SAMIR] [PHASE-7] UPDATING USER_STATUS - Saving new slot IDs`);
     const updateStart = Date.now();
+    
     await this.updateUserStatus(userId, {
       [statusField]: newLatestSlot,
       [normalField]: newNormalSlot
     });
-    console.log(`\n[USER-STATUS-UPDATE] Saved | latest=${newLatestSlot} | normal=${newNormalSlot} | duration=${Date.now() - updateStart}ms`);
+    
+    console.log(`[MONITORING SAMIR] [USER-STATUS-UPDATE] Saved in ${Date.now() - updateStart}ms | latest=${newLatestSlot}, normal=${newNormalSlot}`);
+  } else {
+    console.log(`\n[MONITORING SAMIR] [PHASE-7] SKIP USER_STATUS UPDATE - No changes needed`);
   }
 
   const duration = Date.now() - start;
-  const totalReads = 1 + actualDocsRead + contribDocsRead;
+  const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
 
   console.log(`\n${'='.repeat(80)}`);
-  console.log(`[FEED-ALGORITHM-COMPLETE]`);
+  console.log(`[MONITORING SAMIR] [FEED-COMPLETE]`);
+  console.log(`  User: ${userId} | Type: ${contentType} | User Type: ${isNewUser ? 'FRESH' : 'RETURNING'}`);
   console.log(`  Content Returned: ${interestedContent.length} items`);
-  console.log(`  Total DB Reads: ${totalReads} (1 user_status + ${actualDocsRead} ${collection} + ${contribDocsRead} contrib_${collection})`);
-  console.log(`  Duration: ${duration}ms`);
-  console.log(`  Slots Read: [${slotsToRead.join(', ')}]`);
-  console.log(`  Status Saved: latest=${newLatestSlot}, normal=${newNormalSlot}`);
-  console.log(`  Interest Matches: ${interestMatchCount}/${totalItemsProcessed} items`);
+  console.log(`  Total Reads: ${totalReads} = 1 user_status + ${documentsChecked.length} slot checks + ${contribDocsChecked.length} contrib checks`);
+  console.log(`  Documents Checked: ${documentsChecked.map(d => d.slot).join(', ')}`);
+  console.log(`  Documents with Content: ${slotContents.map(s => s.slotId).join(', ')}`);
+  console.log(`  Contrib Docs Checked: ${contribDocsChecked.map(c => c.slotId).join(', ')}`);
+  console.log(`  Status Will Be Saved: latest=${newLatestSlot}, normal=${newNormalSlot}`);
+  console.log(`  Total Duration: ${duration}ms`);
   console.log(`${'='.repeat(80)}\n`);
 
   return {
@@ -1417,7 +1438,9 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     isNewUser,
     hasNewContent: interestedContent.length > 0,
     metadata: {
-      slotsRead: slotsToRead,
+      slotsChecked: documentsChecked.map(d => d.slot),
+      slotsWithContent: slotContents.map(s => s.slotId),
+      contribDocsChecked: contribDocsChecked.map(c => c.slotId),
       interestFiltered: interestedContent.length,
       totalReads: totalReads,
       userInterests,
@@ -1824,31 +1847,96 @@ hasNewContent: false
 };
 }
 
-// ---- Moved here and corrected ----
 async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
-const results = [];
-const operations = [
-posts.length > 0 && { type: 'posts', collection: 'contrib_posts', ids: posts },
-reels.length > 0 && { type: 'reels', collection: 'contrib_reels', ids: reels }
-].filter(Boolean);
+  console.log(`[MONITORING SAMIR] [BATCH-CONTRIB-START] userId=${userId} | ${posts.length} posts + ${reels.length} reels`);
+  
+  const results = [];
+  const operations = [
+    posts.length > 0 && { type: 'posts', collection: 'contrib_posts', ids: posts },
+    reels.length > 0 && { type: 'reels', collection: 'contrib_reels', ids: reels }
+  ].filter(Boolean);
 
-for (const op of operations) {
-const start = Date.now();
-const result = await this.db.collection(op.collection).bulkWrite([{
-updateOne: {
-filter: { userId },
-update: {
-$addToSet: { ids: { $each: op.ids } },
-$setOnInsert: { userId, createdAt: new Date().toISOString() },
-$set: { updatedAt: new Date().toISOString() }
-},
-upsert: true
-}
-}], { ordered: false });
-logDbOp('bulkWrite', op.collection, { userId }, result, Date.now() - start);
-results.push({ type: op.type, result });
-}
-return results;
+  // Track slot IDs for user_status update
+  const reelSlotIds = new Set();
+  const postSlotIds = new Set();
+
+  for (const op of operations) {
+    const start = Date.now();
+    
+    // Extract slot IDs from the contributions
+    for (const item of op.ids) {
+      const postId = typeof item === 'string' ? item : item.postId;
+      const slotId = typeof item === 'object' ? item.slotId : null;
+      
+      if (slotId) {
+        if (op.type === 'reels') {
+          reelSlotIds.add(slotId);
+        } else {
+          postSlotIds.add(slotId);
+        }
+      }
+    }
+
+    const result = await this.db.collection(op.collection).bulkWrite([{
+      updateOne: {
+        filter: { userId },
+        update: {
+          $addToSet: { ids: { $each: op.ids.map(i => typeof i === 'string' ? i : i.postId) } },
+          $setOnInsert: { userId, createdAt: new Date().toISOString() },
+          $set: { updatedAt: new Date().toISOString() }
+        },
+        upsert: true
+      }
+    }], { ordered: false });
+    
+    const duration = Date.now() - start;
+    logDbOp('bulkWrite', op.collection, { userId }, result, duration);
+    console.log(`[MONITORING SAMIR] [BATCH-CONTRIB-SAVED] ${op.type} | ${op.ids.length} items | Duration: ${duration}ms`);
+    results.push({ type: op.type, result });
+  }
+
+  // ✅ UPDATE USER_STATUS with latest slot IDs
+  if (reelSlotIds.size > 0 || postSlotIds.size > 0) {
+    console.log(`[MONITORING SAMIR] [UPDATE-USER-STATUS-FROM-CONTRIB] Updating user_status with latest slot info`);
+    
+    const updateData = {};
+    
+    if (reelSlotIds.size > 0) {
+      const reelSlotArray = Array.from(reelSlotIds).sort((a, b) => {
+        const numA = parseInt(a.split('_')[1]) || 0;
+        const numB = parseInt(b.split('_')[1]) || 0;
+        return numB - numA;
+      });
+      
+      const latestReelSlot = reelSlotArray[0];
+      const normalReelSlot = reelSlotArray[reelSlotArray.length - 1];
+      
+      updateData.latestReelSlotId = latestReelSlot;
+      updateData.normalReelSlotId = normalReelSlot;
+      
+      console.log(`[MONITORING SAMIR] [USER-STATUS-REELS] Will save: latest=${latestReelSlot}, normal=${normalReelSlot}`);
+    }
+    
+    if (postSlotIds.size > 0) {
+      const postSlotArray = Array.from(postSlotIds).sort((a, b) => {
+        const numA = parseInt(a.split('_')[1]) || 0;
+        const numB = parseInt(b.split('_')[1]) || 0;
+        return numB - numA;
+      });
+      
+      const latestPostSlot = postSlotArray[0];
+      const normalPostSlot = postSlotArray[postSlotArray.length - 1];
+      
+      updateData.latestPostSlotId = latestPostSlot;
+      updateData.normalPostSlotId = normalPostSlot;
+      
+      console.log(`[MONITORING SAMIR] [USER-STATUS-POSTS] Will save: latest=${latestPostSlot}, normal=${normalPostSlot}`);
+    }
+    
+    await this.updateUserStatus(userId, updateData);
+  }
+
+  return results;
 }
 
 async getDocument(col, id) {
@@ -3344,36 +3432,34 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
-    console.log(`[BATCH-CONTRIBUTION-START] userId=${userId} | ${posts.length} posts + ${reels.length} reels`);
+    console.log(`[BATCH-START] userId=${userId} | ${posts.length}P + ${reels.length}R`);
 
-    const reelOperations = [];
     const postOperations = [];
+    const reelOperations = [];
     
+    // ✅ Track which slots we need to query
     const reelSlotLookups = [];
     const postSlotLookups = [];
-    
-    // ✅ NEW: Track which slots were written to
-    const reelSlotsWritten = new Set();
-    const postSlotsWritten = new Set();
 
-    // Process reels
+    // ✅ Process reels - get slot for each postId
     for (const item of reels) {
       const postId = typeof item === 'string' ? item : item.postId;
+      
+      // Check if client provided slotId
       let slotId = typeof item === 'object' ? item.slotId : null;
       
       if (!slotId) {
-        console.log(`[BATCH-REEL-LOOKUP] ${postId.substring(0, 8)}... - client didn't provide slotId, looking up...`);
+        console.log(`[BATCH-REEL-LOOKUP] ${postId.substring(0, 8)} - client didn't provide slotId, looking up...`);
         slotId = await getSlotForReel(postId);
         reelSlotLookups.push(postId);
       }
       
       if (!slotId) {
-        console.warn(`[BATCH-SKIP-REEL] ${postId} - slot not found`);
+        console.warn(`[BATCH-SKIP-REEL] ${postId} - slot not found in any document`);
         continue;
       }
 
-      console.log(`[BATCH-REEL] ${postId.substring(0, 8)}... → ${slotId}`);
-      reelSlotsWritten.add(slotId);
+      console.log(`[BATCH-REEL] ${postId.substring(0, 8)} → ${slotId}`);
 
       reelOperations.push({
         updateOne: {
@@ -3395,13 +3481,13 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
       });
     }
 
-    // Process posts
+    // ✅ Process posts (same logic)
     for (const item of posts) {
       const postId = typeof item === 'string' ? item : item.postId;
       let slotId = typeof item === 'object' ? item.slotId : null;
       
       if (!slotId) {
-        console.log(`[BATCH-POST-LOOKUP] ${postId.substring(0, 8)}... - client didn't provide slotId, looking up...`);
+        console.log(`[BATCH-POST-LOOKUP] ${postId.substring(0, 8)} - client didn't provide slotId, looking up...`);
         slotId = await getSlotForPost(postId);
         postSlotLookups.push(postId);
       }
@@ -3411,8 +3497,7 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
         continue;
       }
 
-      console.log(`[BATCH-POST] ${postId.substring(0, 8)}... → ${slotId}`);
-      postSlotsWritten.add(slotId);
+      console.log(`[BATCH-POST] ${postId.substring(0, 8)} → ${slotId}`);
 
       postOperations.push({
         updateOne: {
@@ -3451,99 +3536,12 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
         : Promise.resolve({ upsertedCount: 0, modifiedCount: 0 })
     ]);
 
-    console.log(`[BATCH-WRITE-COMPLETE] Posts: ${postOperations.length} ops | Reels: ${reelOperations.length} ops`);
-
-    // ✅ NEW: Update user_status with slots that were written
-    // This ensures user_status always reflects the latest consumed slots
-    if (reelSlotsWritten.size > 0 || postSlotsWritten.size > 0) {
-      console.log(`[USER-STATUS-UPDATE-START] Slots written - Reels: [${Array.from(reelSlotsWritten).join(', ')}] | Posts: [${Array.from(postSlotsWritten).join(', ')}]`);
-      
-      const userStatus = await db.collection('user_status').findOne(
-        { _id: userId },
-        { projection: { latestReelSlotId: 1, normalReelSlotId: 1, latestPostSlotId: 1, normalPostSlotId: 1 } }
-      );
-
-      const updateFields = {};
-
-      // Update reel slots if contributions were made
-      if (reelSlotsWritten.size > 0) {
-        const reelSlotIds = Array.from(reelSlotsWritten).sort((a, b) => {
-          const numA = parseInt(a.match(/_(\d+)$/)?.[1] || '0');
-          const numB = parseInt(b.match(/_(\d+)$/)?.[1] || '0');
-          return numB - numA; // Descending
-        });
-
-        const highestReelSlot = reelSlotIds[0];
-        const lowestReelSlot = reelSlotIds[reelSlotIds.length - 1];
-
-        // Update latestReelSlotId if we wrote to a newer slot
-        if (userStatus?.latestReelSlotId) {
-          const currentLatestNum = parseInt(userStatus.latestReelSlotId.match(/_(\d+)$/)?.[1] || '0');
-          const newLatestNum = parseInt(highestReelSlot.match(/_(\d+)$/)?.[1] || '0');
-          
-          if (newLatestNum > currentLatestNum) {
-            updateFields.latestReelSlotId = highestReelSlot;
-            console.log(`[USER-STATUS-REEL-LATEST] Updating ${userStatus.latestReelSlotId} → ${highestReelSlot}`);
-          }
-        } else {
-          updateFields.latestReelSlotId = highestReelSlot;
-        }
-
-        // Always update normalReelSlotId to lowest slot written
-        updateFields.normalReelSlotId = lowestReelSlot;
-        console.log(`[USER-STATUS-REEL-NORMAL] Setting normalReelSlotId → ${lowestReelSlot}`);
-      }
-
-      // Update post slots if contributions were made
-      if (postSlotsWritten.size > 0) {
-        const postSlotIds = Array.from(postSlotsWritten).sort((a, b) => {
-          const numA = parseInt(a.match(/_(\d+)$/)?.[1] || '0');
-          const numB = parseInt(b.match(/_(\d+)$/)?.[1] || '0');
-          return numB - numA;
-        });
-
-        const highestPostSlot = postSlotIds[0];
-        const lowestPostSlot = postSlotIds[postSlotIds.length - 1];
-
-        if (userStatus?.latestPostSlotId) {
-          const currentLatestNum = parseInt(userStatus.latestPostSlotId.match(/_(\d+)$/)?.[1] || '0');
-          const newLatestNum = parseInt(highestPostSlot.match(/_(\d+)$/)?.[1] || '0');
-          
-          if (newLatestNum > currentLatestNum) {
-            updateFields.latestPostSlotId = highestPostSlot;
-            console.log(`[USER-STATUS-POST-LATEST] Updating ${userStatus.latestPostSlotId} → ${highestPostSlot}`);
-          }
-        } else {
-          updateFields.latestPostSlotId = highestPostSlot;
-        }
-
-        updateFields.normalPostSlotId = lowestPostSlot;
-        console.log(`[USER-STATUS-POST-NORMAL] Setting normalPostSlotId → ${lowestPostSlot}`);
-      }
-
-      // Perform the update
-      if (Object.keys(updateFields).length > 0) {
-        await db.collection('user_status').updateOne(
-          { _id: userId },
-          {
-            $set: {
-              ...updateFields,
-              updatedAt: new Date()
-            }
-          },
-          { upsert: true }
-        );
-
-        console.log(`[USER-STATUS-UPDATED] Fields: ${Object.keys(updateFields).join(', ')}`);
-      }
-    }
-
     const duration = Date.now() - startTime;
 
-    console.log(`[BATCH-CONTRIBUTION-COMPLETE] userId=${userId} | ${postOperations.length}P + ${reelOperations.length}R operations | ${duration}ms`);
+    console.log(`[BATCH-COMPLETE] userId=${userId} | ${postOperations.length}P + ${reelOperations.length}R operations in ${duration}ms`);
     
     if (reelSlotLookups.length > 0 || postSlotLookups.length > 0) {
-      console.warn(`[BATCH-PERFORMANCE-WARNING] Had to lookup ${reelSlotLookups.length} reel slots + ${postSlotLookups.length} post slots - client should provide slotId`);
+      console.warn(`[BATCH-PERFORMANCE] Had to lookup ${reelSlotLookups.length} reel slots + ${postSlotLookups.length} post slots - client should provide slotId`);
     }
 
     res.json({
@@ -3566,28 +3564,25 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
           modified: reelResults.modifiedCount || 0
         }
       },
-      userStatusUpdated: reelSlotsWritten.size > 0 || postSlotsWritten.size > 0,
-      slotsWritten: {
-        reels: Array.from(reelSlotsWritten),
-        posts: Array.from(postSlotsWritten)
-},
-performance: {
-reelSlotLookups: reelSlotLookups.length,
-postSlotLookups: postSlotLookups.length
-},
-requestId,
-duration
-});
-} catch (error) {
-const duration = Date.now() - startTime;
-console.error(`[BATCH-CONTRIBUTION-ERROR] requestId=${requestId} | ${error.message} | ${duration}ms`);
-res.status(500).json({
-  success: false,
-  error: error.message,
-  requestId,
-  duration
-});
-}
+      performance: {
+        reelSlotLookups: reelSlotLookups.length,
+        postSlotLookups: postSlotLookups.length
+      },
+      requestId,
+      duration
+    });
+
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.error(`[BATCH-ERROR] requestId=${requestId} | duration=${duration}ms`, error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      requestId,
+      duration
+    });
+  }
 });
 
 const slotCache = new SimpleLRU(10000, 60000); // same config as before
@@ -5545,7 +5540,7 @@ app.get('/api/user-status/:userId', async (req, res) => {
   const { userId } = req.params;
 
   try {
-    console.log(`[USER-STATUS-REQUEST] userId=${userId}`);
+    console.log(`[post_algorithm] [READ-1-START] user_status lookup for userId=${userId}`);
 
     const userStatus = await db.collection('user_status').findOne(
       { _id: userId },
@@ -5564,7 +5559,7 @@ app.get('/api/user-status/:userId', async (req, res) => {
     const duration = Date.now() - startTime;
 
     if (userStatus && userStatus.latestReelSlotId) {
-      // Normalize slot naming
+      // Case 1: User exists with correct fields
       let latestReelSlot = userStatus.latestReelSlotId || 'reel_0';
       let normalReelSlot = userStatus.normalReelSlotId || 'reel_0';
 
@@ -5575,7 +5570,7 @@ app.get('/api/user-status/:userId', async (req, res) => {
         normalReelSlot = normalReelSlot.replace('reels_', 'reel_');
       }
 
-      console.log(`[USER-STATUS-FOUND] duration=${duration}ms | latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${userStatus.latestPostSlotId || 'not_set'} | normalPost=${userStatus.normalPostSlotId || 'not_set'}`);
+      console.log(`[post_algorithm] [READ-1-SUCCESS] user_status EXISTS | duration=${duration}ms | latestReel=${latestReelSlot} | normalReel=${normalReelSlot}`);
 
       return res.json({
         success: true,
@@ -5587,13 +5582,18 @@ app.get('/api/user-status/:userId', async (req, res) => {
         duration
       });
     } else if (userStatus && !userStatus.latestReelSlotId) {
-      console.log(`[USER-STATUS-INCOMPLETE] Document exists but missing slot fields - auto-detecting...`);
+      // Case 2: Document exists but missing fields
+      console.log(`[post_algorithm] [READ-1-INCOMPLETE] Document exists but missing slot fields - updating`);
 
-      // Auto-detect logic (read all slots)
-      const [reelDocs, postDocs] = await Promise.all([
-        db.collection('reels').find({}, { projection: { _id: 1 } }).toArray(),
-        db.collection('posts').find({}, { projection: { _id: 1 } }).toArray()
-      ]);
+      const detectionStart = Date.now();
+
+      const reelDocs = await db.collection('reels')
+        .find({}, { projection: { _id: 1 } })
+        .toArray();
+
+      const postDocs = await db.collection('posts')
+        .find({}, { projection: { _id: 1 } })
+        .toArray();
 
       const reelIds = reelDocs
         .map(doc => doc._id)
@@ -5613,17 +5613,17 @@ app.get('/api/user-status/:userId', async (req, res) => {
           return numB - numA;
         });
 
-      // ✅ CRITICAL: normalSlot = latest - 4 for fresh users
+      // ✅ CRITICAL FIX: For fresh user, normal = latest - 2 (not latest - 1)
       const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
-      const latestReelNum = parseInt(latestReelSlot.match(/_(\d+)$/)?.[1] || '0');
-      const normalReelSlot = `reel_${Math.max(latestReelNum - 4, 0)}`;
+      const normalReelSlot = reelIds.length > 2 ? reelIds[2] : (reelIds[0] || 'reel_0');  // ✅ FIXED: index 2, not 1
 
       const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
-      const latestPostNum = parseInt(latestPostSlot.match(/_(\d+)$/)?.[1] || '0');
-      const normalPostSlot = `post_${Math.max(latestPostNum - 4, 0)}`;
+      const normalPostSlot = postIds.length > 2 ? postIds[2] : (postIds[0] || 'post_0');  // ✅ FIXED: index 2, not 1
 
-      console.log(`[USER-STATUS-AUTO-DETECT] Found ${reelIds.length} reels, ${postIds.length} posts`);
-      console.log(`[USER-STATUS-AUTO-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
+      const detectionDuration = Date.now() - detectionStart;
+
+      console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
+      console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
 
       await db.collection('user_status').updateOne(
         { _id: userId },
@@ -5643,7 +5643,8 @@ app.get('/api/user-status/:userId', async (req, res) => {
       );
 
       const totalDuration = Date.now() - startTime;
-      console.log(`[USER-STATUS-UPDATED] total_duration=${totalDuration}ms | reads=3`);
+
+      console.log(`[post_algorithm] [READ-1-UPDATED] Document updated with detected slots | total_duration=${totalDuration}ms | reads=3`);
 
       return res.json({
         success: true,
@@ -5656,13 +5657,18 @@ app.get('/api/user-status/:userId', async (req, res) => {
         wasIncomplete: true
       });
     } else {
-      console.log(`[USER-STATUS-NOT-FOUND] Creating new user_status...`);
+      // Case 3: No document exists at all - CREATE new one
+      console.log(`[post_algorithm] [READ-1-NEW-USER] User status doesn't exist - auto-detecting latest documents`);
 
-      // Auto-detect for new users
-      const [reelDocs, postDocs] = await Promise.all([
-        db.collection('reels').find({}, { projection: { _id: 1 } }).toArray(),
-        db.collection('posts').find({}, { projection: { _id: 1 } }).toArray()
-      ]);
+      const detectionStart = Date.now();
+
+      const reelDocs = await db.collection('reels')
+        .find({}, { projection: { _id: 1 } })
+        .toArray();
+
+      const postDocs = await db.collection('posts')
+        .find({}, { projection: { _id: 1 } })
+        .toArray();
 
       const reelIds = reelDocs
         .map(doc => doc._id)
@@ -5682,17 +5688,20 @@ app.get('/api/user-status/:userId', async (req, res) => {
           return numB - numA;
         });
 
-      // ✅ CRITICAL: normalSlot = latest - 4
+      // ✅ CRITICAL FIX: For fresh user, normal = latest - 2 (not latest - 1)
+      // Example: If latest is reel_10, read [reel_10, reel_9, reel_8]
+      // So: latestReelSlotId = reel_10, normalReelSlotId = reel_8
       const latestReelSlot = reelIds.length > 0 ? reelIds[0] : 'reel_0';
-      const latestReelNum = parseInt(latestReelSlot.match(/_(\d+)$/)?.[1] || '0');
-      const normalReelSlot = `reel_${Math.max(latestReelNum - 4, 0)}`;
+      const normalReelSlot = reelIds.length > 2 ? reelIds[2] : (reelIds[0] || 'reel_0');  // ✅ FIXED: index 2, not 1
 
       const latestPostSlot = postIds.length > 0 ? postIds[0] : 'post_0';
-      const latestPostNum = parseInt(latestPostSlot.match(/_(\d+)$/)?.[1] || '0');
-      const normalPostSlot = `post_${Math.max(latestPostNum - 4, 0)}`;
+      const normalPostSlot = postIds.length > 2 ? postIds[2] : (postIds[0] || 'post_0');  // ✅ FIXED: index 2, not 1
 
-      console.log(`[USER-STATUS-CREATE] Found ${reelIds.length} reels, ${postIds.length} posts`);
-      console.log(`[USER-STATUS-CREATE-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
+      const detectionDuration = Date.now() - detectionStart;
+
+      console.log(`[post_algorithm] [AUTO-DETECT-SUCCESS] duration=${detectionDuration}ms | Found ${reelIds.length} reel docs, ${postIds.length} post docs`);
+      console.log(`[post_algorithm] [AUTO-DETECT-SLOTS] latestReel=${latestReelSlot} | normalReel=${normalReelSlot} | latestPost=${latestPostSlot} | normalPost=${normalPostSlot}`);
+      console.log(`[post_algorithm] [FRESH-USER-EXPLANATION] Will read slots: [${latestReelSlot}, ${reelIds[1] || 'N/A'}, ${normalReelSlot}]`);
 
       const defaultStatus = {
         _id: userId,
@@ -5708,7 +5717,8 @@ app.get('/api/user-status/:userId', async (req, res) => {
       await db.collection('user_status').insertOne(defaultStatus);
 
       const totalDuration = Date.now() - startTime;
-      console.log(`[USER-STATUS-CREATED] total_duration=${totalDuration}ms | reads=3`);
+
+      console.log(`[post_algorithm] [READ-1-CREATED] New user_status created | total_duration=${totalDuration}ms | reads=3`);
 
       return res.json({
         success: true,
@@ -5723,7 +5733,7 @@ app.get('/api/user-status/:userId', async (req, res) => {
     }
 
   } catch (error) {
-    console.error(`[USER-STATUS-ERROR] ${error.message}`);
+    console.error(`[post_algorithm] [READ-1-ERROR] ${error.message}`);
     return res.status(500).json({
       success: false,
       error: 'Failed to read user_status: ' + error.message,
