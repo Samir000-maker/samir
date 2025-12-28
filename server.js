@@ -5970,6 +5970,23 @@ duration: Date.now() - startTime
 
 
 
+app.use((req, res) => {
+  console.warn(`[404-NOT-FOUND] ${req.method} ${req.originalUrl} - No route handler exists`);
+  
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found',
+    requestedPath: req.originalUrl,
+    method: req.method,
+    message: 'This endpoint does not exist on this server'
+  });
+});
+
+// Error handler (keep your existing one below this)
+app.use((err, req, res, next) => {
+  console.error('[UNHANDLED-ERROR]', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
 
 // Error handler
