@@ -3580,7 +3580,7 @@ duration
 });
 } catch (error) {
 const duration = Date.now() - startTime;
-console.error([BATCH-CONTRIBUTION-ERROR] requestId=${requestId} | ${error.message} | ${duration}ms);
+console.error(`[BATCH-CONTRIBUTION-ERROR] requestId=${requestId} | ${error.message} | ${duration}ms`);
 res.status(500).json({
   success: false,
   error: error.message,
