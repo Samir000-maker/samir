@@ -1329,53 +1329,57 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
         }
         
       } else {
-        // ============================================================
-        // NORMAL BACKWARD TRAVERSAL (Case 3)
-        // ============================================================
-        console.log(`[MONITORING SAMIR] [CASE-3] NORMAL-BACKWARD: normalSlot at index ${normalIndex}`);
-        
-        // Before moving backward, recheck forward one more time
-        const forwardRecheck = `${collection.slice(0, -1)}_${latestIndex + 1}`;
-        console.log(`[MONITORING SAMIR] [FORWARD-RECHECK] Re-checking ${forwardRecheck} before backward movement`);
-        
-        const recheckStart = Date.now();
-        const recheckExists = await this.db.collection(collection).findOne(
-          { _id: forwardRecheck },
-          { projection: { _id: 1 } }
-        );
-        documentsChecked.push({ slot: forwardRecheck, exists: !!recheckExists, duration: Date.now() - recheckStart });
-        console.log(`[MONITORING SAMIR] [CHECKED-DOCUMENT] ${forwardRecheck} | Exists: ${!!recheckExists} | Duration: ${Date.now() - recheckStart}ms`);
-        
-        if (recheckExists) {
-          console.log(`[MONITORING SAMIR] [FORWARD-FOUND-ON-RECHECK] ${forwardRecheck} exists! Prioritizing forward`);
-          
-          slotsToRead = [
-            forwardRecheck,
-            currentNormalSlot,
-            `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`
-          ];
-          
-          newLatestSlot = forwardRecheck;
-          newNormalSlot = slotsToRead[2];
-          
-          console.log(`[MONITORING SAMIR] [CASE-3-FORWARD-PLAN] Will read: [${slotsToRead.join(', ')}]`);
-        } else {
-          // Backward traversal
-          slotsToRead = [
-            currentNormalSlot,
-            `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`,
-            `${collection.slice(0, -1)}_${Math.max(normalIndex - 2, 0)}`
-          ];
-          
-          slotsToRead = [...new Set(slotsToRead)];
-          
-          newLatestSlot = currentLatestSlot;
-          newNormalSlot = slotsToRead[slotsToRead.length - 1];
-          
-          console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] Will read: [${slotsToRead.join(', ')}]`);
-          console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] Will save: latestSlot=${newLatestSlot} (unchanged), normalSlot=${newNormalSlot}`);
-        }
-      }
+  // ============================================================
+  // NORMAL BACKWARD TRAVERSAL (Case 3)
+  // ============================================================
+  console.log(`[MONITORING SAMIR] [CASE-3] NORMAL-BACKWARD: normalSlot at index ${normalIndex}`);
+  
+  // Before moving backward, recheck forward one more time
+  const forwardRecheck = `${collection.slice(0, -1)}_${latestIndex + 1}`;
+  console.log(`[MONITORING SAMIR] [FORWARD-RECHECK] Re-checking ${forwardRecheck} before backward movement`);
+  
+  const recheckStart = Date.now();
+  const recheckExists = await this.db.collection(collection).findOne(
+    { _id: forwardRecheck },
+    { projection: { _id: 1 } }
+  );
+  documentsChecked.push({ slot: forwardRecheck, exists: !!recheckExists, duration: Date.now() - recheckStart });
+  console.log(`[MONITORING SAMIR] [CHECKED-DOCUMENT] ${forwardRecheck} | Exists: ${!!recheckExists} | Duration: ${Date.now() - recheckStart}ms`);
+  
+  if (recheckExists) {
+    console.log(`[MONITORING SAMIR] [FORWARD-FOUND-ON-RECHECK] ${forwardRecheck} exists! Prioritizing forward`);
+    
+    slotsToRead = [
+      forwardRecheck,
+      currentNormalSlot,
+      `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`
+    ];
+    
+    // ✅ CRITICAL FIX: Remove duplicates
+    slotsToRead = [...new Set(slotsToRead)];
+    
+    newLatestSlot = forwardRecheck;
+    newNormalSlot = slotsToRead[slotsToRead.length - 1];
+    
+    console.log(`[MONITORING SAMIR] [CASE-3-FORWARD-PLAN] Will read: [${slotsToRead.join(', ')}]`);
+  } else {
+    // Backward traversal
+    slotsToRead = [
+      currentNormalSlot,
+      `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`,
+      `${collection.slice(0, -1)}_${Math.max(normalIndex - 2, 0)}`
+    ];
+    
+    // ✅ CRITICAL FIX: Remove duplicates BEFORE assigning newNormalSlot
+    slotsToRead = [...new Set(slotsToRead)];
+    
+    newLatestSlot = currentLatestSlot;
+    newNormalSlot = slotsToRead[slotsToRead.length - 1];
+    
+    console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] Will read: [${slotsToRead.join(', ')}]`);
+    console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] Will save: latestSlot=${newLatestSlot} (unchanged), normalSlot=${newNormalSlot}`);
+  }
+}
     }
   }
 
@@ -1583,32 +1587,38 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     if (commentsDiff !== 0) return commentsDiff;
     return (b.viewCount || 0) - (a.viewCount || 0);
   });
-
-  // ============================================================
-  // PHASE 8: UPDATE USER STATUS
-  // ============================================================
-  if (newLatestSlot && newNormalSlot) {
-    console.log(`\n[MONITORING SAMIR] [PHASE-8] UPDATING USER_STATUS - Saving new slot IDs`);
-    const updateStart = Date.now();
-    
-    // Track slot_0 visits
-    const updateData = {
-      [statusField]: newLatestSlot,
-      [normalField]: newNormalSlot
-    };
-    
-    if (newNormalSlot === `${collection.slice(0, -1)}_0`) {
-      const currentVisits = userStatus?.[visitField] || 0;
-      updateData[visitField] = currentVisits + 1;
-      console.log(`[MONITORING SAMIR] [SLOT-0-VISIT-INCREMENT] Visit count: ${currentVisits} → ${currentVisits + 1}`);
-    }
-    
-    await this.updateUserStatus(userId, updateData);
-    
-    console.log(`[MONITORING SAMIR] [USER-STATUS-UPDATE] Saved in ${Date.now() - updateStart}ms | latest=${newLatestSlot}, normal=${newNormalSlot}`);
-  } else {
-    console.log(`\n[MONITORING SAMIR] [PHASE-8] SKIP USER_STATUS UPDATE - No changes needed`);
+if (newLatestSlot && newNormalSlot) {
+  console.log(`\n[MONITORING SAMIR] [PHASE-8] UPDATING USER_STATUS - Saving new slot IDs`);
+  const updateStart = Date.now();
+  
+  // Track slot_0 visits
+  const updateData = {
+    [statusField]: newLatestSlot,
+    [normalField]: newNormalSlot
+  };
+  
+  if (newNormalSlot === `${collection.slice(0, -1)}_0`) {
+    const currentVisits = userStatus?.[visitField] || 0;
+    updateData[visitField] = currentVisits + 1;
+    console.log(`[MONITORING SAMIR] [SLOT-0-VISIT-INCREMENT] Visit count: ${currentVisits} → ${currentVisits + 1}`);
   }
+  
+  await this.updateUserStatus(userId, updateData);
+  
+  // ✅ CRITICAL: Clear cache immediately after update
+  const feedCacheKey = `feed_${contentType}_${userId}`;
+  if (redisClient) {
+    await redisClient.del(feedCacheKey).catch(() => {});
+  }
+  if (cache[feedCacheKey]) {
+    cache[feedCacheKey].clear();
+  }
+  
+  console.log(`[MONITORING SAMIR] [USER-STATUS-UPDATE] Saved in ${Date.now() - updateStart}ms | latest=${newLatestSlot}, normal=${newNormalSlot}`);
+  console.log(`[MONITORING SAMIR] [CACHE-CLEARED] Feed cache invalidated for next request`);
+} else {
+  console.log(`\n[MONITORING SAMIR] [PHASE-8] SKIP USER_STATUS UPDATE - No changes needed`);
+}
 
   const duration = Date.now() - start;
   const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
@@ -1673,39 +1683,32 @@ await setCache(cacheKey, statusDoc, CACHE_TTL_MEDIUM);
 return statusDoc || null;
 }
 
-// Apply same pattern to ALL getCache/setCache calls throughout the code
-
-// Add this to your user_status update logic
 async updateUserStatus(userId, updates) {
   const start = Date.now();
   
-  // Track reel_0 and post_0 visits
-  if (updates.normalReelSlotId === 'reel_0' || updates.normalPostSlotId === 'post_0') {
-    const currentStatus = await this.db.collection('user_status').findOne(
-      { _id: userId },
-      { projection: { reel_0_visits: 1, post_0_visits: 1 } }
-    );
-    
-    if (updates.normalReelSlotId === 'reel_0') {
-      updates.reel_0_visits = (currentStatus?.reel_0_visits || 0) + 1;
-      console.log(`[MONITORING SAMIR] [REEL-0-VISIT-COUNTER] User reached reel_0 for the ${updates.reel_0_visits} time`);
-    }
-    
-    if (updates.normalPostSlotId === 'post_0') {
-      updates.post_0_visits = (currentStatus?.post_0_visits || 0) + 1;
-      console.log(`[MONITORING SAMIR] [POST-0-VISIT-COUNTER] User reached post_0 for the ${updates.post_0_visits} time`);
-    }
-  }
+  console.log(`[MONITORING SAMIR] [UPDATE-USER-STATUS-START] userId=${userId} | updates=${JSON.stringify(updates)}`);
   
   const result = await this.db.collection('user_status').updateOne(
     { _id: userId },
-    { $set: { ...updates, updatedAt: new Date().toISOString() } },
+    { 
+      $set: { 
+        ...updates, 
+        updatedAt: new Date().toISOString() 
+      } 
+    },
     { upsert: true }
   );
+  
   logDbOp('updateOne', 'user_status', { _id: userId }, result, Date.now() - start);
 
-  // Update cache
-  setCache(`user_status_${userId}`, { _id: userId, ...updates, updatedAt: new Date().toISOString() });
+  console.log(`[MONITORING SAMIR] [UPDATE-USER-STATUS-COMPLETE] matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
+
+  // ✅ CRITICAL FIX: Update cache immediately after DB write
+  const cacheKey = `user_status_${userId}`;
+  const updatedDoc = { _id: userId, ...updates, updatedAt: new Date().toISOString() };
+  await setCache(cacheKey, updatedDoc, CACHE_TTL_MEDIUM);
+  
+  console.log(`[MONITORING SAMIR] [CACHE-UPDATED] ${cacheKey} refreshed with new values`);
 }
 
 async getLatestSlotOptimized(collection) {
@@ -2039,14 +2042,12 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
     reels.length > 0 && { type: 'reels', collection: 'contrib_reels', ids: reels }
   ].filter(Boolean);
 
-  // Track slot IDs for user_status update
   const reelSlotIds = new Set();
   const postSlotIds = new Set();
 
   for (const op of operations) {
     const start = Date.now();
     
-    // Extract slot IDs from the contributions
     for (const item of op.ids) {
       const postId = typeof item === 'string' ? item : item.postId;
       const slotId = typeof item === 'object' ? item.slotId : null;
@@ -2078,7 +2079,7 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
     results.push({ type: op.type, result });
   }
 
-  // ✅ UPDATE USER_STATUS with latest slot IDs
+  // ✅ CRITICAL FIX: Update user_status with latest slot IDs AND clear cache
   if (reelSlotIds.size > 0 || postSlotIds.size > 0) {
     console.log(`[MONITORING SAMIR] [UPDATE-USER-STATUS-FROM-CONTRIB] Updating user_status with latest slot info`);
     
@@ -2117,6 +2118,24 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
     }
     
     await this.updateUserStatus(userId, updateData);
+    
+    // ✅ CRITICAL: Clear feed cache to force fresh fetch
+    const cacheKeys = [
+      `feed_reels_${userId}`,
+      `feed_posts_${userId}`,
+      `user_status_${userId}`
+    ];
+    
+    for (const key of cacheKeys) {
+      if (redisClient) {
+        await redisClient.del(key).catch(() => {});
+      }
+      if (cache[key]) {
+        cache[key].clear();
+      }
+    }
+    
+    console.log(`[MONITORING SAMIR] [CACHE-CLEARED] Invalidated feed caches for fresh data`);
   }
 
   return results;
