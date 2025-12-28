@@ -1362,26 +1362,22 @@ if (normalIndex === 0) {
     
     console.log(`[MONITORING SAMIR] [CASE-3-FORWARD-PLAN] Will read: [${slotsToRead.join(', ')}]`);
   } else {
-    // ✅ CRITICAL FIX: Ensure reel_0 is included when moving backward
-    const slot1 = currentNormalSlot; // e.g., reel_3
-    const slot2 = normalIndex >= 1 ? `${collection.slice(0, -1)}_${normalIndex - 1}` : `${collection.slice(0, -1)}_0`; // e.g., reel_2
-    const slot3 = normalIndex >= 2 ? `${collection.slice(0, -1)}_${normalIndex - 2}` : `${collection.slice(0, -1)}_0`; // e.g., reel_1 or reel_0
+    // ✅ CRITICAL FIX: Build backward sequence that ALWAYS reaches reel_0
+    const backwardSlots = [];
     
-    slotsToRead = [slot1, slot2, slot3];
-    
-    // ✅ Remove duplicates BUT ensure reel_0 is prioritized if present
-    slotsToRead = [...new Set(slotsToRead)];
-    
-    // ✅ FORCE reel_0 inclusion if normalIndex is low
-    if (normalIndex <= 2 && !slotsToRead.includes(`${collection.slice(0, -1)}_0`)) {
-      slotsToRead.push(`${collection.slice(0, -1)}_0`);
-      slotsToRead = slotsToRead.slice(0, 3); // Keep max 3
+    // Start from currentNormalSlot and go backward
+    for (let i = normalIndex; i >= 0 && backwardSlots.length < 3; i--) {
+      backwardSlots.push(`${collection.slice(0, -1)}_${i}`);
     }
     
-    newLatestSlot = currentLatestSlot;
-    newNormalSlot = slotsToRead[slotsToRead.length - 1];
+    // If we have less than 3 slots (e.g., normalIndex was 1 or 0), fill with what we have
+    slotsToRead = backwardSlots;
     
-    console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] Will read: [${slotsToRead.join(', ')}]`);
+    newLatestSlot = currentLatestSlot; // Unchanged
+    newNormalSlot = backwardSlots[backwardSlots.length - 1]; // Last slot we read
+    
+    console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] normalIndex=${normalIndex} | Building backward sequence`);
+    console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-SLOTS] Will read: [${slotsToRead.join(', ')}]`);
     console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] Will save: latestSlot=${newLatestSlot} (unchanged), normalSlot=${newNormalSlot}`);
   }
 }
