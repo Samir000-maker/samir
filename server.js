@@ -1084,7 +1084,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
   console.log(`${'='.repeat(80)}`);
 
   // ============================================================
-  // READ 1: Get user status
+  // READ 1: Get user status - ALWAYS FRESH, NO CACHE
   // ============================================================
   console.log(`[MONITORING SAMIR] [READ-1] Checking user_status collection for userId=${userId}`);
   const userStatusReadStart = Date.now();
@@ -1663,31 +1663,34 @@ return {
 
 
 async getUserStatus(userId) {
-const cacheKey = `user_status_${userId}`;
-const cached = await getCache(cacheKey);
-if (cached) {
-console.log(`[CACHE-HIT] user_status for ${userId} | Source: Redis/Memory`);
-return cached;
-}
+  // ❌ REMOVE CACHE CHECK
+  // const cacheKey = `user_status_${userId}`;
+  // const cached = await getCache(cacheKey);
+  // if (cached) {
+  //   console.log(`[CACHE-HIT] user_status for ${userId} | Source: Redis/Memory`);
+  //   return cached;
+  // }
 
-const readsBefore = dbOpCounters.reads;
-const start = Date.now();
+  const readsBefore = dbOpCounters.reads;
+  const start = Date.now();
 
-const statusDoc = await this.db.collection('user_status').findOne({ _id: userId });
+  const statusDoc = await this.db.collection('user_status').findOne({ _id: userId });
 
-const readsUsed = dbOpCounters.reads - readsBefore;
-const time = Date.now() - start;
+  const readsUsed = dbOpCounters.reads - readsBefore;
+  const time = Date.now() - start;
 
-logDbOp('findOne', 'user_status', { _id: userId }, statusDoc, time, {
-docsExamined: statusDoc ? 1 : 0
-});
+  logDbOp('findOne', 'user_status', { _id: userId }, statusDoc, time, {
+    docsExamined: statusDoc ? 1 : 0
+  });
 
-console.log(`[USER-STATUS-QUERY] userId=${userId} | DB Reads: ${readsUsed} | Cache: MISS | Time: ${time}ms`);
+  console.log(`[USER-STATUS-QUERY] userId=${userId} | DB Reads: ${readsUsed} | Cache: DISABLED | Time: ${time}ms`);
 
-if (statusDoc) {
-await setCache(cacheKey, statusDoc, CACHE_TTL_MEDIUM);
-}
-return statusDoc || null;
+  // ❌ REMOVE CACHE SET
+  // if (statusDoc) {
+  //   await setCache(cacheKey, statusDoc, CACHE_TTL_MEDIUM);
+  // }
+  
+  return statusDoc || null;
 }
 
 async updateUserStatus(userId, updates) {
@@ -1710,12 +1713,12 @@ async updateUserStatus(userId, updates) {
 
   console.log(`[MONITORING SAMIR] [UPDATE-USER-STATUS-COMPLETE] matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
 
-  // ✅ CRITICAL FIX: Update cache immediately after DB write
-  const cacheKey = `user_status_${userId}`;
-  const updatedDoc = { _id: userId, ...updates, updatedAt: new Date().toISOString() };
-  await setCache(cacheKey, updatedDoc, CACHE_TTL_MEDIUM);
+  // ❌ REMOVE THESE LINES - NO CACHING
+  // const cacheKey = `user_status_${userId}`;
+  // const updatedDoc = { _id: userId, ...updates, updatedAt: new Date().toISOString() };
+  // await setCache(cacheKey, updatedDoc, CACHE_TTL_MEDIUM);
   
-  console.log(`[MONITORING SAMIR] [CACHE-UPDATED] ${cacheKey} refreshed with new values`);
+  console.log(`[MONITORING SAMIR] [NO-CACHE] user_status updated without caching`);
 }
 
 async getLatestSlotOptimized(collection) {
@@ -2055,7 +2058,7 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
   for (const op of operations) {
     const start = Date.now();
     
-    // ✅ Extract slotIds from items
+    // Extract slotIds from items
     for (const item of op.ids) {
       const postId = typeof item === 'string' ? item : item.postId;
       const slotId = typeof item === 'object' ? item.slotId : null;
@@ -2069,6 +2072,7 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
       }
     }
 
+    // ✅ CRITICAL: Use ordered: true to ensure sequential execution
     const result = await this.db.collection(op.collection).bulkWrite([{
       updateOne: {
         filter: { userId, slotId: { $in: Array.from(op.type === 'reels' ? reelSlotIds : postSlotIds) } },
@@ -2079,7 +2083,7 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
         },
         upsert: true
       }
-    }], { ordered: false });
+    }], { ordered: true }); // ✅ CHANGED: Force sequential execution
     
     const duration = Date.now() - start;
     logDbOp('bulkWrite', op.collection, { userId }, result, duration);
@@ -2087,9 +2091,9 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
     results.push({ type: op.type, result });
   }
 
-  // ✅ CRITICAL FIX: Update user_status IMMEDIATELY after contrib save
+  // ✅ CRITICAL: IMMEDIATE user_status UPDATE (not async, wait for completion)
   if (reelSlotIds.size > 0 || postSlotIds.size > 0) {
-    console.log(`[MONITORING SAMIR] [REALTIME-USER-STATUS-UPDATE] Syncing user_status with contrib data`);
+    console.log(`[MONITORING SAMIR] [FORCE-USER-STATUS-UPDATE] Updating user_status IMMEDIATELY`);
     
     const updateData = {};
     
@@ -2097,16 +2101,13 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
       const reelSlotArray = Array.from(reelSlotIds).sort((a, b) => {
         const numA = parseInt(a.split('_')[1]) || 0;
         const numB = parseInt(b.split('_')[1]) || 0;
-        return numB - numA; // Descending
+        return numB - numA;
       });
       
-      const latestReelSlot = reelSlotArray[0]; // Highest index
-      const normalReelSlot = reelSlotArray[reelSlotArray.length - 1]; // Lowest index
+      updateData.latestReelSlotId = reelSlotArray[0];
+      updateData.normalReelSlotId = reelSlotArray[reelSlotArray.length - 1];
       
-      updateData.latestReelSlotId = latestReelSlot;
-      updateData.normalReelSlotId = normalReelSlot;
-      
-      console.log(`[MONITORING SAMIR] [USER-STATUS-REELS-UPDATE] latest=${latestReelSlot}, normal=${normalReelSlot}`);
+      console.log(`[MONITORING SAMIR] [USER-STATUS-REELS-UPDATE] latest=${updateData.latestReelSlotId}, normal=${updateData.normalReelSlotId}`);
     }
     
     if (postSlotIds.size > 0) {
@@ -2116,35 +2117,16 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
         return numB - numA;
       });
       
-      const latestPostSlot = postSlotArray[0];
-      const normalPostSlot = postSlotArray[postSlotArray.length - 1];
+      updateData.latestPostSlotId = postSlotArray[0];
+      updateData.normalPostSlotId = postSlotArray[postSlotArray.length - 1];
       
-      updateData.latestPostSlotId = latestPostSlot;
-      updateData.normalPostSlotId = normalPostSlot;
-      
-      console.log(`[MONITORING SAMIR] [USER-STATUS-POSTS-UPDATE] latest=${latestPostSlot}, normal=${normalPostSlot}`);
+      console.log(`[MONITORING SAMIR] [USER-STATUS-POSTS-UPDATE] latest=${updateData.latestPostSlotId}, normal=${updateData.normalPostSlotId}`);
     }
     
-    // ✅ FORCE UPDATE user_status NOW
+    // ✅ CRITICAL: WAIT for update to complete (don't use Promise.all or async)
     await this.updateUserStatus(userId, updateData);
     
-    // ✅ FORCE CACHE INVALIDATION
-    const cacheKeys = [
-      `feed_reels_${userId}`,
-      `feed_posts_${userId}`,
-      `user_status_${userId}`
-    ];
-    
-    for (const key of cacheKeys) {
-      if (redisClient) {
-        await redisClient.del(key).catch(() => {});
-      }
-      if (cache[key]) {
-        cache[key].clear();
-      }
-    }
-    
-    console.log(`[MONITORING SAMIR] [REALTIME-SYNC-COMPLETE] user_status updated & cache cleared`);
+    console.log(`[MONITORING SAMIR] [FORCE-SYNC-COMPLETE] user_status updated IMMEDIATELY`);
   }
 
   return results;
@@ -3572,19 +3554,18 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
       return res.json({ ...result, servedFromDuplicatePrevention: true });
     }
 
-    // Check cache
-    const cacheKey = `feed_${contentType}_${userId}`;
-    const cached = await getCache(cacheKey);
-    if (cached && cached.content && cached.content.length >= parseInt(minContent)) {
-      console.log(`[CACHE-SERVED] ${requestKey} | Items: ${cached.content.length}`);
-      return res.json({ ...cached, servedFromCache: true });
-    }
+    // ❌ REMOVE CACHE CHECK
+    // const cacheKey = `feed_${contentType}_${userId}`;
+    // const cached = await getCache(cacheKey);
+    // if (cached && cached.content && cached.content.length >= parseInt(minContent)) {
+    //   console.log(`[CACHE-SERVED] ${requestKey} | Items: ${cached.content.length}`);
+    //   return res.json({ ...cached, servedFromCache: true });
+    // }
 
     const requestPromise = (async () => {
       try {
         const dbReadsBefore = dbOpCounters.reads;
 
-        // ✅ CRITICAL FIX: Call getOptimizedFeedFixedReads instead of getOptimizedFeed
         const feedData = await dbManager.getOptimizedFeedFixedReads(
           userId, 
           contentType, 
@@ -3595,15 +3576,14 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
 
         console.log(`[FEED-DB-QUERY] ${requestKey} | DB reads: ${dbReadsUsed} | Items: ${feedData.content?.length || 0}`);
 
-        // ✅ Verify read count (should be MAX 7)
         if (dbReadsUsed > 7) {
           console.warn(`⚠️ [READ-LIMIT-EXCEEDED] ${contentType} used ${dbReadsUsed} reads (limit: 7)`);
         }
 
-        // Cache for 30 seconds
-        if (feedData.content && feedData.content.length > 0) {
-          await setCache(cacheKey, feedData, 30000);
-        }
+        // ❌ REMOVE CACHE SET
+        // if (feedData.content && feedData.content.length > 0) {
+        //   await setCache(cacheKey, feedData, 30000);
+        // }
 
         return {
           success: true,
