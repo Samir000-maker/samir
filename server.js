@@ -1200,7 +1200,7 @@ if (normalIndex === 0) {
     
     const forwardSlots = [];
     
-    // Check forward slots after latestSlot
+    // ✅ Check forward slots STARTING FROM latestIndex + 1
     for (let i = latestIndex + 1; i <= latestIndex + 3; i++) {
       const checkSlot = `${collection.slice(0, -1)}_${i}`;
       const checkStart = Date.now();
@@ -1210,40 +1210,39 @@ if (normalIndex === 0) {
       );
       const checkDuration = Date.now() - checkStart;
       documentsChecked.push({ slot: checkSlot, exists: !!exists, duration: checkDuration });
-      console.log(`[MONITORING SAMIR] [CHECKED-DOCUMENT] ${checkSlot} | Exists: ${!!exists} | Duration: ${checkDuration}ms`);
+      console.log(`[MONITORING SAMIR] [CASE-4-FORWARD-CHECK] ${checkSlot} | Exists: ${!!exists} | Duration: ${checkDuration}ms`);
       
       if (exists) {
         forwardSlots.push(checkSlot);
       } else {
-        break; // Stop at first missing slot
+        break; // ✅ Stop at first missing slot
       }
     }
     
     if (forwardSlots.length > 0) {
-      // Found newer slots
+      // ✅ Found forward slots - read [slot_0, forward_1, forward_2]
       slotsToRead = [
         currentNormalSlot, // slot_0
-        forwardSlots[0],
-        forwardSlots[1] || currentLatestSlot
-      ].filter((v, i, a) => a.indexOf(v) === i); // Remove duplicates
+        ...forwardSlots.slice(0, 2) // Take max 2 forward
+      ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3); // ✅ Max 3 slots
       
       newLatestSlot = forwardSlots[forwardSlots.length - 1];
-      newNormalSlot = currentNormalSlot; // Stay at slot_0
+      newNormalSlot = currentNormalSlot; // ✅ Stay at slot_0
       
-      console.log(`[MONITORING SAMIR] [CASE-4-PLAN] Found ${forwardSlots.length} forward slots | Will read: [${slotsToRead.join(', ')}]`);
-      console.log(`[MONITORING SAMIR] [CASE-4-STRATEGY] Use MEDIUM engagement for interest-matched content`);
+      console.log(`[MONITORING SAMIR] [CASE-4-FORWARD-FOUND] Will read: [${slotsToRead.join(', ')}]`);
+      console.log(`[MONITORING SAMIR] [CASE-4-STRATEGY] Use MEDIUM engagement (50%+ retention OR 20+ likes)`);
     } else {
-      // No forward slots
+      // ✅ No forward slots - read [slot_0, latest, latest-1]
       slotsToRead = [
         currentNormalSlot, // slot_0
         currentLatestSlot,
         `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`
-      ].filter((v, i, a) => a.indexOf(v) === i);
+      ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
       
-      newLatestSlot = currentLatestSlot;
-      newNormalSlot = currentNormalSlot; // Stay at slot_0
+      newLatestSlot = currentLatestSlot; // ✅ Unchanged
+      newNormalSlot = currentNormalSlot; // ✅ Stay at slot_0
       
-      console.log(`[MONITORING SAMIR] [CASE-4-PLAN] No forward slots | Will read: [${slotsToRead.join(', ')}]`);
+      console.log(`[MONITORING SAMIR] [CASE-4-NO-FORWARD] Will read: [${slotsToRead.join(', ')}]`);
     }
     
   } 
@@ -1251,9 +1250,9 @@ if (normalIndex === 0) {
   // CASE 5: SECOND TIME AT SLOT_0
   // ============================================================
   else if (slot0Visits === 1) {
-    console.log(`[MONITORING SAMIR] [CASE-5] SECOND TIME at slot_0 - high engagement only`);
+    console.log(`[MONITORING SAMIR] [CASE-5] SECOND TIME at slot_0 - HIGH engagement only`);
     
-    // Check forward first
+    // ✅ Check forward first
     const forwardSlot = `${collection.slice(0, -1)}_${latestIndex + 1}`;
     const forwardCheckStart = Date.now();
     const forwardExists = await this.db.collection(collection).findOne(
@@ -1261,42 +1260,44 @@ if (normalIndex === 0) {
       { projection: { _id: 1 } }
     );
     documentsChecked.push({ slot: forwardSlot, exists: !!forwardExists, duration: Date.now() - forwardCheckStart });
-    console.log(`[MONITORING SAMIR] [CHECKED-DOCUMENT] ${forwardSlot} | Exists: ${!!forwardExists} | Duration: ${Date.now() - forwardCheckStart}ms`);
+    console.log(`[MONITORING SAMIR] [CASE-5-FORWARD-CHECK] ${forwardSlot} | Exists: ${!!forwardExists} | Duration: ${Date.now() - forwardCheckStart}ms`);
     
     if (forwardExists) {
+      // ✅ Read [slot_0, forward, latest]
       slotsToRead = [
         currentNormalSlot, // slot_0
         forwardSlot,
         currentLatestSlot
-      ].filter((v, i, a) => a.indexOf(v) === i);
+      ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
       
       newLatestSlot = forwardSlot;
-      newNormalSlot = currentNormalSlot; // Stay at slot_0
+      newNormalSlot = currentNormalSlot; // ✅ Stay at slot_0
       
-      console.log(`[MONITORING SAMIR] [CASE-5-PLAN] Forward found | Will read: [${slotsToRead.join(', ')}]`);
+      console.log(`[MONITORING SAMIR] [CASE-5-FORWARD-FOUND] Will read: [${slotsToRead.join(', ')}]`);
     } else {
+      // ✅ Read [slot_0, latest, latest-1]
       slotsToRead = [
         currentNormalSlot, // slot_0
         currentLatestSlot,
         `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`
-      ].filter((v, i, a) => a.indexOf(v) === i);
+      ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
       
-      newLatestSlot = currentLatestSlot;
-      newNormalSlot = currentNormalSlot; // Stay at slot_0
+      newLatestSlot = currentLatestSlot; // ✅ Unchanged
+      newNormalSlot = currentNormalSlot; // ✅ Stay at slot_0
       
-      console.log(`[MONITORING SAMIR] [CASE-5-PLAN] No forward, backward from latestSlot | Will read: [${slotsToRead.join(', ')}]`);
+      console.log(`[MONITORING SAMIR] [CASE-5-NO-FORWARD] Will read: [${slotsToRead.join(', ')}]`);
     }
     
-    console.log(`[MONITORING SAMIR] [CASE-5-STRATEGY] Use HIGH ENGAGEMENT ONLY`);
+    console.log(`[MONITORING SAMIR] [CASE-5-STRATEGY] Use HIGH ENGAGEMENT (70%+ retention OR 50+ likes)`);
     
   } 
   // ============================================================
   // CASE 6: THIRD+ TIME AT SLOT_0
   // ============================================================
   else {
-    console.log(`[MONITORING SAMIR] [CASE-6] THIRD+ TIME at slot_0 (visit ${slot0Visits + 1}) - load remaining unseen`);
+    console.log(`[MONITORING SAMIR] [CASE-6] THIRD+ TIME at slot_0 (visit ${slot0Visits + 1}) - load UNSEEN only`);
     
-    // Check forward
+    // ✅ Check forward
     const forwardSlot = `${collection.slice(0, -1)}_${latestIndex + 1}`;
     const forwardCheckStart = Date.now();
     const forwardExists = await this.db.collection(collection).findOne(
@@ -1304,31 +1305,40 @@ if (normalIndex === 0) {
       { projection: { _id: 1 } }
     );
     documentsChecked.push({ slot: forwardSlot, exists: !!forwardExists, duration: Date.now() - forwardCheckStart });
-    console.log(`[MONITORING SAMIR] [CHECKED-DOCUMENT] ${forwardSlot} | Exists: ${!!forwardExists} | Duration: ${Date.now() - forwardCheckStart}ms`);
+    console.log(`[MONITORING SAMIR] [CASE-6-FORWARD-CHECK] ${forwardSlot} | Exists: ${!!forwardExists} | Duration: ${Date.now() - forwardCheckStart}ms`);
     
     if (forwardExists) {
+      // ✅ Read [forward, latest, latest-1]
       slotsToRead = [
         forwardSlot,
         currentLatestSlot,
         `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`
-      ].filter((v, i, a) => a.indexOf(v) === i);
+      ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
       
       newLatestSlot = forwardSlot;
-      newNormalSlot = `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`;
+      newNormalSlot = `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`; // ✅ Move backward from latest
     } else {
+      // ✅ Read [latest, latest-1, latest-2]
       slotsToRead = [
         currentLatestSlot,
         `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`,
         `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`
-      ].filter((v, i, a) => a.indexOf(v) === i);
+      ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
       
-      newLatestSlot = currentLatestSlot;
-      newNormalSlot = slotsToRead[2];
+      newLatestSlot = currentLatestSlot; // ✅ Unchanged
+      newNormalSlot = slotsToRead[slotsToRead.length - 1]; // ✅ Last slot read
     }
     
     console.log(`[MONITORING SAMIR] [CASE-6-PLAN] Will read: [${slotsToRead.join(', ')}]`);
-    console.log(`[MONITORING SAMIR] [CASE-6-STRATEGY] Load UNSEEN CONTENT ONLY`);
+    console.log(`[MONITORING SAMIR] [CASE-6-STRATEGY] Load UNSEEN CONTENT ONLY (no engagement filter)`);
   }
+  
+  
+  
+  
+  
+  
+  
   
 } else {
   // ============================================================
@@ -1365,25 +1375,49 @@ if (normalIndex === 0) {
     
     console.log(`[MONITORING SAMIR] [CASE-3-FORWARD-PLAN] Will read: [${slotsToRead.join(', ')}]`);
   } else {
-    // ✅ BACKWARD SEQUENCE - FIXED to prevent duplicates and reach reel_0
-    const backwardSlots = [];
+  // ✅ BACKWARD SEQUENCE - FIXED to prevent skipping slots
+  const backwardSlots = [];
+  
+  // ✅ CRITICAL FIX: Build COMPLETE backward sequence from normalIndex
+  // Example: normalIndex=2 → read [reel_2, reel_1, reel_0]
+  let currentIndex = normalIndex;
+  
+  while (backwardSlots.length < 3 && currentIndex >= 0) {
+    const slotId = `${collection.slice(0, -1)}_${currentIndex}`;
     
-    // Build sequence: current, current-1, current-2
-    for (let i = normalIndex; i >= 0 && backwardSlots.length < 3; i--) {
-      const slotId = `${collection.slice(0, -1)}_${i}`;
-      if (!backwardSlots.includes(slotId)) { // ✅ Prevent duplicates
-        backwardSlots.push(slotId);
-      }
+    // ✅ Check if slot actually exists before adding
+    const slotExistsCheckStart = Date.now();
+    const slotExists = await this.db.collection(collection).findOne(
+      { _id: slotId },
+      { projection: { _id: 1 } }
+    );
+    const slotExistsDuration = Date.now() - slotExistsCheckStart;
+    
+    documentsChecked.push({ 
+      slot: slotId, 
+      exists: !!slotExists, 
+      duration: slotExistsDuration,
+      reason: 'backward-sequence-check'
+    });
+    
+    console.log(`[MONITORING SAMIR] [BACKWARD-CHECK] ${slotId} | Exists: ${!!slotExists} | Duration: ${slotExistsDuration}ms`);
+    
+    if (slotExists) {
+      backwardSlots.push(slotId);
     }
     
-    slotsToRead = backwardSlots;
-    newLatestSlot = currentLatestSlot; // Unchanged
-    newNormalSlot = backwardSlots[backwardSlots.length - 1]; // Last slot we read
-    
-    console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] normalIndex=${normalIndex} | Building backward sequence`);
-    console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-SLOTS] Will read: [${slotsToRead.join(', ')}]`);
-    console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] Will save: latestSlot=${newLatestSlot} (unchanged), normalSlot=${newNormalSlot}`);
+    currentIndex--; // ✅ Move backward by 1
   }
+  
+  slotsToRead = backwardSlots;
+  newLatestSlot = currentLatestSlot; // Unchanged
+  newNormalSlot = backwardSlots.length > 0 ? backwardSlots[backwardSlots.length - 1] : currentNormalSlot;
+  
+  console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] normalIndex=${normalIndex} | Building backward sequence`);
+  console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-SEQUENCE] Found ${backwardSlots.length} existing slots: [${backwardSlots.join(', ')}]`);
+  console.log(`[MONITORING SAMIR] [CASE-3-BACKWARD-PLAN] Will save: latestSlot=${newLatestSlot} (unchanged), normalSlot=${newNormalSlot}`);
+  }
+  
 }
     }
   }
@@ -1474,32 +1508,42 @@ if (normalIndex === 0) {
   // ============================================================
   // PHASE 5: INTEREST-BASED FILTERING
   // ============================================================
-  console.log(`\n[MONITORING SAMIR] [PHASE-5] INTEREST FILTERING - Matching with user interests`);
+console.log(`\n[MONITORING SAMIR] [PHASE-5] INTEREST FILTERING - Matching with user interests`);
+
+let interestedContent = [];
+let totalItemsBeforeFilter = 0;
+let interestMatchCount = 0;
+let noInterestIncludeCount = 0;
+
+for (const { slotId, content } of slotContents) {
+  totalItemsBeforeFilter += content.length;
   
-  let interestedContent = [];
-  let totalItemsBeforeFilter = 0;
-  let interestMatchCount = 0;
-  let noInterestIncludeCount = 0;
-
-  for (const { slotId, content } of slotContents) {
-    totalItemsBeforeFilter += content.length;
+  for (const item of content) {
+    if (viewedIds.has(item.postId)) continue; // ✅ Skip viewed first
     
-    for (const item of content) {
-      if (viewedIds.has(item.postId)) continue;
-
-      if (userInterests.length > 0) {
-        if (item.category && userInterests.includes(item.category)) {
-          interestedContent.push(item);
-          interestMatchCount++;
-        }
-      } else {
-        interestedContent.push(item);
-        noInterestIncludeCount++;
-      }
+    // ✅ CRITICAL FIX: Check if category field exists and matches
+    const hasCategory = item.category && typeof item.category === 'string' && item.category.trim() !== '';
+    const categoryMatches = hasCategory && userInterests.length > 0 && userInterests.includes(item.category);
+    
+    if (categoryMatches) {
+      // ✅ PRIORITY 1: Category matches user interest
+      interestedContent.push(item);
+      interestMatchCount++;
+      console.log(`[MONITORING SAMIR] [INTEREST-MATCH] ${item.postId.substring(0, 8)} | category="${item.category}" matches interests`);
+    } else if (userInterests.length === 0) {
+      // ✅ PRIORITY 2: No interests set, include all
+      interestedContent.push(item);
+      noInterestIncludeCount++;
     }
+    // ✅ Items with non-matching categories are EXCLUDED (will be filled by engagement later)
   }
+}
 
-  console.log(`[MONITORING SAMIR] [INTEREST-FILTER-RESULT] Total items: ${totalItemsBeforeFilter} | After viewed filter: ${totalItemsBeforeFilter - viewedIds.size} | Interest matches: ${interestMatchCount} | No-interest includes: ${noInterestIncludeCount} | Final: ${interestedContent.length}`);
+console.log(`[MONITORING SAMIR] [INTEREST-FILTER-RESULT] Total items: ${totalItemsBeforeFilter} | After viewed filter: ${totalItemsBeforeFilter - viewedIds.size} | Interest matches: ${interestMatchCount} | No-interest includes: ${noInterestIncludeCount} | Final: ${interestedContent.length}`);
+
+if (interestMatchCount === 0 && userInterests.length > 0) {
+  console.warn(`[MONITORING SAMIR] [NO-INTEREST-MATCHES] No content matched user interests [${userInterests.join(', ')}] - will use engagement fill`);
+}
 
   // ============================================================
   // PHASE 6: ENGAGEMENT-BASED FILL (if insufficient)
@@ -1578,20 +1622,70 @@ if (normalIndex === 0) {
     console.log(`\n[MONITORING SAMIR] [PHASE-6] SKIP - Already have ${interestedContent.length} items (>= ${minContentRequired} required)`);
   }
 
-  // ============================================================
-  // PHASE 7: FINAL RANKING
-  // ============================================================
+
   console.log(`\n[MONITORING SAMIR] [PHASE-7] FINAL RANKING - Sorting by engagement`);
   
-  interestedContent.sort((a, b) => {
-    const retentionDiff = (b.retention || 0) - (a.retention || 0);
-    if (Math.abs(retentionDiff) > 1) return retentionDiff;
-    const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
-    if (likesDiff !== 0) return likesDiff;
-    const commentsDiff = (b.commentCount || 0) - (a.commentCount || 0);
-    if (commentsDiff !== 0) return commentsDiff;
-    return (b.viewCount || 0) - (a.viewCount || 0);
-  });
+// ============================================================
+// PHASE 7: FINAL RANKING (UNCHANGED)
+// ============================================================
+interestedContent.sort((a, b) => {
+  const retentionDiff = (b.retention || 0) - (a.retention || 0);
+  if (Math.abs(retentionDiff) > 1) return retentionDiff;
+  const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+  if (likesDiff !== 0) return likesDiff;
+  const commentsDiff = (b.commentCount || 0) - (a.commentCount || 0);
+  if (commentsDiff !== 0) return commentsDiff;
+  return (b.viewCount || 0) - (a.viewCount || 0);
+});
+
+// ❌ REMOVE THIS ENTIRE BLOCK - NO UPDATE DURING FEED LOAD
+// if (newLatestSlot && newNormalSlot) {
+//   console.log(`\n[MONITORING SAMIR] [PHASE-8] UPDATING USER_STATUS...`);
+//   await this.updateUserStatus(userId, updateData);
+//   ...
+// }
+
+// ✅ NEW: Only log what WOULD be saved (for app exit to use)
+console.log(`\n[MONITORING SAMIR] [PHASE-8] FEED-LOAD-COMPLETE - NO UPDATE`);
+console.log(`[MONITORING SAMIR] [COMPUTED-NEXT-STATE] latestSlot=${newLatestSlot || 'UNCHANGED'}, normalSlot=${newNormalSlot || 'UNCHANGED'}`);
+console.log(`[MONITORING SAMIR] [NOTE] user_status will be updated on APP EXIT, not during feed load`);
+
+const duration = Date.now() - start;
+const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
+
+console.log(`\n${'='.repeat(80)}`);
+console.log(`[MONITORING SAMIR] [FEED-COMPLETE]`);
+console.log(`  User: ${userId} | Type: ${contentType} | User Type: ${isNewUser ? 'FRESH' : 'RETURNING'}`);
+console.log(`  Content Returned: ${interestedContent.length} items`);
+console.log(`  Total Reads: ${totalReads} = 1 user_status + ${documentsChecked.length} slot checks + ${contribDocsChecked.length} contrib checks`);
+console.log(`  Slots Read: [${slotContents.map(s => s.slotId).join(', ')}]`);
+console.log(`  Next State (for exit): latest=${newLatestSlot || 'UNCHANGED'}, normal=${newNormalSlot || 'UNCHANGED'}`);
+console.log(`  Total Duration: ${duration}ms`);
+console.log(`${'='.repeat(80)}\n`);
+
+return {
+  content: interestedContent.slice(0, minContentRequired * 2),
+  latestDocumentId: newLatestSlot,  // ✅ Return for Android to save on exit
+  normalDocumentId: newNormalSlot,  // ✅ Return for Android to save on exit
+  isNewUser,
+  hasNewContent: interestedContent.length > 0,
+  metadata: {
+    slotsChecked: documentsChecked.map(d => d.slot),
+    slotsWithContent: slotContents.map(s => s.slotId),
+    slotsRead: slotContents.map(s => s.slotId),
+    contribDocsChecked: contribDocsChecked.map(c => c.slotId),
+    interestFiltered: interestedContent.length,
+    totalReads: totalReads,
+    userInterests,
+    duration,
+    // ✅ NEW: Return computed next state for app exit
+    computedNextState: {
+      latestSlot: newLatestSlot,
+      normalSlot: newNormalSlot,
+      visitIncrement: (newNormalSlot === `${collection.slice(0, -1)}_0`) ? 1 : 0
+    }
+  }
+};
 if (newLatestSlot && newNormalSlot) {
   console.log(`\n[MONITORING SAMIR] [PHASE-8] UPDATING USER_STATUS - Saving new slot IDs`);
   const updateStart = Date.now();
@@ -2895,6 +2989,55 @@ return res.status(500).json({ error: 'Failed to check retention contribution' })
 }
 });
 
+
+
+// ✅ NEW: Update user_status ONLY on app exit
+app.post('/api/user-status/exit-update/:userId', async (req, res) => {
+  const startTime = Date.now();
+  const { userId } = req.params;
+  const { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId, reel_0_visits, post_0_visits } = req.body;
+
+  try {
+    console.log(`[APP-EXIT-UPDATE] userId=${userId} | Updating user_status on app exit`);
+
+    const updateData = { userId, updatedAt: new Date().toISOString() };
+
+    if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
+    if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
+    if (latestPostSlotId) updateData.latestPostSlotId = latestPostSlotId;
+    if (normalPostSlotId) updateData.normalPostSlotId = normalPostSlotId;
+    if (typeof reel_0_visits === 'number') updateData.reel_0_visits = reel_0_visits;
+    if (typeof post_0_visits === 'number') updateData.post_0_visits = post_0_visits;
+
+    const result = await db.collection('user_status').updateOne(
+      { _id: userId },
+      { 
+        $set: updateData,
+        $setOnInsert: { createdAt: new Date().toISOString() }
+      },
+      { upsert: true }
+    );
+
+    const duration = Date.now() - startTime;
+
+    console.log(`[APP-EXIT-UPDATE-SUCCESS] matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount} | duration=${duration}ms`);
+
+    return res.json({
+      success: true,
+      message: 'user_status updated on app exit',
+      updated: updateData,
+      duration
+    });
+
+  } catch (error) {
+    console.error(`[APP-EXIT-UPDATE-ERROR] ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to update user_status on exit: ' + error.message,
+      duration: Date.now() - startTime
+    });
+  }
+});
 
 
 
