@@ -1,3 +1,4 @@
+
 'use strict';
 require('dotenv').config();
 
@@ -560,43 +561,42 @@ async function initMongo() {
 
 async function createContribIndexes() {
   try {
-    // ✅ CRITICAL: Compound index for FAST filtering
+    // ✅ Compound index for filtering
     await db.collection('contrib_posts').createIndex(
       { userId: 1, slotId: 1 },
-      { 
-        name: 'userId_slotId_lookup',
-        background: true
-      }
+      { name: 'userId_slotId_lookup', background: true }
     );
 
     await db.collection('contrib_reels').createIndex(
       { userId: 1, slotId: 1 },
-      { 
-        name: 'userId_slotId_lookup',
-        background: true
-      }
+      { name: 'userId_slotId_lookup', background: true }
     );
 
-    // ✅ NEW: Index for efficient min/max slot detection
+    // ✅ Index for finding MAX (latest) - descending
     await db.collection('contrib_reels').createIndex(
-      { userId: 1, slotId: -1 },  // Descending for max (latest)
-      { 
-        name: 'userId_slotId_latest',
-        background: true
-      }
+      { userId: 1, slotId: -1 },
+      { name: 'userId_slotId_latest', background: true }
     );
 
+    await db.collection('contrib_posts').createIndex(
+      { userId: 1, slotId: -1 },
+      { name: 'userId_slotId_latest', background: true }
+    );
+
+    // ✅ Index for finding MIN (normal/oldest) - ascending
     await db.collection('contrib_reels').createIndex(
-      { userId: 1, slotId: 1 },  // Ascending for min (normal/oldest)
-      { 
-        name: 'userId_slotId_oldest',
-        background: true
-      }
+      { userId: 1, slotId: 1 },
+      { name: 'userId_slotId_oldest', background: true }
     );
 
-    console.log('[CONTRIB-INDEXES] ✅ Created compound indexes for userId + slotId');
+    await db.collection('contrib_posts').createIndex(
+      { userId: 1, slotId: 1 },
+      { name: 'userId_slotId_oldest', background: true }
+    );
+
+    console.log('[CONTRIB-INDEXES] ✅ Created all contrib indexes');
   } catch (err) {
-    if (err.code !== 85) { // Ignore "already exists"
+    if (err.code !== 85) {
       console.error('[CONTRIB-INDEX-ERROR]', err.message);
     }
   }
@@ -612,7 +612,7 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
   console.log(`[AUTO-UPDATE-STATUS] Detecting slots for userId=${userId} | type=${contentType}`);
 
   try {
-    // ✅ READ 1: Get highest slotId (latest) - uses index, no collection scan
+    // ✅ READ 1: Get highest slotId (latest) - uses userId_slotId_latest index
     const latestDoc = await db.collection(collection)
       .find({ userId })
       .sort({ slotId: -1 })  // Descending = highest first
@@ -620,7 +620,7 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
       .project({ slotId: 1 })
       .toArray();
 
-    // ✅ READ 2: Get lowest slotId (normal) - uses index, no collection scan
+    // ✅ READ 2: Get lowest slotId (normal) - uses userId_slotId_oldest index
     const normalDoc = await db.collection(collection)
       .find({ userId })
       .sort({ slotId: 1 })   // Ascending = lowest first
@@ -2240,17 +2240,16 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
       const postId = typeof item === 'string' ? item : item.postId;
       let slotId = typeof item === 'object' ? item.slotId : null;
       
-      // ✅ CRITICAL FIX: If no slotId provided, look it up
+      // ✅ CRITICAL FIX: If no slotId provided, derive from postId
       if (!slotId) {
-        // Derive slotId from postId (e.g., "reel8_post2" -> "reel_8")
         const match = postId.match(/^(reel|post)(\d+)_/);
         if (match) {
-          const prefix = match[1]; // "reel" or "post"
-          const number = match[2]; // "8"
-          slotId = `${prefix}_${number}`; // "reel_8"
+          const prefix = match[1];
+          const number = match[2];
+          slotId = `${prefix}_${number}`;
           console.log(`[BATCH-SLOT-DERIVED] ${postId} -> ${slotId}`);
         } else {
-          console.warn(`[BATCH-SKIP] ${postId} - cannot derive slotId from postId format`);
+          console.warn(`[BATCH-SKIP] ${postId} - cannot derive slotId`);
           continue;
         }
       }
@@ -2283,11 +2282,11 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
       console.log(`[MONITORING SAMIR] [BATCH-CONTRIB-SAVED] ${op.type} | ${op.ids.length} items -> ${Object.keys(slotGroups).length} slots | upserted=${result.upsertedCount} modified=${result.modifiedCount} | Duration: ${duration}ms`);
       results.push({ type: op.type, result });
     } else {
-      console.warn(`[BATCH-SKIP-ALL] ${op.type} | No valid slotIds derived from ${op.ids.length} items`);
+      console.warn(`[BATCH-SKIP-ALL] ${op.type} | No valid slotIds derived`);
     }
   }
 
-  // ✅ CRITICAL: Auto-update user_status after contrib changes (no client dependency)
+  // ✅ CRITICAL: Auto-update user_status after contrib changes
   const updatePromises = [];
   
   if (reels.length > 0) {
