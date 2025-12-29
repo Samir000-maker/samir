@@ -1,3 +1,4 @@
+
 'use strict';
 require('dotenv').config();
 
@@ -602,7 +603,7 @@ async function createContribIndexes() {
 }
 
 
-// ✅ FIXED: Auto-update user_status with NUMERIC sorting of slot IDs
+// ✅ FIXED: Only update user_status when contrib has actual data
 async function autoUpdateUserStatusFromContrib(userId, contentType) {
   const collection = contentType === 'reels' ? 'contrib_reels' : 'contrib_posts';
   const latestField = contentType === 'reels' ? 'latestReelSlotId' : 'latestPostSlotId';
@@ -611,86 +612,31 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
   console.log(`[AUTO-UPDATE-STATUS] Detecting slots for userId=${userId} | type=${contentType}`);
 
   try {
-    // ✅ CRITICAL FIX: Use aggregation to extract numeric part and sort correctly
-    const prefix = contentType === 'reels' ? 'reel_' : 'post_';
-    
-    // Single aggregation to get both min and max in ONE query
-    const result = await db.collection(collection).aggregate([
-      { $match: { userId } },
-      {
-        $project: {
-          slotId: 1,
-          // Extract numeric part: "reel_10" -> 10
-          slotNum: {
-            $toInt: {
-              $arrayElemAt: [
-                { $split: ["$slotId", "_"] },
-                1
-              ]
-            }
-          }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          // Highest number = latest
-          maxSlotNum: { $max: "$slotNum" },
-          maxSlotId: { $max: { $cond: [{ $eq: ["$slotNum", { $max: "$slotNum" }] }, "$slotId", null] } },
-          // Lowest number = normal
-          minSlotNum: { $min: "$slotNum" },
-          minSlotId: { $min: { $cond: [{ $eq: ["$slotNum", { $min: "$slotNum" }] }, "$slotId", null] } },
-          // Collect all for proper selection
-          allSlots: { $push: { slotId: "$slotId", slotNum: "$slotNum" } }
-        }
-      },
-      {
-        $project: {
-          _id: 0,
-          maxSlotNum: 1,
-          minSlotNum: 1,
-          // Get the actual slotId for max
-          latestSlot: {
-            $arrayElemAt: [
-              {
-                $map: {
-                  input: { $filter: { input: "$allSlots", cond: { $eq: ["$$this.slotNum", "$maxSlotNum"] } } },
-                  in: "$$this.slotId"
-                }
-              },
-              0
-            ]
-          },
-          // Get the actual slotId for min
-          normalSlot: {
-            $arrayElemAt: [
-              {
-                $map: {
-                  input: { $filter: { input: "$allSlots", cond: { $eq: ["$$this.slotNum", "$minSlotNum"] } } },
-                  in: "$$this.slotId"
-                }
-              },
-              0
-            ]
-          }
-        }
-      }
-    ]).toArray();
+    // ✅ CRITICAL: Get all slotIds for this user
+    const docs = await db.collection(collection)
+      .find({ userId }, { projection: { slotId: 1 } })
+      .toArray();
 
-    if (!result || result.length === 0) {
-      console.log(`[AUTO-UPDATE-STATUS] No ${contentType} contributions found for userId=${userId}`);
+    if (docs.length === 0) {
+      console.log(`[AUTO-UPDATE-STATUS] ⏭️ Skipped - no ${contentType} contributions for userId=${userId}`);
       return { updated: false, reason: 'no_contributions' };
     }
 
-    const latestSlot = result[0].latestSlot;
-    const normalSlot = result[0].normalSlot;
+    // ✅ Extract numeric parts and sort in JavaScript
+    const slots = docs
+      .map(doc => {
+        const match = doc.slotId.match(/_(\d+)$/);
+        return {
+          slotId: doc.slotId,
+          slotNum: match ? parseInt(match[1], 10) : 0
+        };
+      })
+      .sort((a, b) => a.slotNum - b.slotNum); // Ascending numeric sort
 
-    if (!latestSlot || !normalSlot) {
-      console.log(`[AUTO-UPDATE-STATUS] Invalid slot detection for userId=${userId}`);
-      return { updated: false, reason: 'invalid_slots' };
-    }
+    const normalSlot = slots[0].slotId;  // ✅ Lowest (reel_4, reel_7, etc.)
+    const latestSlot = slots[slots.length - 1].slotId;  // ✅ Highest (reel_10, etc.)
 
-    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot} (highest=${result[0].maxSlotNum}), normal=${normalSlot} (lowest=${result[0].minSlotNum})`);
+    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot} (num=${slots[slots.length - 1].slotNum}), normal=${normalSlot} (num=${slots[0].slotNum})`);
 
     // ✅ Check if update is needed
     const currentStatus = await db.collection('user_status').findOne(
@@ -714,7 +660,7 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
       updatedAt: new Date().toISOString()
     };
 
-    const updateResult = await db.collection('user_status').updateOne(
+    const result = await db.collection('user_status').updateOne(
       { _id: userId },
       {
         $set: updateData,
@@ -726,7 +672,7 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
       { upsert: true }
     );
 
-    console.log(`[AUTO-UPDATE-STATUS] ✅ Updated user_status | matched=${updateResult.matchedCount} | modified=${updateResult.modifiedCount} | upserted=${updateResult.upsertedCount}`);
+    console.log(`[AUTO-UPDATE-STATUS] ✅ Updated user_status | matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
 
     return { updated: true, latestSlot, normalSlot };
 
@@ -1839,40 +1785,42 @@ return {
     // ❌ REMOVE computedNextState - user_status updates automatically now
   }
 };
-if (newLatestSlot && newNormalSlot) {
-  console.log(`\n[MONITORING SAMIR] [PHASE-8] UPDATING USER_STATUS - Saving new slot IDs`);
-  const updateStart = Date.now();
+// if (newLatestSlot && newNormalSlot) {
+//   console.log(`\n[MONITORING SAMIR] [PHASE-8] UPDATING USER_STATUS - Saving new slot IDs`);
+//   const updateStart = Date.now();
   
-  // ✅ Track slot_0 visits
-  const updateData = {
-    [statusField]: newLatestSlot,
-    [normalField]: newNormalSlot
-  };
+//   // ✅ Track slot_0 visits
+//   const updateData = {
+//     [statusField]: newLatestSlot,
+//     [normalField]: newNormalSlot
+//   };
   
-  // ✅ CRITICAL: Increment visit counter when at slot_0
-  if (newNormalSlot === `${collection.slice(0, -1)}_0`) {
-    const currentVisits = userStatus?.[visitField] || 0;
-    updateData[visitField] = currentVisits + 1;
-    console.log(`[MONITORING SAMIR] [SLOT-0-VISIT-INCREMENT] Visit count: ${currentVisits} → ${currentVisits + 1}`);
-  }
+//   // ✅ CRITICAL: Increment visit counter when at slot_0
+//   if (newNormalSlot === `${collection.slice(0, -1)}_0`) {
+//     const currentVisits = userStatus?.[visitField] || 0;
+//     updateData[visitField] = currentVisits + 1;
+//     console.log(`[MONITORING SAMIR] [SLOT-0-VISIT-INCREMENT] Visit count: ${currentVisits} → ${currentVisits + 1}`);
+//   }
   
-  await this.updateUserStatus(userId, updateData);
+//   await this.updateUserStatus(userId, updateData);
   
-  // ✅ CRITICAL: Clear cache immediately after update
-  const feedCacheKey = `feed_${contentType}_${userId}`;
-  if (redisClient) {
-    await redisClient.del(feedCacheKey).catch(() => {});
-  }
-  if (cache[feedCacheKey]) {
-    cache[feedCacheKey].clear();
-  }
+//   // ✅ CRITICAL: Clear cache immediately after update
+//   const feedCacheKey = `feed_${contentType}_${userId}`;
+//   if (redisClient) {
+//     await redisClient.del(feedCacheKey).catch(() => {});
+//   }
+//   if (cache[feedCacheKey]) {
+//     cache[feedCacheKey].clear();
+//   }
   
-  console.log(`[MONITORING SAMIR] [USER-STATUS-UPDATE] Saved in ${Date.now() - updateStart}ms | latest=${newLatestSlot}, normal=${newNormalSlot}`);
-  console.log(`[MONITORING SAMIR] [CACHE-CLEARED] Feed cache invalidated for next request`);
-} else {
-  console.log(`\n[MONITORING SAMIR] [PHASE-8] SKIP USER_STATUS UPDATE - No changes needed`);
-}
+//   console.log(`[MONITORING SAMIR] [USER-STATUS-UPDATE] Saved in ${Date.now() - updateStart}ms | latest=${newLatestSlot}, normal=${newNormalSlot}`);
+//   console.log(`[MONITORING SAMIR] [CACHE-CLEARED] Feed cache invalidated for next request`);
+// } else {
+//   console.log(`\n[MONITORING SAMIR] [PHASE-8] SKIP USER_STATUS UPDATE - No changes needed`);
+// }
 
+console.log(`\n[MONITORING SAMIR] [PHASE-8] FEED-LOAD-COMPLETE - NO UPDATE`);
+console.log(`[MONITORING SAMIR] [NOTE] user_status is managed by contrib_reels changes only`);
 
   console.log(`\n${'='.repeat(80)}`);
   console.log(`[MONITORING SAMIR] [FEED-COMPLETE]`);
