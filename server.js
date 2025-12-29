@@ -561,7 +561,7 @@ async function initMongo() {
 
 async function createContribIndexes() {
   try {
-    // ✅ Compound index for filtering
+    // ✅ Compound index for filtering + lookup
     await db.collection('contrib_posts').createIndex(
       { userId: 1, slotId: 1 },
       { name: 'userId_slotId_lookup', background: true }
@@ -572,7 +572,7 @@ async function createContribIndexes() {
       { name: 'userId_slotId_lookup', background: true }
     );
 
-    // ✅ Index for finding MAX (latest) - descending
+    // ✅ Index for finding MAX (latest = HIGHEST slotId) - descending
     await db.collection('contrib_reels').createIndex(
       { userId: 1, slotId: -1 },
       { name: 'userId_slotId_latest', background: true }
@@ -583,7 +583,7 @@ async function createContribIndexes() {
       { name: 'userId_slotId_latest', background: true }
     );
 
-    // ✅ Index for finding MIN (normal/oldest) - ascending
+    // ✅ Index for finding MIN (normal = LOWEST slotId) - ascending
     await db.collection('contrib_reels').createIndex(
       { userId: 1, slotId: 1 },
       { name: 'userId_slotId_oldest', background: true }
@@ -596,14 +596,14 @@ async function createContribIndexes() {
 
     console.log('[CONTRIB-INDEXES] ✅ Created all contrib indexes');
   } catch (err) {
-    if (err.code !== 85) {
+    if (err.code !== 85 && err.code !== 86) { // Ignore "already exists"
       console.error('[CONTRIB-INDEX-ERROR]', err.message);
     }
   }
 }
 
 
-// ✅ NEW: Automatically update user_status based on contrib_reels (2 reads max)
+// ✅ FIXED: Auto-update user_status based on contrib_reels (2 reads max)
 async function autoUpdateUserStatusFromContrib(userId, contentType) {
   const collection = contentType === 'reels' ? 'contrib_reels' : 'contrib_posts';
   const latestField = contentType === 'reels' ? 'latestReelSlotId' : 'latestPostSlotId';
@@ -612,18 +612,20 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
   console.log(`[AUTO-UPDATE-STATUS] Detecting slots for userId=${userId} | type=${contentType}`);
 
   try {
-    // ✅ READ 1: Get highest slotId (latest) - uses userId_slotId_latest index
+    // ✅ READ 1: Get HIGHEST slotId (latest) - sorted DESC by slotId string
+    // This uses userId_slotId_latest index (userId: 1, slotId: -1)
     const latestDoc = await db.collection(collection)
       .find({ userId })
-      .sort({ slotId: -1 })  // Descending = highest first
+      .sort({ slotId: -1 })  // ✅ Descending = "reel_10" > "reel_9" > "reel_8"
       .limit(1)
       .project({ slotId: 1 })
       .toArray();
 
-    // ✅ READ 2: Get lowest slotId (normal) - uses userId_slotId_oldest index
+    // ✅ READ 2: Get LOWEST slotId (normal) - sorted ASC by slotId string
+    // This uses userId_slotId_oldest index (userId: 1, slotId: 1)
     const normalDoc = await db.collection(collection)
       .find({ userId })
-      .sort({ slotId: 1 })   // Ascending = lowest first
+      .sort({ slotId: 1 })   // ✅ Ascending = "reel_6" < "reel_8" < "reel_9"
       .limit(1)
       .project({ slotId: 1 })
       .toArray();
@@ -636,9 +638,23 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
       return { updated: false, reason: 'no_contributions' };
     }
 
-    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot}, normal=${normalSlot}`);
+    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot} (highest), normal=${normalSlot} (lowest)`);
 
-    // ✅ WRITE: Update user_status
+    // ✅ WRITE: Update user_status ONLY if values changed
+    const currentStatus = await db.collection('user_status').findOne(
+      { _id: userId },
+      { projection: { [latestField]: 1, [normalField]: 1 } }
+    );
+
+    const needsUpdate = !currentStatus || 
+                        currentStatus[latestField] !== latestSlot || 
+                        currentStatus[normalField] !== normalSlot;
+
+    if (!needsUpdate) {
+      console.log(`[AUTO-UPDATE-STATUS] ⏭️ Skipped - no changes (latest=${latestSlot}, normal=${normalSlot})`);
+      return { updated: false, reason: 'no_changes', latestSlot, normalSlot };
+    }
+
     const updateData = {
       [latestField]: latestSlot,
       [normalField]: normalSlot,
@@ -2287,23 +2303,23 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
   }
 
   // ✅ CRITICAL: Auto-update user_status after contrib changes
-  const updatePromises = [];
-  
-  if (reels.length > 0) {
-    console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for reels`);
-    updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'reels'));
-  }
-  
-  if (posts.length > 0) {
-    console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for posts`);
-    updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'posts'));
-  }
+const updatePromises = [];
 
-  // Wait for all updates to complete
-  if (updatePromises.length > 0) {
-    const updateResults = await Promise.all(updatePromises);
-    console.log(`[BATCH-AUTO-UPDATE-COMPLETE]`, updateResults);
-  }
+if (reels.length > 0) {
+  console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for reels`);
+  updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'reels'));
+}
+
+if (posts.length > 0) {
+  console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for posts`);
+  updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'posts'));
+}
+
+// Wait for all updates to complete
+if (updatePromises.length > 0) {
+  const updateResults = await Promise.all(updatePromises);
+  console.log(`[BATCH-AUTO-UPDATE-COMPLETE]`, updateResults);
+}
 
   return results;
 }
@@ -3073,98 +3089,13 @@ return res.status(500).json({ error: 'Failed to check retention contribution' })
 
 
 
-// ✅ NEW: Update user_status ONLY on app exit
+// ✅ REPLACE: Read-only status (no manual updates)
 app.post('/api/user-status/exit-update/:userId', async (req, res) => {
-  const startTime = Date.now();
-  const { userId } = req.params;
-  const { 
-    latestReelSlotId, 
-    normalReelSlotId, 
-    latestPostSlotId, 
-    normalPostSlotId, 
-    reel_0_visits, 
-    post_0_visits 
-  } = req.body;
-
-  try {
-    // ✅ CRITICAL: Validate that at least ONE field is provided
-    if (!latestReelSlotId && !normalReelSlotId && !latestPostSlotId && !normalPostSlotId && 
-        typeof reel_0_visits !== 'number' && typeof post_0_visits !== 'number') {
-      console.warn(`[APP-EXIT-UPDATE-SKIP] userId=${userId} | No data provided in request body`);
-      console.warn(`[APP-EXIT-UPDATE-SKIP] Received: ${JSON.stringify(req.body)}`);
-      return res.status(400).json({
-        success: false,
-        error: 'At least one field must be provided',
-        received: req.body,
-        hint: 'Android should send metadata.computedNextState from feed response'
-      });
-    }
-
-    console.log(`[APP-EXIT-UPDATE] userId=${userId} | Updating user_status on app exit`);
-    console.log(`[APP-EXIT-UPDATE-DATA] latestReel=${latestReelSlotId || 'not_provided'} | normalReel=${normalReelSlotId || 'not_provided'} | latestPost=${latestPostSlotId || 'not_provided'} | normalPost=${normalPostSlotId || 'not_provided'}`);
-
-    const updateData = { 
-      userId, 
-      updatedAt: new Date().toISOString() 
-    };
-
-    // ✅ Only update fields that are provided
-    if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
-    if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
-    if (latestPostSlotId) updateData.latestPostSlotId = latestPostSlotId;
-    if (normalPostSlotId) updateData.normalPostSlotId = normalPostSlotId;
-    if (typeof reel_0_visits === 'number') updateData.reel_0_visits = reel_0_visits;
-    if (typeof post_0_visits === 'number') updateData.post_0_visits = post_0_visits;
-
-    // ✅ CRITICAL: Get current state first to compute slot_0 visits
-    const currentStatus = await db.collection('user_status').findOne(
-      { _id: userId },
-      { projection: { reel_0_visits: 1, post_0_visits: 1, normalReelSlotId: 1, normalPostSlotId: 1 } }
-    );
-
-    // ✅ Auto-increment slot_0 visits if normalSlot is at slot_0
-    if (normalReelSlotId === 'reel_0' && !updateData.reel_0_visits) {
-      const currentVisits = currentStatus?.reel_0_visits || 0;
-      updateData.reel_0_visits = currentVisits + 1;
-      console.log(`[APP-EXIT-AUTO-INCREMENT] reel_0_visits: ${currentVisits} → ${currentVisits + 1}`);
-    }
-
-    if (normalPostSlotId === 'post_0' && !updateData.post_0_visits) {
-      const currentVisits = currentStatus?.post_0_visits || 0;
-      updateData.post_0_visits = currentVisits + 1;
-      console.log(`[APP-EXIT-AUTO-INCREMENT] post_0_visits: ${currentVisits} → ${currentVisits + 1}`);
-    }
-
-    const result = await db.collection('user_status').updateOne(
-      { _id: userId },
-      { 
-        $set: updateData,
-        $setOnInsert: { createdAt: new Date().toISOString() }
-      },
-      { upsert: true }
-    );
-
-    const duration = Date.now() - startTime;
-
-    console.log(`[APP-EXIT-UPDATE-SUCCESS] matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount} | duration=${duration}ms`);
-    console.log(`[APP-EXIT-UPDATE-FIELDS] Updated: ${Object.keys(updateData).filter(k => k !== 'userId' && k !== 'updatedAt').join(', ')}`);
-
-    return res.json({
-      success: true,
-      message: 'user_status updated on app exit',
-      updated: updateData,
-      fieldsUpdated: Object.keys(updateData).filter(k => k !== 'userId' && k !== 'updatedAt'),
-      duration
-    });
-
-  } catch (error) {
-    console.error(`[APP-EXIT-UPDATE-ERROR] ${error.message}`);
-    return res.status(500).json({
-      success: false,
-      error: 'Failed to update user_status on exit: ' + error.message,
-      duration: Date.now() - startTime
-    });
-  }
+  return res.status(410).json({
+    success: false,
+    error: 'Manual user_status updates are disabled',
+    message: 'user_status is now auto-updated via contrib_reels changes'
+  });
 });
 
 
