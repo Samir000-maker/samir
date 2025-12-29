@@ -2999,19 +2999,63 @@ return res.status(500).json({ error: 'Failed to check retention contribution' })
 app.post('/api/user-status/exit-update/:userId', async (req, res) => {
   const startTime = Date.now();
   const { userId } = req.params;
-  const { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId, reel_0_visits, post_0_visits } = req.body;
+  const { 
+    latestReelSlotId, 
+    normalReelSlotId, 
+    latestPostSlotId, 
+    normalPostSlotId, 
+    reel_0_visits, 
+    post_0_visits 
+  } = req.body;
 
   try {
+    // ✅ CRITICAL: Validate that at least ONE field is provided
+    if (!latestReelSlotId && !normalReelSlotId && !latestPostSlotId && !normalPostSlotId && 
+        typeof reel_0_visits !== 'number' && typeof post_0_visits !== 'number') {
+      console.warn(`[APP-EXIT-UPDATE-SKIP] userId=${userId} | No data provided in request body`);
+      console.warn(`[APP-EXIT-UPDATE-SKIP] Received: ${JSON.stringify(req.body)}`);
+      return res.status(400).json({
+        success: false,
+        error: 'At least one field must be provided',
+        received: req.body,
+        hint: 'Android should send metadata.computedNextState from feed response'
+      });
+    }
+
     console.log(`[APP-EXIT-UPDATE] userId=${userId} | Updating user_status on app exit`);
+    console.log(`[APP-EXIT-UPDATE-DATA] latestReel=${latestReelSlotId || 'not_provided'} | normalReel=${normalReelSlotId || 'not_provided'} | latestPost=${latestPostSlotId || 'not_provided'} | normalPost=${normalPostSlotId || 'not_provided'}`);
 
-    const updateData = { userId, updatedAt: new Date().toISOString() };
+    const updateData = { 
+      userId, 
+      updatedAt: new Date().toISOString() 
+    };
 
+    // ✅ Only update fields that are provided
     if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
     if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
     if (latestPostSlotId) updateData.latestPostSlotId = latestPostSlotId;
     if (normalPostSlotId) updateData.normalPostSlotId = normalPostSlotId;
     if (typeof reel_0_visits === 'number') updateData.reel_0_visits = reel_0_visits;
     if (typeof post_0_visits === 'number') updateData.post_0_visits = post_0_visits;
+
+    // ✅ CRITICAL: Get current state first to compute slot_0 visits
+    const currentStatus = await db.collection('user_status').findOne(
+      { _id: userId },
+      { projection: { reel_0_visits: 1, post_0_visits: 1, normalReelSlotId: 1, normalPostSlotId: 1 } }
+    );
+
+    // ✅ Auto-increment slot_0 visits if normalSlot is at slot_0
+    if (normalReelSlotId === 'reel_0' && !updateData.reel_0_visits) {
+      const currentVisits = currentStatus?.reel_0_visits || 0;
+      updateData.reel_0_visits = currentVisits + 1;
+      console.log(`[APP-EXIT-AUTO-INCREMENT] reel_0_visits: ${currentVisits} → ${currentVisits + 1}`);
+    }
+
+    if (normalPostSlotId === 'post_0' && !updateData.post_0_visits) {
+      const currentVisits = currentStatus?.post_0_visits || 0;
+      updateData.post_0_visits = currentVisits + 1;
+      console.log(`[APP-EXIT-AUTO-INCREMENT] post_0_visits: ${currentVisits} → ${currentVisits + 1}`);
+    }
 
     const result = await db.collection('user_status').updateOne(
       { _id: userId },
@@ -3025,11 +3069,13 @@ app.post('/api/user-status/exit-update/:userId', async (req, res) => {
     const duration = Date.now() - startTime;
 
     console.log(`[APP-EXIT-UPDATE-SUCCESS] matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount} | duration=${duration}ms`);
+    console.log(`[APP-EXIT-UPDATE-FIELDS] Updated: ${Object.keys(updateData).filter(k => k !== 'userId' && k !== 'updatedAt').join(', ')}`);
 
     return res.json({
       success: true,
       message: 'user_status updated on app exit',
       updated: updateData,
+      fieldsUpdated: Object.keys(updateData).filter(k => k !== 'userId' && k !== 'updatedAt'),
       duration
     });
 
@@ -5738,23 +5784,24 @@ app.post('/api/user-status/:userId', async (req, res) => {
   const { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId } = req.body;
 
   try {
-
+    // ✅ VALIDATION: Check if at least one field is provided
     if (!latestReelSlotId && !normalReelSlotId && !latestPostSlotId && !normalPostSlotId) {
       console.warn(`[post_algorithm] [UPDATE-USER-STATUS-SKIP] No slot IDs provided`);
+      console.warn(`[post_algorithm] [UPDATE-BODY-DEBUG] Received: ${JSON.stringify(req.body)}`);
       return res.status(400).json({
         success: false,
         error: 'At least one slot ID must be provided',
-        received: { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId }
+        received: { latestReelSlotId, normalReelSlotId, latestPostSlotId, normalPostSlotId },
+        hint: 'Send metadata.computedNextState.latestSlot and normalSlot from feed response'
       });
     }
 
     console.log(`[post_algorithm] [UPDATE-USER-STATUS] userId=${userId} | latestReel=${latestReelSlotId || 'not_provided'} | normalReel=${normalReelSlotId || 'not_provided'} | latestPost=${latestPostSlotId || 'not_provided'} | normalPost=${normalPostSlotId || 'not_provided'}`);
 
     const updateData = {
-      userId: userId, // ✅ Always set userId
+      userId: userId,
       updatedAt: new Date()
     };
-
 
     if (latestReelSlotId) updateData.latestReelSlotId = latestReelSlotId;
     if (normalReelSlotId) updateData.normalReelSlotId = normalReelSlotId;
