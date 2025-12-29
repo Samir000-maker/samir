@@ -2233,17 +2233,33 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
   for (const op of operations) {
     const start = Date.now();
     
-    // Group by slotId for efficient bulk operations
+    // ✅ FIX: Detect slotId from postId if not provided
     const slotGroups = {};
+    
     for (const item of op.ids) {
       const postId = typeof item === 'string' ? item : item.postId;
-      const slotId = typeof item === 'object' ? item.slotId : null;
+      let slotId = typeof item === 'object' ? item.slotId : null;
       
-      if (slotId) {
-        if (!slotGroups[slotId]) slotGroups[slotId] = [];
-        slotGroups[slotId].push(postId);
+      // ✅ CRITICAL FIX: If no slotId provided, look it up
+      if (!slotId) {
+        // Derive slotId from postId (e.g., "reel8_post2" -> "reel_8")
+        const match = postId.match(/^(reel|post)(\d+)_/);
+        if (match) {
+          const prefix = match[1]; // "reel" or "post"
+          const number = match[2]; // "8"
+          slotId = `${prefix}_${number}`; // "reel_8"
+          console.log(`[BATCH-SLOT-DERIVED] ${postId} -> ${slotId}`);
+        } else {
+          console.warn(`[BATCH-SKIP] ${postId} - cannot derive slotId from postId format`);
+          continue;
+        }
       }
+      
+      if (!slotGroups[slotId]) slotGroups[slotId] = [];
+      slotGroups[slotId].push(postId);
     }
+
+    console.log(`[BATCH-SLOT-GROUPS] ${op.type} | Found ${Object.keys(slotGroups).length} unique slots: [${Object.keys(slotGroups).join(', ')}]`);
 
     // ✅ Bulk write with proper grouping
     const bulkOps = Object.entries(slotGroups).map(([slotId, postIds]) => ({
@@ -2263,8 +2279,11 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
       
       const duration = Date.now() - start;
       logDbOp('bulkWrite', op.collection, { userId }, result, duration);
-      console.log(`[MONITORING SAMIR] [BATCH-CONTRIB-SAVED] ${op.type} | ${op.ids.length} items | Duration: ${duration}ms`);
+      
+      console.log(`[MONITORING SAMIR] [BATCH-CONTRIB-SAVED] ${op.type} | ${op.ids.length} items -> ${Object.keys(slotGroups).length} slots | upserted=${result.upsertedCount} modified=${result.modifiedCount} | Duration: ${duration}ms`);
       results.push({ type: op.type, result });
+    } else {
+      console.warn(`[BATCH-SKIP-ALL] ${op.type} | No valid slotIds derived from ${op.ids.length} items`);
     }
   }
 
@@ -2272,15 +2291,20 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
   const updatePromises = [];
   
   if (reels.length > 0) {
+    console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for reels`);
     updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'reels'));
   }
   
   if (posts.length > 0) {
+    console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for posts`);
     updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'posts'));
   }
 
   // Wait for all updates to complete
-  await Promise.all(updatePromises);
+  if (updatePromises.length > 0) {
+    const updateResults = await Promise.all(updatePromises);
+    console.log(`[BATCH-AUTO-UPDATE-COMPLETE]`, updateResults);
+  }
 
   return results;
 }
