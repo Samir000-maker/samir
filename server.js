@@ -603,6 +603,7 @@ async function createContribIndexes() {
 }
 
 
+// ✅ FIXED: Auto-update user_status with NUMERIC sorting of slot IDs
 async function autoUpdateUserStatusFromContrib(userId, contentType) {
   const collection = contentType === 'reels' ? 'contrib_reels' : 'contrib_posts';
   const latestField = contentType === 'reels' ? 'latestReelSlotId' : 'latestPostSlotId';
@@ -611,31 +612,86 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
   console.log(`[AUTO-UPDATE-STATUS] Detecting slots for userId=${userId} | type=${contentType}`);
 
   try {
-    // Get all slotIds for this user
-    const docs = await db.collection(collection)
-      .find({ userId }, { projection: { slotId: 1 } })
-      .toArray();
+    // ✅ CRITICAL FIX: Use aggregation to extract numeric part and sort correctly
+    const prefix = contentType === 'reels' ? 'reel_' : 'post_';
+    
+    // Single aggregation to get both min and max in ONE query
+    const result = await db.collection(collection).aggregate([
+      { $match: { userId } },
+      {
+        $project: {
+          slotId: 1,
+          // Extract numeric part: "reel_10" -> 10
+          slotNum: {
+            $toInt: {
+              $arrayElemAt: [
+                { $split: ["$slotId", "_"] },
+                1
+              ]
+            }
+          }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          // Highest number = latest
+          maxSlotNum: { $max: "$slotNum" },
+          maxSlotId: { $max: { $cond: [{ $eq: ["$slotNum", { $max: "$slotNum" }] }, "$slotId", null] } },
+          // Lowest number = normal
+          minSlotNum: { $min: "$slotNum" },
+          minSlotId: { $min: { $cond: [{ $eq: ["$slotNum", { $min: "$slotNum" }] }, "$slotId", null] } },
+          // Collect all for proper selection
+          allSlots: { $push: { slotId: "$slotId", slotNum: "$slotNum" } }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          maxSlotNum: 1,
+          minSlotNum: 1,
+          // Get the actual slotId for max
+          latestSlot: {
+            $arrayElemAt: [
+              {
+                $map: {
+                  input: { $filter: { input: "$allSlots", cond: { $eq: ["$$this.slotNum", "$maxSlotNum"] } } },
+                  in: "$$this.slotId"
+                }
+              },
+              0
+            ]
+          },
+          // Get the actual slotId for min
+          normalSlot: {
+            $arrayElemAt: [
+              {
+                $map: {
+                  input: { $filter: { input: "$allSlots", cond: { $eq: ["$$this.slotNum", "$minSlotNum"] } } },
+                  in: "$$this.slotId"
+                }
+              },
+              0
+            ]
+          }
+        }
+      }
+    ]).toArray();
 
-    if (docs.length === 0) {
+    if (!result || result.length === 0) {
       console.log(`[AUTO-UPDATE-STATUS] No ${contentType} contributions found for userId=${userId}`);
       return { updated: false, reason: 'no_contributions' };
     }
 
-    // ✅ Extract numeric parts and sort in JavaScript
-    const slots = docs
-      .map(doc => {
-        const match = doc.slotId.match(/_(\d+)$/);
-        return {
-          slotId: doc.slotId,
-          slotNum: match ? parseInt(match[1], 10) : 0
-        };
-      })
-      .sort((a, b) => a.slotNum - b.slotNum); // Ascending numeric sort
+    const latestSlot = result[0].latestSlot;
+    const normalSlot = result[0].normalSlot;
 
-    const normalSlot = slots[0].slotId;  // ✅ Lowest number (first in ascending)
-    const latestSlot = slots[slots.length - 1].slotId;  // ✅ Highest number (last in ascending)
+    if (!latestSlot || !normalSlot) {
+      console.log(`[AUTO-UPDATE-STATUS] Invalid slot detection for userId=${userId}`);
+      return { updated: false, reason: 'invalid_slots' };
+    }
 
-    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot} (num=${slots[slots.length - 1].slotNum}), normal=${normalSlot} (num=${slots[0].slotNum})`);
+    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot} (highest=${result[0].maxSlotNum}), normal=${normalSlot} (lowest=${result[0].minSlotNum})`);
 
     // ✅ Check if update is needed
     const currentStatus = await db.collection('user_status').findOne(
@@ -648,7 +704,7 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
                         currentStatus[normalField] !== normalSlot;
 
     if (!needsUpdate) {
-      console.log(`[AUTO-UPDATE-STATUS] ⏭️ Skipped - no changes`);
+      console.log(`[AUTO-UPDATE-STATUS] ⏭️ Skipped - no changes (latest=${latestSlot}, normal=${normalSlot})`);
       return { updated: false, reason: 'no_changes', latestSlot, normalSlot };
     }
 
@@ -659,7 +715,7 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
       updatedAt: new Date().toISOString()
     };
 
-    const result = await db.collection('user_status').updateOne(
+    const updateResult = await db.collection('user_status').updateOne(
       { _id: userId },
       {
         $set: updateData,
@@ -671,7 +727,7 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
       { upsert: true }
     );
 
-    console.log(`[AUTO-UPDATE-STATUS] ✅ Updated user_status | matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
+    console.log(`[AUTO-UPDATE-STATUS] ✅ Updated user_status | matched=${updateResult.matchedCount} | modified=${updateResult.modifiedCount} | upserted=${updateResult.upsertedCount}`);
 
     return { updated: true, latestSlot, normalSlot };
 
