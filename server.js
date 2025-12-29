@@ -577,11 +577,93 @@ async function createContribIndexes() {
       }
     );
 
+    // ✅ NEW: Index for efficient min/max slot detection
+    await db.collection('contrib_reels').createIndex(
+      { userId: 1, slotId: -1 },  // Descending for max (latest)
+      { 
+        name: 'userId_slotId_latest',
+        background: true
+      }
+    );
+
+    await db.collection('contrib_reels').createIndex(
+      { userId: 1, slotId: 1 },  // Ascending for min (normal/oldest)
+      { 
+        name: 'userId_slotId_oldest',
+        background: true
+      }
+    );
+
     console.log('[CONTRIB-INDEXES] ✅ Created compound indexes for userId + slotId');
   } catch (err) {
     if (err.code !== 85) { // Ignore "already exists"
       console.error('[CONTRIB-INDEX-ERROR]', err.message);
     }
+  }
+}
+
+
+// ✅ NEW: Automatically update user_status based on contrib_reels (2 reads max)
+async function autoUpdateUserStatusFromContrib(userId, contentType) {
+  const collection = contentType === 'reels' ? 'contrib_reels' : 'contrib_posts';
+  const latestField = contentType === 'reels' ? 'latestReelSlotId' : 'latestPostSlotId';
+  const normalField = contentType === 'reels' ? 'normalReelSlotId' : 'normalPostSlotId';
+  
+  console.log(`[AUTO-UPDATE-STATUS] Detecting slots for userId=${userId} | type=${contentType}`);
+
+  try {
+    // ✅ READ 1: Get highest slotId (latest) - uses index, no collection scan
+    const latestDoc = await db.collection(collection)
+      .find({ userId })
+      .sort({ slotId: -1 })  // Descending = highest first
+      .limit(1)
+      .project({ slotId: 1 })
+      .toArray();
+
+    // ✅ READ 2: Get lowest slotId (normal) - uses index, no collection scan
+    const normalDoc = await db.collection(collection)
+      .find({ userId })
+      .sort({ slotId: 1 })   // Ascending = lowest first
+      .limit(1)
+      .project({ slotId: 1 })
+      .toArray();
+
+    const latestSlot = latestDoc.length > 0 ? latestDoc[0].slotId : null;
+    const normalSlot = normalDoc.length > 0 ? normalDoc[0].slotId : null;
+
+    if (!latestSlot || !normalSlot) {
+      console.log(`[AUTO-UPDATE-STATUS] No ${contentType} contributions found for userId=${userId}`);
+      return { updated: false, reason: 'no_contributions' };
+    }
+
+    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot}, normal=${normalSlot}`);
+
+    // ✅ WRITE: Update user_status
+    const updateData = {
+      [latestField]: latestSlot,
+      [normalField]: normalSlot,
+      updatedAt: new Date().toISOString()
+    };
+
+    const result = await db.collection('user_status').updateOne(
+      { _id: userId },
+      {
+        $set: updateData,
+        $setOnInsert: {
+          userId: userId,
+          createdAt: new Date().toISOString()
+        }
+      },
+      { upsert: true }
+    );
+
+    console.log(`[AUTO-UPDATE-STATUS] ✅ Updated user_status | matched=${result.matchedCount} | modified=${result.modifiedCount} | upserted=${result.upsertedCount}`);
+
+    return { updated: true, latestSlot, normalSlot };
+
+  } catch (error) {
+    console.error(`[AUTO-UPDATE-STATUS-ERROR]`, error);
+    return { updated: false, error: error.message };
   }
 }
 
@@ -1671,8 +1753,9 @@ console.log(`${'='.repeat(80)}\n`);
 
 return {
   content: interestedContent.slice(0, minContentRequired * 2),
-  latestDocumentId: newLatestSlot,  // ✅ Return for Android to save on exit
-  normalDocumentId: newNormalSlot,  // ✅ Return for Android to save on exit
+  // ❌ REMOVE THESE - No longer needed:
+  // latestDocumentId: newLatestSlot,
+  // normalDocumentId: newNormalSlot,
   isNewUser,
   hasNewContent: interestedContent.length > 0,
   metadata: {
@@ -1683,13 +1766,8 @@ return {
     interestFiltered: interestedContent.length,
     totalReads: totalReads,
     userInterests,
-    duration,
-    // ✅ NEW: Return computed next state for app exit
-    computedNextState: {
-      latestSlot: newLatestSlot,
-      normalSlot: newNormalSlot,
-      visitIncrement: (newNormalSlot === `${collection.slice(0, -1)}_0`) ? 1 : 0
-    }
+    duration
+    // ❌ REMOVE computedNextState - user_status updates automatically now
   }
 };
 if (newLatestSlot && newNormalSlot) {
@@ -1739,19 +1817,21 @@ newLatestSlot,normal={newNormalSlot}
 );   console.log(  Total Duration: ${duration}ms);   console.log(${'='.repeat(80)}\n`);
 return {
   content: interestedContent.slice(0, minContentRequired * 2),
-  latestDocumentId: newLatestSlot,
-  normalDocumentId: newNormalSlot,
+  // ❌ REMOVE THESE - No longer needed:
+  // latestDocumentId: newLatestSlot,
+  // normalDocumentId: newNormalSlot,
   isNewUser,
   hasNewContent: interestedContent.length > 0,
   metadata: {
     slotsChecked: documentsChecked.map(d => d.slot),
     slotsWithContent: slotContents.map(s => s.slotId),
-    slotsRead: slotContents.map(s => s.slotId), // ✅ ADD THIS
+    slotsRead: slotContents.map(s => s.slotId),
     contribDocsChecked: contribDocsChecked.map(c => c.slotId),
     interestFiltered: interestedContent.length,
     totalReads: totalReads,
     userInterests,
     duration
+    // ❌ REMOVE computedNextState - user_status updates automatically now
   }
 };
 }
@@ -2150,82 +2230,57 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
     reels.length > 0 && { type: 'reels', collection: 'contrib_reels', ids: reels }
   ].filter(Boolean);
 
-  const reelSlotIds = new Set();
-  const postSlotIds = new Set();
-
   for (const op of operations) {
     const start = Date.now();
     
-    // Extract slotIds from items
+    // Group by slotId for efficient bulk operations
+    const slotGroups = {};
     for (const item of op.ids) {
       const postId = typeof item === 'string' ? item : item.postId;
       const slotId = typeof item === 'object' ? item.slotId : null;
       
       if (slotId) {
-        if (op.type === 'reels') {
-          reelSlotIds.add(slotId);
-        } else {
-          postSlotIds.add(slotId);
-        }
+        if (!slotGroups[slotId]) slotGroups[slotId] = [];
+        slotGroups[slotId].push(postId);
       }
     }
 
-    // ✅ CRITICAL: Use ordered: true to ensure sequential execution
-    const result = await this.db.collection(op.collection).bulkWrite([{
+    // ✅ Bulk write with proper grouping
+    const bulkOps = Object.entries(slotGroups).map(([slotId, postIds]) => ({
       updateOne: {
-        filter: { userId, slotId: { $in: Array.from(op.type === 'reels' ? reelSlotIds : postSlotIds) } },
+        filter: { userId, slotId },
         update: {
-          $addToSet: { ids: { $each: op.ids.map(i => typeof i === 'string' ? i : i.postId) } },
-          $setOnInsert: { userId, createdAt: new Date().toISOString() },
+          $addToSet: { ids: { $each: postIds } },
+          $setOnInsert: { userId, slotId, createdAt: new Date().toISOString() },
           $set: { updatedAt: new Date().toISOString() }
         },
         upsert: true
       }
-    }], { ordered: true }); // ✅ CHANGED: Force sequential execution
-    
-    const duration = Date.now() - start;
-    logDbOp('bulkWrite', op.collection, { userId }, result, duration);
-    console.log(`[MONITORING SAMIR] [BATCH-CONTRIB-SAVED] ${op.type} | ${op.ids.length} items | Duration: ${duration}ms`);
-    results.push({ type: op.type, result });
+    }));
+
+    if (bulkOps.length > 0) {
+      const result = await this.db.collection(op.collection).bulkWrite(bulkOps, { ordered: false });
+      
+      const duration = Date.now() - start;
+      logDbOp('bulkWrite', op.collection, { userId }, result, duration);
+      console.log(`[MONITORING SAMIR] [BATCH-CONTRIB-SAVED] ${op.type} | ${op.ids.length} items | Duration: ${duration}ms`);
+      results.push({ type: op.type, result });
+    }
   }
 
-  // ✅ CRITICAL: IMMEDIATE user_status UPDATE (not async, wait for completion)
-  if (reelSlotIds.size > 0 || postSlotIds.size > 0) {
-    console.log(`[MONITORING SAMIR] [FORCE-USER-STATUS-UPDATE] Updating user_status IMMEDIATELY`);
-    
-    const updateData = {};
-    
-    if (reelSlotIds.size > 0) {
-      const reelSlotArray = Array.from(reelSlotIds).sort((a, b) => {
-        const numA = parseInt(a.split('_')[1]) || 0;
-        const numB = parseInt(b.split('_')[1]) || 0;
-        return numB - numA;
-      });
-      
-      updateData.latestReelSlotId = reelSlotArray[0];
-      updateData.normalReelSlotId = reelSlotArray[reelSlotArray.length - 1];
-      
-      console.log(`[MONITORING SAMIR] [USER-STATUS-REELS-UPDATE] latest=${updateData.latestReelSlotId}, normal=${updateData.normalReelSlotId}`);
-    }
-    
-    if (postSlotIds.size > 0) {
-      const postSlotArray = Array.from(postSlotIds).sort((a, b) => {
-        const numA = parseInt(a.split('_')[1]) || 0;
-        const numB = parseInt(b.split('_')[1]) || 0;
-        return numB - numA;
-      });
-      
-      updateData.latestPostSlotId = postSlotArray[0];
-      updateData.normalPostSlotId = postSlotArray[postSlotArray.length - 1];
-      
-      console.log(`[MONITORING SAMIR] [USER-STATUS-POSTS-UPDATE] latest=${updateData.latestPostSlotId}, normal=${updateData.normalPostSlotId}`);
-    }
-    
-    // ✅ CRITICAL: WAIT for update to complete (don't use Promise.all or async)
-    await this.updateUserStatus(userId, updateData);
-    
-    console.log(`[MONITORING SAMIR] [FORCE-SYNC-COMPLETE] user_status updated IMMEDIATELY`);
+  // ✅ CRITICAL: Auto-update user_status after contrib changes (no client dependency)
+  const updatePromises = [];
+  
+  if (reels.length > 0) {
+    updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'reels'));
   }
+  
+  if (posts.length > 0) {
+    updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'posts'));
+  }
+
+  // Wait for all updates to complete
+  await Promise.all(updatePromises);
 
   return results;
 }
@@ -3818,115 +3873,12 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
 
     console.log(`[BATCH-START] userId=${userId} | ${posts.length}P + ${reels.length}R`);
 
-    const postOperations = [];
-    const reelOperations = [];
-    
-    // ✅ Track which slots we need to query
-    const reelSlotLookups = [];
-    const postSlotLookups = [];
-
-    // ✅ Process reels - get slot for each postId
-    for (const item of reels) {
-      const postId = typeof item === 'string' ? item : item.postId;
-      
-      // Check if client provided slotId
-      let slotId = typeof item === 'object' ? item.slotId : null;
-      
-      if (!slotId) {
-        console.log(`[BATCH-REEL-LOOKUP] ${postId.substring(0, 8)} - client didn't provide slotId, looking up...`);
-        slotId = await getSlotForReel(postId);
-        reelSlotLookups.push(postId);
-      }
-      
-      if (!slotId) {
-        console.warn(`[BATCH-SKIP-REEL] ${postId} - slot not found in any document`);
-        continue;
-      }
-
-      console.log(`[BATCH-REEL] ${postId.substring(0, 8)} → ${slotId}`);
-
-      reelOperations.push({
-        updateOne: {
-          filter: { 
-            userId: userId,
-            slotId: slotId
-          },
-          update: {
-            $addToSet: { ids: postId },
-            $setOnInsert: {
-              userId: userId,
-              slotId: slotId,
-              createdAt: new Date()
-            },
-            $set: { updatedAt: new Date() }
-          },
-          upsert: true
-        }
-      });
-    }
-
-    // ✅ Process posts (same logic)
-    for (const item of posts) {
-      const postId = typeof item === 'string' ? item : item.postId;
-      let slotId = typeof item === 'object' ? item.slotId : null;
-      
-      if (!slotId) {
-        console.log(`[BATCH-POST-LOOKUP] ${postId.substring(0, 8)} - client didn't provide slotId, looking up...`);
-        slotId = await getSlotForPost(postId);
-        postSlotLookups.push(postId);
-      }
-      
-      if (!slotId) {
-        console.warn(`[BATCH-SKIP-POST] ${postId} - slot not found`);
-        continue;
-      }
-
-      console.log(`[BATCH-POST] ${postId.substring(0, 8)} → ${slotId}`);
-
-      postOperations.push({
-        updateOne: {
-          filter: { 
-            userId: userId,
-            slotId: slotId
-          },
-          update: {
-            $addToSet: { ids: postId },
-            $setOnInsert: {
-              userId: userId,
-              slotId: slotId,
-              createdAt: new Date()
-            },
-            $set: { updatedAt: new Date() }
-          },
-          upsert: true
-        }
-      });
-    }
-
-    // Execute bulk writes
-    const [postResults, reelResults] = await Promise.all([
-      postOperations.length > 0 
-        ? db.collection('contrib_posts').bulkWrite(postOperations, { 
-            ordered: false,
-            writeConcern: { w: 1, j: false }
-          })
-        : Promise.resolve({ upsertedCount: 0, modifiedCount: 0 }),
-      
-      reelOperations.length > 0
-        ? db.collection('contrib_reels').bulkWrite(reelOperations, { 
-            ordered: false,
-            writeConcern: { w: 1, j: false }
-          })
-        : Promise.resolve({ upsertedCount: 0, modifiedCount: 0 })
-    ]);
+    // ✅ Use the updated method that auto-updates user_status
+    const results = await dbManager.batchPutContributedViewsOptimized(userId, posts, reels);
 
     const duration = Date.now() - startTime;
 
-    console.log(`[BATCH-COMPLETE] userId=${userId} | ${postOperations.length}P + ${reelOperations.length}R operations in ${duration}ms`);
-    
-    if (reelSlotLookups.length > 0 || postSlotLookups.length > 0) {
-      console.warn(`[BATCH-PERFORMANCE] Had to lookup ${reelSlotLookups.length} reel slots + ${postSlotLookups.length} post slots - client should provide slotId`);
-    }
+    console.log(`[BATCH-COMPLETE] userId=${userId} | Duration: ${duration}ms | user_status auto-updated`);
 
     res.json({
       success: true,
@@ -3934,23 +3886,10 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
         posts: posts.length,
         reels: reels.length
       },
-      saved: {
-        posts: postOperations.length,
-        reels: reelOperations.length
-      },
-      results: {
-        posts: {
-          upserted: postResults.upsertedCount || 0,
-          modified: postResults.modifiedCount || 0
-        },
-        reels: {
-          upserted: reelResults.upsertedCount || 0,
-          modified: reelResults.modifiedCount || 0
-        }
-      },
-      performance: {
-        reelSlotLookups: reelSlotLookups.length,
-        postSlotLookups: postSlotLookups.length
+      // ✅ user_status is automatically updated by autoUpdateUserStatusFromContrib
+      autoUpdated: {
+        reels: reels.length > 0,
+        posts: posts.length > 0
       },
       requestId,
       duration
