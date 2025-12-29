@@ -1720,7 +1720,6 @@ if (newLatestSlot && newNormalSlot) {
   console.log(`\n[MONITORING SAMIR] [PHASE-8] SKIP USER_STATUS UPDATE - No changes needed`);
 }
 
-  const duration = Date.now() - start;
   const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
 
   console.log(`\n${'='.repeat(80)}`);
