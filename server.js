@@ -1530,8 +1530,8 @@ for (const { slotId, content } of slotContents) {
       interestedContent.push(item);
       interestMatchCount++;
       console.log(`[MONITORING SAMIR] [INTEREST-MATCH] ${item.postId.substring(0, 8)} | category="${item.category}" matches interests`);
-    } else if (userInterests.length === 0) {
-      // ✅ PRIORITY 2: No interests set, include all
+    } else if (userInterests.length === 0 || !hasCategory) {
+      // ✅ CRITICAL FIX: If no interests OR item has no category, include it
       interestedContent.push(item);
       noInterestIncludeCount++;
     }
@@ -1541,86 +1541,92 @@ for (const { slotId, content } of slotContents) {
 
 console.log(`[MONITORING SAMIR] [INTEREST-FILTER-RESULT] Total items: ${totalItemsBeforeFilter} | After viewed filter: ${totalItemsBeforeFilter - viewedIds.size} | Interest matches: ${interestMatchCount} | No-interest includes: ${noInterestIncludeCount} | Final: ${interestedContent.length}`);
 
-if (interestMatchCount === 0 && userInterests.length > 0) {
+if (interestMatchCount === 0 && noInterestIncludeCount === 0 && userInterests.length > 0) {
   console.warn(`[MONITORING SAMIR] [NO-INTEREST-MATCHES] No content matched user interests [${userInterests.join(', ')}] - will use engagement fill`);
 }
 
-  // ============================================================
-  // PHASE 6: ENGAGEMENT-BASED FILL (if insufficient)
-  // ============================================================
-  if (interestedContent.length < minContentRequired) {
-    const slot0Visits = userStatus?.[visitField] || 0;
-    const normalMatch = userStatus?.[normalField]?.match(/_(\d+)$/);
-    const normalIndex = normalMatch ? parseInt(normalMatch[1]) : -1;
-    const isAtSlot0 = normalIndex === 0;
-    
-    let engagementStrategy = 'HIGH';
-    
-    if (isAtSlot0) {
-      if (slot0Visits === 0) {
-        engagementStrategy = 'MEDIUM';
-        console.log(`\n[MONITORING SAMIR] [PHASE-6] ENGAGEMENT FILL - FIRST TIME AT SLOT_0 - Using MEDIUM engagement strategy`);
-      } else if (slot0Visits === 1) {
-        engagementStrategy = 'HIGH';
-        console.log(`\n[MONITORING SAMIR] [PHASE-6] ENGAGEMENT FILL - SECOND TIME AT SLOT_0 - Using HIGH engagement strategy`);
-      } else {
-        engagementStrategy = 'UNSEEN';
-        console.log(`\n[MONITORING SAMIR] [PHASE-6] ENGAGEMENT FILL - THIRD+ TIME AT SLOT_0 - Using UNSEEN CONTENT strategy`);
-      }
+// ============================================================
+// PHASE 6: ENGAGEMENT-BASED FILL (if insufficient)
+// ============================================================
+if (interestedContent.length < minContentRequired) {
+  const slot0Visits = userStatus?.[visitField] || 0;
+  const normalMatch = userStatus?.[normalField]?.match(/_(\d+)$/);
+  const normalIndex = normalMatch ? parseInt(normalMatch[1]) : -1;
+  const isAtSlot0 = normalIndex === 0;
+  
+  let engagementStrategy = 'HIGH';
+  
+  if (isAtSlot0) {
+    if (slot0Visits === 0) {
+      engagementStrategy = 'MEDIUM';
+      console.log(`\n[MONITORING SAMIR] [PHASE-6] ENGAGEMENT FILL - FIRST TIME AT SLOT_0 - Using MEDIUM engagement strategy`);
+    } else if (slot0Visits === 1) {
+      engagementStrategy = 'HIGH';
+      console.log(`\n[MONITORING SAMIR] [PHASE-6] ENGAGEMENT FILL - SECOND TIME AT SLOT_0 - Using HIGH engagement strategy`);
     } else {
-      console.log(`\n[MONITORING SAMIR] [PHASE-6] ENGAGEMENT FILL - NORMAL POSITION - Using HIGH engagement strategy`);
+      engagementStrategy = 'UNSEEN';
+      console.log(`\n[MONITORING SAMIR] [PHASE-6] ENGAGEMENT FILL - THIRD+ TIME AT SLOT_0 - Using UNSEEN CONTENT strategy`);
     }
-    
-    console.log(`[MONITORING SAMIR] [ENGAGEMENT-STRATEGY] ${engagementStrategy} | Need ${minContentRequired - interestedContent.length} more items`);
-    
-    const existingIds = new Set(interestedContent.map(item => item.postId));
-    const remainderContent = [];
+  } else {
+    console.log(`\n[MONITORING SAMIR] [PHASE-6] ENGAGEMENT FILL - NORMAL POSITION - Using HIGH engagement strategy`);
+  }
+  
+  console.log(`[MONITORING SAMIR] [ENGAGEMENT-STRATEGY] ${engagementStrategy} | Need ${minContentRequired - interestedContent.length} more items`);
+  
+  const existingIds = new Set(interestedContent.map(item => item.postId));
+  const remainderContent = [];
 
-    for (const { content } of slotContents) {
-      for (const item of content) {
-        if (!viewedIds.has(item.postId) && !existingIds.has(item.postId)) {
-          let shouldInclude = false;
-          
-          if (engagementStrategy === 'HIGH') {
-            shouldInclude = (item.retention || 0) > 70 || (item.likeCount || 0) > 50;
-          } else if (engagementStrategy === 'MEDIUM') {
-            shouldInclude = (item.retention || 0) > 40 || (item.likeCount || 0) > 20;
-          } else if (engagementStrategy === 'UNSEEN') {
-            shouldInclude = true;
-          }
-          
-          if (shouldInclude) {
-            remainderContent.push(item);
-          }
+  for (const { content } of slotContents) {
+    for (const item of content) {
+      if (!viewedIds.has(item.postId) && !existingIds.has(item.postId)) {
+        let shouldInclude = false;
+        
+        // ✅ CRITICAL FIX: Use proper numeric comparisons
+        const retention = parseFloat(item.retention) || 0;
+        const likeCount = parseInt(item.likeCount) || 0;
+        
+        if (engagementStrategy === 'HIGH') {
+          shouldInclude = retention >= 70 || likeCount >= 50;
+        } else if (engagementStrategy === 'MEDIUM') {
+          shouldInclude = retention >= 40 || likeCount >= 20;
+        } else if (engagementStrategy === 'UNSEEN') {
+          shouldInclude = true; // Include everything unseen
+        }
+        
+        if (shouldInclude) {
+          remainderContent.push(item);
+          console.log(`[MONITORING SAMIR] [ENGAGEMENT-CANDIDATE] ${item.postId.substring(0, 8)} | retention=${retention}% | likes=${likeCount} | strategy=${engagementStrategy}`);
         }
       }
     }
-
-    remainderContent.sort((a, b) => {
-      const retentionDiff = (b.retention || 0) - (a.retention || 0);
-      if (Math.abs(retentionDiff) > 1) return retentionDiff;
-      const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
-      if (likesDiff !== 0) return likesDiff;
-      const commentsDiff = (b.commentCount || 0) - (a.commentCount || 0);
-      if (commentsDiff !== 0) return commentsDiff;
-      return (b.viewCount || 0) - (a.viewCount || 0);
-    });
-
-    const needed = minContentRequired - interestedContent.length;
-    const fillContent = remainderContent.slice(0, needed);
-    
-    console.log(`[MONITORING SAMIR] [ENGAGEMENT-FILL-RESULT] Strategy: ${engagementStrategy} | Available: ${remainderContent.length} | Taking: ${fillContent.length}`);
-    
-    fillContent.forEach((item, idx) => {
-      if (idx < 3) {
-        console.log(`[MONITORING SAMIR] [FILL-ITEM-${idx + 1}] postId=${item.postId.substring(0, 8)} | retention=${item.retention}% | likes=${item.likeCount} | Strategy: ${engagementStrategy}`);
-      }
-    });
-    
-    interestedContent.push(...fillContent);
-  } else {
-    console.log(`\n[MONITORING SAMIR] [PHASE-6] SKIP - Already have ${interestedContent.length} items (>= ${minContentRequired} required)`);
   }
+
+  // ✅ Sort by engagement metrics
+  remainderContent.sort((a, b) => {
+    const retentionDiff = (parseFloat(b.retention) || 0) - (parseFloat(a.retention) || 0);
+    if (Math.abs(retentionDiff) > 1) return retentionDiff;
+    const likesDiff = (parseInt(b.likeCount) || 0) - (parseInt(a.likeCount) || 0);
+    if (likesDiff !== 0) return likesDiff;
+    const commentsDiff = (parseInt(b.commentCount) || 0) - (parseInt(a.commentCount) || 0);
+    if (commentsDiff !== 0) return commentsDiff;
+    return (parseInt(b.viewCount) || 0) - (parseInt(a.viewCount) || 0);
+  });
+
+  const needed = minContentRequired - interestedContent.length;
+  const fillContent = remainderContent.slice(0, needed);
+  
+  console.log(`[MONITORING SAMIR] [ENGAGEMENT-FILL-RESULT] Strategy: ${engagementStrategy} | Available: ${remainderContent.length} | Taking: ${fillContent.length}`);
+  
+  fillContent.forEach((item, idx) => {
+    if (idx < 3) {
+      console.log(`[MONITORING SAMIR] [FILL-ITEM-${idx + 1}] postId=${item.postId.substring(0, 8)} | retention=${item.retention}% | likes=${item.likeCount} | Strategy: ${engagementStrategy}`);
+    }
+  });
+  
+  interestedContent.push(...fillContent);
+} else {
+  console.log(`\n[MONITORING SAMIR] [PHASE-6] SKIP - Already have ${interestedContent.length} items (>= ${minContentRequired} required)`);
+}
 
 
   console.log(`\n[MONITORING SAMIR] [PHASE-7] FINAL RANKING - Sorting by engagement`);
