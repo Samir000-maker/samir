@@ -603,7 +603,6 @@ async function createContribIndexes() {
 }
 
 
-// ✅ FIXED: Auto-update user_status based on contrib_reels (2 reads max)
 async function autoUpdateUserStatusFromContrib(userId, contentType) {
   const collection = contentType === 'reels' ? 'contrib_reels' : 'contrib_posts';
   const latestField = contentType === 'reels' ? 'latestReelSlotId' : 'latestPostSlotId';
@@ -612,35 +611,33 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
   console.log(`[AUTO-UPDATE-STATUS] Detecting slots for userId=${userId} | type=${contentType}`);
 
   try {
-    // ✅ READ 1: Get HIGHEST slotId (latest) - sorted DESC by slotId string
-    // This uses userId_slotId_latest index (userId: 1, slotId: -1)
-    const latestDoc = await db.collection(collection)
-      .find({ userId })
-      .sort({ slotId: -1 })  // ✅ Descending = "reel_10" > "reel_9" > "reel_8"
-      .limit(1)
-      .project({ slotId: 1 })
+    // Get all slotIds for this user
+    const docs = await db.collection(collection)
+      .find({ userId }, { projection: { slotId: 1 } })
       .toArray();
 
-    // ✅ READ 2: Get LOWEST slotId (normal) - sorted ASC by slotId string
-    // This uses userId_slotId_oldest index (userId: 1, slotId: 1)
-    const normalDoc = await db.collection(collection)
-      .find({ userId })
-      .sort({ slotId: 1 })   // ✅ Ascending = "reel_6" < "reel_8" < "reel_9"
-      .limit(1)
-      .project({ slotId: 1 })
-      .toArray();
-
-    const latestSlot = latestDoc.length > 0 ? latestDoc[0].slotId : null;
-    const normalSlot = normalDoc.length > 0 ? normalDoc[0].slotId : null;
-
-    if (!latestSlot || !normalSlot) {
+    if (docs.length === 0) {
       console.log(`[AUTO-UPDATE-STATUS] No ${contentType} contributions found for userId=${userId}`);
       return { updated: false, reason: 'no_contributions' };
     }
 
-    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot} (highest), normal=${normalSlot} (lowest)`);
+    // ✅ Extract numeric parts and sort in JavaScript
+    const slots = docs
+      .map(doc => {
+        const match = doc.slotId.match(/_(\d+)$/);
+        return {
+          slotId: doc.slotId,
+          slotNum: match ? parseInt(match[1], 10) : 0
+        };
+      })
+      .sort((a, b) => a.slotNum - b.slotNum); // Ascending numeric sort
 
-    // ✅ WRITE: Update user_status ONLY if values changed
+    const normalSlot = slots[0].slotId;  // ✅ Lowest number (first in ascending)
+    const latestSlot = slots[slots.length - 1].slotId;  // ✅ Highest number (last in ascending)
+
+    console.log(`[AUTO-UPDATE-STATUS] Detected: latest=${latestSlot} (num=${slots[slots.length - 1].slotNum}), normal=${normalSlot} (num=${slots[0].slotNum})`);
+
+    // ✅ Check if update is needed
     const currentStatus = await db.collection('user_status').findOne(
       { _id: userId },
       { projection: { [latestField]: 1, [normalField]: 1 } }
@@ -651,10 +648,11 @@ async function autoUpdateUserStatusFromContrib(userId, contentType) {
                         currentStatus[normalField] !== normalSlot;
 
     if (!needsUpdate) {
-      console.log(`[AUTO-UPDATE-STATUS] ⏭️ Skipped - no changes (latest=${latestSlot}, normal=${normalSlot})`);
+      console.log(`[AUTO-UPDATE-STATUS] ⏭️ Skipped - no changes`);
       return { updated: false, reason: 'no_changes', latestSlot, normalSlot };
     }
 
+    // ✅ Update user_status
     const updateData = {
       [latestField]: latestSlot,
       [normalField]: normalSlot,
