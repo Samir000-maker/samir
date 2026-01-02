@@ -1268,21 +1268,91 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     // ====================================================================
     // CASE 2/3: NEW FORWARD SLOT EXISTS (Priority #1)
     // ====================================================================
-    if (globalForwardExists) {
-      console.log(`[CASE-2/3] NEWER-SLOT-FOUND: ${globalForwardSlot}`);
+if (globalForwardExists) {
+  console.log(`[CASE-2/3] NEWER-SLOT-FOUND: ${globalForwardSlot}`);
+  
+  // ✅ CRITICAL FIX: Build forward sequence [latest+1, latest+2, latest+3]
+  const forwardSlots = [globalForwardSlot]; // Start with confirmed slot
+  
+  // Check up to 2 more forward slots
+  for (let i = latestIndex + 2; i <= latestIndex + 3; i++) {
+    if (forwardSlots.length >= 3) break; // Max 3 slots
+    
+    const nextForwardSlot = `${collection.slice(0, -1)}_${i}`;
+    const nextCheckStart = Date.now();
+    const nextExists = await this.db.collection(collection).findOne(
+      { _id: nextForwardSlot },
+      { projection: { _id: 1 } }
+    );
+    const nextCheckDuration = Date.now() - nextCheckStart;
+    
+    documentsChecked.push({ 
+      slot: nextForwardSlot, 
+      exists: !!nextExists, 
+      duration: nextCheckDuration,
+      reason: 'case2-forward-increment'
+    });
+    
+    console.log(`[CASE-2/3-FORWARD-CHECK] ${nextForwardSlot} | Exists: ${!!nextExists} | Duration: ${nextCheckDuration}ms`);
+    
+    if (nextExists) {
+      forwardSlots.push(nextForwardSlot);
+    } else {
+      break; // Stop at first missing slot
+    }
+  }
+  
+  // ✅ If we have less than 3 slots, fill backward from normalSlot
+  if (forwardSlots.length < 3) {
+    const backwardSlots = [];
+    let backwardIndex = normalIndex;
+    
+    while (backwardSlots.length + forwardSlots.length < 3 && backwardIndex >= 0) {
+      const backwardSlot = `${collection.slice(0, -1)}_${backwardIndex}`;
       
-      slotsToRead = [
-        globalForwardSlot,
-        currentNormalSlot,
-        `${collection.slice(0, -1)}_${Math.max(normalIndex - 1, 0)}`
-      ];
-
-      newLatestSlot = globalForwardSlot;
-      newNormalSlot = slotsToRead[2];
-
-      console.log(`[CASE-2/3-PLAN] Will read: [${slotsToRead.join(', ')}]`);
-
-    } 
+      // ✅ Skip if already in forwardSlots
+      if (forwardSlots.includes(backwardSlot)) {
+        backwardIndex--;
+        continue;
+      }
+      
+      const backwardCheckStart = Date.now();
+      const backwardExists = await this.db.collection(collection).findOne(
+        { _id: backwardSlot },
+        { projection: { _id: 1 } }
+      );
+      const backwardCheckDuration = Date.now() - backwardCheckStart;
+      
+      documentsChecked.push({ 
+        slot: backwardSlot, 
+        exists: !!backwardExists, 
+        duration: backwardCheckDuration,
+        reason: 'case2-backward-fill'
+      });
+      
+      console.log(`[CASE-2/3-BACKWARD-FILL] ${backwardSlot} | Exists: ${!!backwardExists} | Duration: ${backwardCheckDuration}ms`);
+      
+      if (backwardExists) {
+        backwardSlots.push(backwardSlot);
+      }
+      
+      backwardIndex--;
+    }
+    
+    slotsToRead = [...forwardSlots, ...backwardSlots];
+  } else {
+    slotsToRead = forwardSlots;
+  }
+  
+  // ✅ Remove duplicates and limit to 3
+  slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+  
+  newLatestSlot = forwardSlots[forwardSlots.length - 1]; // Highest forward slot
+  newNormalSlot = slotsToRead[slotsToRead.length - 1]; // Last slot read
+  
+  console.log(`[CASE-2/3-FINAL-PLAN] Forward: [${forwardSlots.join(', ')}] | Total read: [${slotsToRead.join(', ')}]`);
+  console.log(`[CASE-2/3-STATE-UPDATE] New latest=${newLatestSlot}, New normal=${newNormalSlot}`);
+}
     // ====================================================================
     // AT SLOT_0 CASES (4, 5, 6)
     // ====================================================================
