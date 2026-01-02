@@ -1941,46 +1941,6 @@ async getLatestSlotOptimized(collection) {
 }
 
 
-
-const latestSlot = await this.getLatestSlotOptimized(collection);
-if (!latestSlot) {
-return { content: [], latestDocumentId: null, normalDocumentId: null, isNewUser: true };
-}
-
-const content = [];
-const slotsToFetch = [latestSlot._id];
-
-const additionalSlots = await this.db.collection(collection)
-.find({ index: { $lt: latestSlot.index } }, { projection: { _id: 1, index: 1, count: 1 } })
-.sort({ index: -1 })
-.limit(3)
-.toArray();
-
-additionalSlots.forEach(slot => slotsToFetch.push(slot._id));
-
-await this.fetchContentFromSlots(slotsToFetch, collection, contentType, content);
-
-const qualityContent = content.filter(item => {
-return item.postId &&
-item.imageUrl &&
-item.username &&
-(item.likeCount || 0) >= 0;
-});
-
-const normalDocId = slotsToFetch.length > 1 ? slotsToFetch[1] : latestSlot._id;
-await this.updateUserStatus(userId, {
-[statusField]: latestSlot._id,
-[normalField]: normalDocId
-});
-
-return {
-content: qualityContent.slice(0, Math.max(minContentRequired, MIN_CONTENT_FOR_FEED)),
-latestDocumentId: latestSlot._id,
-normalDocumentId: normalDocId,
-isNewUser: true
-};
-}
-
 async fetchContentFromSlots(slots, collection, contentType, content) {
 if (slots.length === 0) return;
 
