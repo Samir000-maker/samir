@@ -44,7 +44,7 @@ const { promisify } = require('util');
 
 
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
-const MAX_CONTENT_PER_SLOT = 40; // Maximum content items per document before creating new slot
+const MAX_CONTENT_PER_SLOT = 3; // Maximum content items per document before creating new slot
 const DEFAULT_CONTENT_BATCH_SIZE = 10; // Default number of items to return per request
 const MIN_CONTENT_FOR_FEED = 10; // Minimum content required for feed requests
 // ============================================================================
@@ -529,6 +529,7 @@ async function initMongo() {
   // ✅ CREATE ALL INDEXES (consolidated function)
   await createAllProductionIndexes();
 
+  await createRankingIndexes();
   // ✅ VERIFY CRITICAL INDEXES
   await verifyIndexes();
 
@@ -1939,58 +1940,7 @@ async getLatestSlotOptimized(collection) {
   return latestSlot;
 }
 
-async getAdditionalContent(userId, collection, contentType, needed, existingResult) {
-try {
-console.log(`[ADDITIONAL-CONTENT-START] ${userId} needs ${needed} more items | Current Reads: ${dbOpCounters.reads}`);
 
-const listKey = contentType === 'reels' ? 'reelsList' : 'postList';
-const existingIds = new Set(existingResult.content.map(item => item.postId));
-
-// Single query for contributed views
-const start1 = Date.now();
-const contributedDoc = await this.db.collection(`contrib_${collection}`).findOne(
-{ userId },
-{ projection: { ids: 1 } }
-);
-logDbOp('findOne', `contrib_${collection}`, { userId }, contributedDoc, Date.now() - start1);
-const viewedIds = new Set(contributedDoc?.ids || []);
-
-// Limit to only 2 slots to minimize reads
-const start2 = Date.now();
-const slots = await this.db.collection(collection)
-.find({}, { projection: { _id: 1, [listKey]: 1, index: 1 } })
-.sort({ index: -1 })
-.limit(2) // Reduced from 5 to 2
-.toArray();
-logDbOp('find', collection, { sort: { index: -1 }, limit: 2 }, slots, Date.now() - start2);
-
-const additionalContent = [];
-
-for (const slot of slots) {
-if (additionalContent.length >= needed) break;
-
-const items = slot[listKey] || [];
-for (const item of items) {
-if (additionalContent.length >= needed) break;
-
-if (item.postId &&
-!existingIds.has(item.postId) &&
-!viewedIds.has(item.postId)) {
-additionalContent.push(item);
-}
-}
-}
-
-console.log(`[ADDITIONAL-CONTENT-RESULT] Found ${additionalContent.length} items | Total Reads: ${dbOpCounters.reads}`);
-return additionalContent;
-
-} catch (error) {
-console.error('[ADDITIONAL-CONTENT-ERROR]', error);
-return [];
-}
-}
-
-async getOptimizedFeedForNewUser(userId, collection, contentType, statusField, normalField, minContentRequired) {
 
 const latestSlot = await this.getLatestSlotOptimized(collection);
 if (!latestSlot) {
@@ -2031,143 +1981,6 @@ isNewUser: true
 };
 }
 
-async getOptimizedFeedForReturningUser(userId, collection, contentType, userStatus, statusField, normalField, minContentRequired) {
-
-const currentLatest = userStatus[statusField];
-const currentNormal = userStatus[normalField];
-
-if (!currentLatest) {
-return await this.getOptimizedFeedForNewUser(userId, collection, contentType, statusField, normalField, minContentRequired);
-}
-
-// Extract current index
-const match = currentLatest.match(/_(\d+)$/);
-if (!match) {
-return await this.getOptimizedFeedForNewUser(userId, collection, contentType, statusField, normalField, minContentRequired);
-}
-const currentIndex = parseInt(match[1]);
-
-// Check cache first for recent requests
-const cacheKey = `user_feed_${userId}_${contentType}_${currentIndex}`;
-const cachedResult = getCache(cacheKey);
-if (cachedResult) {
-console.log(`[FEED-CACHE-HIT] ${userId} - ${contentType} | Reads: ${dbOpCounters.reads}`);
-return cachedResult;
-}
-
-// SINGLE AGGREGATION QUERY instead of multiple separate queries
-const listKey = contentType === 'reels' ? 'reelsList' : 'postList';
-const nextSlotIds = [`${collection.slice(0, -1)}_${currentIndex + 1}`, `${collection.slice(0, -1)}_${currentIndex + 2}`];
-
-const start = Date.now();
-const pipeline = [
-{
-$match: {
-$or: [
-{ _id: { $in: nextSlotIds } }, // Check next 2 slots
-{ _id: currentLatest }, // Current slot
-{ _id: currentNormal } // Normal slot
-]
-}
-},
-{
-$lookup: {
-from: `contrib_${collection}`,
-let: { slotContent: `$${listKey}` },
-pipeline: [
-{ $match: { userId: userId } },
-{ $project: { ids: 1 } }
-],
-as: 'viewedData'
-}
-},
-{
-$project: {
-_id: 1,
-index: 1,
-count: 1,
-[listKey]: 1,
-viewedIds: { $ifNull: [{ $arrayElemAt: ['$viewedData.ids', 0] }, []] }
-}
-},
-{ $sort: { index: -1 } }
-];
-
-const results = await this.db.collection(collection).aggregate(pipeline).toArray();
-logDbOp('aggregate', collection, { pipeline: 'optimized_feed_query' }, results, Date.now() - start);
-
-const viewedIds = new Set(results.length > 0 && results[0].viewedIds ? results[0].viewedIds : []);
-let content = [];
-let newLatestSlot = currentLatest;
-
-// Process results in order of preference: newest slots first
-const sortedResults = results.sort((a, b) => (b.index || 0) - (a.index || 0));
-
-for (const slot of sortedResults) {
-const slotContent = slot[listKey] || [];
-const isNewSlot = nextSlotIds.includes(slot._id);
-
-// If this is a new slot with content, use it
-if (isNewSlot && slotContent.length > 0) {
-const freshContent = slotContent.filter(item =>
-item.postId && !viewedIds.has(item.postId)
-);
-
-if (freshContent.length > 0) {
-content = freshContent;
-newLatestSlot = slot._id;
-
-// Update user status in single operation
-await this.updateUserStatus(userId, {
-[statusField]: newLatestSlot,
-[normalField]: currentNormal
-});
-
-const result = {
-content: content.slice(0, Math.max(minContentRequired, content.length)),
-latestDocumentId: newLatestSlot,
-normalDocumentId: currentNormal,
-isNewUser: false,
-hasNewContent: true
-};
-
-// Cache the result for 15 seconds to prevent duplicate processing
-setCache(cacheKey, result, 15000);
-
-console.log(`[NEW-CONTENT-FOUND] ${userId} - ${contentType}: ${content.length} items | Total Reads: ${dbOpCounters.reads}`);
-return result;
-}
-}
-}
-
-// If no new content, return filtered existing content
-const existingSlots = sortedResults.filter(slot =>
-slot._id === currentLatest || slot._id === currentNormal
-);
-
-for (const slot of existingSlots) {
-const slotContent = slot[listKey] || [];
-const filteredContent = slotContent.filter(item =>
-item.postId && !viewedIds.has(item.postId)
-);
-content.push(...filteredContent);
-}
-
-const finalResult = {
-content: content.slice(0, Math.max(minContentRequired, MIN_CONTENT_FOR_FEED)),
-latestDocumentId: currentLatest,
-normalDocumentId: currentNormal,
-isNewUser: false,
-hasNewContent: false
-};
-
-// Cache negative results too to prevent repeated queries
-setCache(cacheKey, finalResult, 10000);
-
-console.log(`[FILTERED-RESULT] ${userId} - ${contentType}: ${finalResult.content.length} items | Total Reads: ${dbOpCounters.reads}`);
-return finalResult;
-}
-
 async fetchContentFromSlots(slots, collection, contentType, content) {
 if (slots.length === 0) return;
 
@@ -2179,63 +1992,6 @@ logDbOp('find', collection, { _id: { $in: slots } }, slotDocs, Date.now() - star
 const slotMap = new Map();
 slotDocs.forEach(doc => slotMap.set(doc._id, doc[listKey] || []));
 slots.forEach(slotId => content.push(...(slotMap.get(slotId) || [])));
-}
-
-async getFilteredContentForReturningUser(userId, collection, contentType, latestSlotId, normalSlotId, minContentRequired) {
-console.log(`[FILTERED-CONTENT] ${userId} - ${contentType}, minimum: ${minContentRequired} | Current Reads: ${dbOpCounters.reads}`);
-
-// Single query to get contributed views
-const start1 = Date.now();
-const contributedDoc = await this.db.collection(`contrib_${collection}`)
-.findOne({ userId }, { projection: { ids: 1 } });
-logDbOp('findOne', `contrib_${collection}`, { userId }, contributedDoc, Date.now() - start1);
-
-const viewedIds = new Set(contributedDoc?.ids || []);
-
-const currentIndex = parseInt(latestSlotId.match(/_(\d+)$/)?.[1] || '0');
-
-// Limit to only 2 slots for returning users to reduce reads
-const slotIds = [latestSlotId];
-if (normalSlotId && normalSlotId !== latestSlotId) {
-slotIds.push(normalSlotId);
-}
-
-// Single query for content
-const content = [];
-const start2 = Date.now();
-const slotDocs = await this.db.collection(collection)
-.find({ _id: { $in: slotIds } }, {
-projection: {
-[contentType === 'reels' ? 'reelsList' : 'postList']: 1,
-_id: 1
-}
-})
-.toArray();
-logDbOp('find', collection, { _id: { $in: slotIds } }, slotDocs, Date.now() - start2);
-
-const listKey = contentType === 'reels' ? 'reelsList' : 'postList';
-slotDocs.forEach(doc => {
-const items = doc[listKey] || [];
-content.push(...items);
-});
-
-const filteredContent = content.filter((item, index) => {
-return item.postId &&
-!viewedIds.has(item.postId) &&
-item.imageUrl &&
-item.username &&
-index < minContentRequired * 2;
-}).slice(0, Math.max(minContentRequired, 6));
-
-console.log(`[FILTERED-RESULT] ${userId} - ${contentType}: ${filteredContent.length} items | Total Reads: ${dbOpCounters.reads}`);
-
-return {
-content: filteredContent,
-latestDocumentId: latestSlotId,
-normalDocumentId: normalSlotId,
-isNewUser: false,
-hasNewContent: false
-};
 }
 
 async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
@@ -3485,33 +3241,6 @@ details: error.message
 });
 
 
-// Calculate ranking score based on Instagram's algorithm
-// Replace the existing calculateRankingScore function with this enhanced version
-function calculateRankingScore(item) {
-// Strict hierarchy: retention > likes > comments > views
-const RETENTION_WEIGHT = 1000000; // Highest priority
-const LIKE_WEIGHT = 10000; // Second priority
-const COMMENT_WEIGHT = 100; // Third priority
-const VIEW_WEIGHT = 1; // Lowest priority
-
-const retention = parseFloat(item.retention) || 0;
-const likes = parseInt(item.likeCount) || 0;
-const comments = parseInt(item.commentCount) || 0;
-const views = parseInt(item.viewCount) || 0;
-
-// This ensures retention dominates, then likes, then comments, then views
-const score = (
-(retention * RETENTION_WEIGHT) +
-(likes * LIKE_WEIGHT) +
-(comments * COMMENT_WEIGHT) +
-(views * VIEW_WEIGHT)
-);
-
-log('info', `[RANKING] ${item.postId}: retention=${retention}% → score=${score.toFixed(0)}`);
-return score;
-}
-
-
 
 // ✅ REPLACE WITH THIS SIMPLIFIED VERSION
 app.post('/api/interactions/contribution-like', async (req, res) => {
@@ -4374,15 +4103,6 @@ return res.status(500).json({ error: 'Internal server error', details: error.mes
 }
 });
 
-
-function extractDocumentId(item) {
-// Extract document ID from sourceDocument or _id field
-if (item.sourceDocument) return item.sourceDocument;
-if (item._id) return item._id;
-return null;
-}
-
-
 app.post('/api/feed/instagram-ranked', async (req, res) => {
   const startTime = Date.now();
   const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, excludedPostIds = [], excludedReelIds = [] } = req.body;
@@ -4441,95 +4161,6 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     return res.status(500).json({ success: false, error: error.message });
   }
 });
-
-// Instagram feed builder (same as before)
-function buildInstagramFeed(followingContent, globalContent, limit, offset) {
-followingContent.sort((a, b) => b.rankingScore - a.rankingScore);
-globalContent.sort((a, b) => b.rankingScore - a.rankingScore);
-
-const feed = [];
-const usedUserIds = new Set();
-let followingIndex = 0;
-let globalIndex = 0;
-
-const followingRatio = 0.65;
-const followingSlots = Math.ceil(limit * followingRatio);
-
-// Phase 1: Following content with diversity
-let followingAdded = 0;
-while (followingAdded < followingSlots && followingIndex < followingContent.length) {
-const item = followingContent[followingIndex++];
-
-if (!usedUserIds.has(item.sourceUserId)) {
-feed.push(item);
-usedUserIds.add(item.sourceUserId);
-followingAdded++;
-
-if (feed.length % 3 === 0) {
-usedUserIds.clear();
-}
-}
-}
-
-// Phase 2: Global content with diversity
-while (feed.length < limit && globalIndex < globalContent.length) {
-const item = globalContent[globalIndex++];
-
-if (!usedUserIds.has(item.sourceUserId)) {
-feed.push(item);
-usedUserIds.add(item.sourceUserId);
-
-if (feed.length % 3 === 0) {
-usedUserIds.clear();
-}
-}
-}
-
-// Phase 3: Fill remaining if needed
-if (feed.length < limit) {
-const remaining = [...followingContent.slice(followingIndex), ...globalContent.slice(globalIndex)];
-feed.push(...remaining.slice(0, limit - feed.length));
-}
-
-// Phase 4: Balance content types
-const mixedFeed = balanceContentTypes(feed);
-
-return mixedFeed.slice(offset, offset + limit);
-}
-
-// Instagram ranking algorithm
-function calculateInstagramRankingScore(item, isFollowingContent) {
-const FOLLOWING_BOOST = 10000000; // Massive boost for following content
-const RECENCY_WEIGHT = 100000; // Recent content prioritized
-const RETENTION_WEIGHT = 10000; // High engagement = high priority
-const LIKE_WEIGHT = 100;
-const COMMENT_WEIGHT = 50;
-const VIEW_WEIGHT = 1;
-
-// Calculate recency score (newer = higher)
-const ageInHours = item.timestamp
-? (Date.now() - new Date(item.timestamp).getTime()) / (1000 * 60 * 60)
-: 999;
-const recencyScore = Math.max(0, 168 - ageInHours); // 168 hours = 7 days
-
-const retention = parseFloat(item.retention) || 0;
-const likes = parseInt(item.likeCount) || 0;
-const comments = parseInt(item.commentCount) || 0;
-const views = parseInt(item.viewCount) || 0;
-
-let score = (
-(isFollowingContent ? FOLLOWING_BOOST : 0) +
-(recencyScore * RECENCY_WEIGHT) +
-(retention * RETENTION_WEIGHT) +
-(likes * LIKE_WEIGHT) +
-(comments * COMMENT_WEIGHT) +
-(views * VIEW_WEIGHT)
-);
-
-return score;
-}
-
-
 
 
 // Add this endpoint after the /api/retention/analytics/:reelId endpoint
@@ -5861,49 +5492,6 @@ app.post('/api/feed/mixed-optimized', async (req, res) => {
     });
   }
 });
-
-
-function sendMixedResponse(res, mixedContent, startTime, phaseReached) {
-const duration = Date.now() - startTime;
-
-
-const sortedContent = mixedContent.sort((a, b) =>
-(b.compositeScore || b.retention || 0) - (a.compositeScore || a.retention || 0)
-);
-
-
-const posts = sortedContent.filter(item => !item.isReel);
-const reels = sortedContent.filter(item => item.isReel);
-
-console.log(`[post_algorithm] [MIXED-FEED-RESPONSE] Total: ${sortedContent.length} | Posts: ${posts.length} | Reels: ${reels.length} | Phase: ${phaseReached} | Time: ${duration}ms`);
-
-return res.json({
-success: true,
-content: sortedContent,
-metadata: {
-totalItems: sortedContent.length,
-postsCount: posts.length,
-reelsCount: reels.length,
-phaseReached: phaseReached,
-phasesChecked: ['latestReels', 'latestPosts', 'normalReels', 'normalPosts', 'previousSlots'].slice(0, phaseReached),
-duration,
-reads: dbOpCounters.reads
-}
-});
-}
-
-
-function calculatePreviousSlot(currentSlotId) {
-const match = currentSlotId.match(/_(\d+)$/);
-if (!match) return null;
-
-const currentNum = parseInt(match[1]);
-if (currentNum > 0) {
-return currentSlotId.replace(/_\d+$/, `_${currentNum - 1}`);
-}
-return null;
-}
-
 
 
 app.post('/api/feed/optimized-posts', async (req, res) => {
