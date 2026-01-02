@@ -1176,12 +1176,15 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
   const normalField = isReel ? 'normalReelSlotId' : 'normalPostSlotId';
   const visitField = isReel ? 'reel_0_visits' : 'post_0_visits';
   const listKey = isReel ? 'reelsList' : 'postList';
+  const prefix = isReel ? 'reel' : 'post';
 
   console.log(`\n${'='.repeat(80)}`);
   console.log(`[FEED-START] userId=${userId} | type=${contentType} | minRequired=${minContentRequired}`);
   console.log(`${'='.repeat(80)}`);
 
+  // ====================================================================
   // READ 1: Get user status
+  // ====================================================================
   console.log(`[READ-1] Checking user_status collection for userId=${userId}`);
   const userStatusReadStart = Date.now();
   
@@ -1211,21 +1214,26 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     
     if (!latestSlot) {
       console.warn(`[NO-SLOTS] ${collection} collection is empty`);
-      return { content: [], latestDocumentId: null, normalDocumentId: null, isNewUser: true };
+      return { content: [], isNewUser: true, hasNewContent: false, metadata: { totalReads: 1 } };
     }
 
     const latestIndex = latestSlot.index;
     
+    // ✅ FIXED: Build proper backward sequence [latest, latest-1, latest-2]
     slotsToRead = [
-      `${collection.slice(0, -1)}_${latestIndex}`,
-      `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`,
-      `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`
+      `${prefix}_${latestIndex}`,
+      `${prefix}_${Math.max(latestIndex - 1, 0)}`,
+      `${prefix}_${Math.max(latestIndex - 2, 0)}`
     ];
+    
+    // ✅ Remove duplicates (in case latestIndex is 0 or 1)
+    slotsToRead = [...new Set(slotsToRead)];
 
     newLatestSlot = slotsToRead[0];
-    newNormalSlot = slotsToRead[2];
+    newNormalSlot = slotsToRead[slotsToRead.length - 1];
 
     console.log(`[CASE-1-PLAN] Will read slots: [${slotsToRead.join(', ')}]`);
+    console.log(`[CASE-1-STATE] New latest=${newLatestSlot}, New normal=${newNormalSlot}`);
 
   } else {
     // ====================================================================
@@ -1246,10 +1254,9 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     const normalIndex = normalMatch ? parseInt(normalMatch[1]) : 0;
 
     // ====================================================================
-    // CRITICAL: GLOBAL FORWARD CHECK
-    // Always check for newer slots beyond latestSlotId
+    // CRITICAL: GLOBAL FORWARD CHECK (Always check first)
     // ====================================================================
-    const globalForwardSlot = `${collection.slice(0, -1)}_${latestIndex + 1}`;
+    const globalForwardSlot = `${prefix}_${latestIndex + 1}`;
     console.log(`[GLOBAL-FORWARD-CHECK] Looking for ${globalForwardSlot}`);
     
     const globalForwardCheckStart = Date.now();
@@ -1268,107 +1275,107 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     // ====================================================================
     // CASE 2/3: NEW FORWARD SLOT EXISTS (Priority #1)
     // ====================================================================
-if (globalForwardExists) {
-  console.log(`[CASE-2/3] NEWER-SLOT-FOUND: ${globalForwardSlot}`);
-  
-  // ✅ CRITICAL FIX: Build forward sequence [latest+1, latest+2, latest+3]
-  const forwardSlots = [globalForwardSlot]; // Start with confirmed slot
-  
-  // Check up to 2 more forward slots
-  for (let i = latestIndex + 2; i <= latestIndex + 3; i++) {
-    if (forwardSlots.length >= 3) break; // Max 3 slots
-    
-    const nextForwardSlot = `${collection.slice(0, -1)}_${i}`;
-    const nextCheckStart = Date.now();
-    const nextExists = await this.db.collection(collection).findOne(
-      { _id: nextForwardSlot },
-      { projection: { _id: 1 } }
-    );
-    const nextCheckDuration = Date.now() - nextCheckStart;
-    
-    documentsChecked.push({ 
-      slot: nextForwardSlot, 
-      exists: !!nextExists, 
-      duration: nextCheckDuration,
-      reason: 'case2-forward-increment'
-    });
-    
-    console.log(`[CASE-2/3-FORWARD-CHECK] ${nextForwardSlot} | Exists: ${!!nextExists} | Duration: ${nextCheckDuration}ms`);
-    
-    if (nextExists) {
-      forwardSlots.push(nextForwardSlot);
-    } else {
-      break; // Stop at first missing slot
-    }
-  }
-  
-  // ✅ If we have less than 3 slots, fill backward from normalSlot
-  if (forwardSlots.length < 3) {
-    const backwardSlots = [];
-    let backwardIndex = normalIndex;
-    
-    while (backwardSlots.length + forwardSlots.length < 3 && backwardIndex >= 0) {
-      const backwardSlot = `${collection.slice(0, -1)}_${backwardIndex}`;
+    if (globalForwardExists) {
+      console.log(`[CASE-2/3] NEWER-SLOT-FOUND: ${globalForwardSlot}`);
       
-      // ✅ Skip if already in forwardSlots
-      if (forwardSlots.includes(backwardSlot)) {
-        backwardIndex--;
-        continue;
+      // ✅ CRITICAL FIX: Build forward sequence [latest+1, latest+2, latest+3]
+      const forwardSlots = [globalForwardSlot];
+      
+      // Check up to 2 more forward slots
+      for (let i = latestIndex + 2; i <= latestIndex + 3; i++) {
+        if (forwardSlots.length >= 3) break;
+        
+        const nextForwardSlot = `${prefix}_${i}`;
+        const nextCheckStart = Date.now();
+        const nextExists = await this.db.collection(collection).findOne(
+          { _id: nextForwardSlot },
+          { projection: { _id: 1 } }
+        );
+        const nextCheckDuration = Date.now() - nextCheckStart;
+        
+        documentsChecked.push({ 
+          slot: nextForwardSlot, 
+          exists: !!nextExists, 
+          duration: nextCheckDuration,
+          reason: 'case2-forward-increment'
+        });
+        
+        console.log(`[CASE-2/3-FORWARD-CHECK] ${nextForwardSlot} | Exists: ${!!nextExists} | Duration: ${nextCheckDuration}ms`);
+        
+        if (nextExists) {
+          forwardSlots.push(nextForwardSlot);
+        } else {
+          break;
+        }
       }
       
-      const backwardCheckStart = Date.now();
-      const backwardExists = await this.db.collection(collection).findOne(
-        { _id: backwardSlot },
-        { projection: { _id: 1 } }
-      );
-      const backwardCheckDuration = Date.now() - backwardCheckStart;
-      
-      documentsChecked.push({ 
-        slot: backwardSlot, 
-        exists: !!backwardExists, 
-        duration: backwardCheckDuration,
-        reason: 'case2-backward-fill'
-      });
-      
-      console.log(`[CASE-2/3-BACKWARD-FILL] ${backwardSlot} | Exists: ${!!backwardExists} | Duration: ${backwardCheckDuration}ms`);
-      
-      if (backwardExists) {
-        backwardSlots.push(backwardSlot);
+      // ✅ If we have less than 3 slots, fill backward from normalSlot
+      if (forwardSlots.length < 3) {
+        const backwardSlots = [];
+        let backwardIndex = normalIndex;
+        
+        while (backwardSlots.length + forwardSlots.length < 3 && backwardIndex >= 0) {
+          const backwardSlot = `${prefix}_${backwardIndex}`;
+          
+          // ✅ Skip if already in forwardSlots
+          if (forwardSlots.includes(backwardSlot)) {
+            backwardIndex--;
+            continue;
+          }
+          
+          const backwardCheckStart = Date.now();
+          const backwardExists = await this.db.collection(collection).findOne(
+            { _id: backwardSlot },
+            { projection: { _id: 1 } }
+          );
+          const backwardCheckDuration = Date.now() - backwardCheckStart;
+          
+          documentsChecked.push({ 
+            slot: backwardSlot, 
+            exists: !!backwardExists, 
+            duration: backwardCheckDuration,
+            reason: 'case2-backward-fill'
+          });
+          
+          console.log(`[CASE-2/3-BACKWARD-FILL] ${backwardSlot} | Exists: ${!!backwardExists} | Duration: ${backwardCheckDuration}ms`);
+          
+          if (backwardExists) {
+            backwardSlots.push(backwardSlot);
+          }
+          
+          backwardIndex--;
+        }
+        
+        slotsToRead = [...forwardSlots, ...backwardSlots];
+      } else {
+        slotsToRead = forwardSlots;
       }
       
-      backwardIndex--;
-    }
-    
-    slotsToRead = [...forwardSlots, ...backwardSlots];
-  } else {
-    slotsToRead = forwardSlots;
-  }
-  
-  // ✅ Remove duplicates and limit to 3
-  slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
-  
-  newLatestSlot = forwardSlots[forwardSlots.length - 1]; // Highest forward slot
-  newNormalSlot = slotsToRead[slotsToRead.length - 1]; // Last slot read
-  
-  console.log(`[CASE-2/3-FINAL-PLAN] Forward: [${forwardSlots.join(', ')}] | Total read: [${slotsToRead.join(', ')}]`);
-  console.log(`[CASE-2/3-STATE-UPDATE] New latest=${newLatestSlot}, New normal=${newNormalSlot}`);
-}
+      // ✅ Remove duplicates and limit to 3
+      slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+      
+      newLatestSlot = forwardSlots[forwardSlots.length - 1];
+      newNormalSlot = slotsToRead[slotsToRead.length - 1];
+      
+      console.log(`[CASE-2/3-FINAL-PLAN] Forward: [${forwardSlots.join(', ')}] | Total read: [${slotsToRead.join(', ')}]`);
+      console.log(`[CASE-2/3-STATE-UPDATE] New latest=${newLatestSlot}, New normal=${newNormalSlot}`);
+    } 
     // ====================================================================
     // AT SLOT_0 CASES (4, 5, 6)
     // ====================================================================
     else if (normalIndex === 0) {
-      console.log(`[AT-SLOT-0] normalSlot is at slot_0 | Visit count: ${slot0Visits}`);
+      console.log(`[AT-SLOT-0] normalSlot is at ${prefix}_0 | Visit count: ${slot0Visits}`);
       
       // ================================================================
       // CASE 4: FIRST TIME AT SLOT_0
       // ================================================================
       if (slot0Visits === 0) {
-        console.log(`[CASE-4] FIRST TIME at slot_0`);
+        console.log(`[CASE-4] FIRST TIME at ${prefix}_0`);
         
         // Check multiple forward slots beyond current latest
         const forwardSlots = [];
         for (let i = latestIndex + 1; i <= latestIndex + 5; i++) {
-          const checkSlot = `${collection.slice(0, -1)}_${i}`;
+          const checkSlot = `${prefix}_${i}`;
           const checkStart = Date.now();
           const exists = await this.db.collection(collection).findOne(
             { _id: checkSlot },
@@ -1386,28 +1393,28 @@ if (globalForwardExists) {
           if (exists) {
             forwardSlots.push(checkSlot);
           } else {
-            break; // Stop at first missing slot
+            break;
           }
         }
         
         if (forwardSlots.length > 0) {
-          // Found forward slots - read [slot_0, forward_1, forward_2]
           slotsToRead = [
-            currentNormalSlot, // slot_0
+            currentNormalSlot,
             ...forwardSlots.slice(0, 2)
-          ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
+          ];
+          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
           
           newLatestSlot = forwardSlots[forwardSlots.length - 1];
           newNormalSlot = currentNormalSlot;
           
           console.log(`[CASE-4-FORWARD-FOUND] Will read: [${slotsToRead.join(', ')}] | New latest: ${newLatestSlot}`);
         } else {
-          // No forward - read [slot_0, latest, latest-1]
           slotsToRead = [
             currentNormalSlot,
             currentLatestSlot,
-            `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`
-          ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
+            `${prefix}_${Math.max(latestIndex - 1, 0)}`
+          ];
+          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
           
           newLatestSlot = currentLatestSlot;
           newNormalSlot = currentNormalSlot;
@@ -1420,10 +1427,9 @@ if (globalForwardExists) {
       // CASE 5: SECOND TIME AT SLOT_0
       // ================================================================
       else if (slot0Visits === 1) {
-        console.log(`[CASE-5] SECOND TIME at slot_0`);
+        console.log(`[CASE-5] SECOND TIME at ${prefix}_0`);
         
-        // Check forward
-        const forwardSlot = `${collection.slice(0, -1)}_${latestIndex + 1}`;
+        const forwardSlot = `${prefix}_${latestIndex + 1}`;
         const forwardCheckStart = Date.now();
         const forwardExists = await this.db.collection(collection).findOne(
           { _id: forwardSlot },
@@ -1442,7 +1448,8 @@ if (globalForwardExists) {
             currentNormalSlot,
             forwardSlot,
             currentLatestSlot
-          ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
+          ];
+          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
           
           newLatestSlot = forwardSlot;
           newNormalSlot = currentNormalSlot;
@@ -1450,8 +1457,9 @@ if (globalForwardExists) {
           slotsToRead = [
             currentNormalSlot,
             currentLatestSlot,
-            `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`
-          ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
+            `${prefix}_${Math.max(latestIndex - 1, 0)}`
+          ];
+          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
           
           newLatestSlot = currentLatestSlot;
           newNormalSlot = currentNormalSlot;
@@ -1464,10 +1472,9 @@ if (globalForwardExists) {
       // CASE 6: THIRD+ TIME AT SLOT_0
       // ================================================================
       else {
-        console.log(`[CASE-6] THIRD+ TIME at slot_0 (visit ${slot0Visits + 1})`);
+        console.log(`[CASE-6] THIRD+ TIME at ${prefix}_0 (visit ${slot0Visits + 1})`);
         
-        // Check forward
-        const forwardSlot = `${collection.slice(0, -1)}_${latestIndex + 1}`;
+        const forwardSlot = `${prefix}_${latestIndex + 1}`;
         const forwardCheckStart = Date.now();
         const forwardExists = await this.db.collection(collection).findOne(
           { _id: forwardSlot },
@@ -1485,17 +1492,19 @@ if (globalForwardExists) {
           slotsToRead = [
             forwardSlot,
             currentLatestSlot,
-            `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`
-          ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
+            `${prefix}_${Math.max(latestIndex - 1, 0)}`
+          ];
+          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
           
           newLatestSlot = forwardSlot;
-          newNormalSlot = `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`;
+          newNormalSlot = `${prefix}_${Math.max(latestIndex - 1, 0)}`;
         } else {
           slotsToRead = [
             currentLatestSlot,
-            `${collection.slice(0, -1)}_${Math.max(latestIndex - 1, 0)}`,
-            `${collection.slice(0, -1)}_${Math.max(latestIndex - 2, 0)}`
-          ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 3);
+            `${prefix}_${Math.max(latestIndex - 1, 0)}`,
+            `${prefix}_${Math.max(latestIndex - 2, 0)}`
+          ];
+          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
           
           newLatestSlot = currentLatestSlot;
           newNormalSlot = slotsToRead[slotsToRead.length - 1];
@@ -1511,12 +1520,11 @@ if (globalForwardExists) {
     else {
       console.log(`[CASE-3] NORMAL-BACKWARD: normalSlot at index ${normalIndex}`);
       
-      // Build backward sequence from normalIndex
       const backwardSlots = [];
       let currentIndex = normalIndex;
       
       while (backwardSlots.length < 3 && currentIndex >= 0) {
-        const slotId = `${collection.slice(0, -1)}_${currentIndex}`;
+        const slotId = `${prefix}_${currentIndex}`;
         
         const slotExistsCheckStart = Date.now();
         const slotExists = await this.db.collection(collection).findOne(
@@ -1878,29 +1886,64 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
   for (const op of operations) {
     const start = Date.now();
     
-    // ✅ FIX: Detect slotId from postId if not provided
+    // ✅ CRITICAL FIX: Enhanced slot detection for both UUID and formatted IDs
     const slotGroups = {};
     
     for (const item of op.ids) {
       const postId = typeof item === 'string' ? item : item.postId;
       let slotId = typeof item === 'object' ? item.slotId : null;
       
-      // ✅ CRITICAL FIX: If no slotId provided, derive from postId
-      if (!slotId) {
-        const match = postId.match(/^(reel|post)(\d+)_/);
-        if (match) {
-          const prefix = match[1];
-          const number = match[2];
-          slotId = `${prefix}_${number}`;
-          console.log(`[BATCH-SLOT-DERIVED] ${postId} -> ${slotId}`);
-        } else {
-          console.warn(`[BATCH-SKIP] ${postId} - cannot derive slotId`);
-          continue;
-        }
+      // ✅ STRATEGY 1: Use provided slotId
+      if (slotId) {
+        if (!slotGroups[slotId]) slotGroups[slotId] = [];
+        slotGroups[slotId].push(postId);
+        console.log(`[BATCH-SLOT-PROVIDED] ${postId.substring(0, 8)} -> ${slotId}`);
+        continue;
       }
       
-      if (!slotGroups[slotId]) slotGroups[slotId] = [];
-      slotGroups[slotId].push(postId);
+      // ✅ STRATEGY 2: Derive from postId format (reel28_post1)
+      const match = postId.match(/^(reel|post)(\d+)_/);
+      if (match) {
+        const prefix = match[1];
+        const number = match[2];
+        slotId = `${prefix}_${number}`;
+        
+        if (!slotGroups[slotId]) slotGroups[slotId] = [];
+        slotGroups[slotId].push(postId);
+        console.log(`[BATCH-SLOT-DERIVED] ${postId} -> ${slotId}`);
+        continue;
+      }
+      
+      // ✅ STRATEGY 3: UUID - Query database to find which slot contains it
+      console.log(`[BATCH-SLOT-UUID-LOOKUP] ${postId.substring(0, 8)} is UUID, querying database...`);
+      
+      try {
+        const lookupStart = Date.now();
+        
+        // Query the main collection to find which slot contains this postId
+        const mainCollection = op.type === 'posts' ? 'posts' : 'reels';
+        const arrayField = op.type === 'posts' ? 'postList' : 'reelsList';
+        
+        const slotDoc = await this.db.collection(mainCollection).findOne(
+          { [`${arrayField}.postId`]: postId },
+          { projection: { _id: 1 } }
+        );
+        
+        const lookupDuration = Date.now() - lookupStart;
+        
+        if (slotDoc) {
+          slotId = slotDoc._id;
+          
+          if (!slotGroups[slotId]) slotGroups[slotId] = [];
+          slotGroups[slotId].push(postId);
+          
+          console.log(`[BATCH-SLOT-UUID-FOUND] ${postId.substring(0, 8)} -> ${slotId} (${lookupDuration}ms)`);
+        } else {
+          console.warn(`[BATCH-SLOT-UUID-NOT-FOUND] ${postId.substring(0, 8)} not found in ${mainCollection} collection`);
+        }
+      } catch (err) {
+        console.error(`[BATCH-SLOT-UUID-ERROR] ${postId.substring(0, 8)}: ${err.message}`);
+      }
     }
 
     console.log(`[BATCH-SLOT-GROUPS] ${op.type} | Found ${Object.keys(slotGroups).length} unique slots: [${Object.keys(slotGroups).join(', ')}]`);
@@ -1932,23 +1975,22 @@ async batchPutContributedViewsOptimized(userId, posts = [], reels = []) {
   }
 
   // ✅ CRITICAL: Auto-update user_status after contrib changes
-const updatePromises = [];
+  const updatePromises = [];
 
-if (reels.length > 0) {
-  console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for reels`);
-  updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'reels'));
-}
+  if (reels.length > 0) {
+    console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for reels`);
+    updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'reels'));
+  }
 
-if (posts.length > 0) {
-  console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for posts`);
-  updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'posts'));
-}
+  if (posts.length > 0) {
+    console.log(`[BATCH-TRIGGER-UPDATE] Updating user_status for posts`);
+    updatePromises.push(autoUpdateUserStatusFromContrib(userId, 'posts'));
+  }
 
-// Wait for all updates to complete
-if (updatePromises.length > 0) {
-  const updateResults = await Promise.all(updatePromises);
-  console.log(`[BATCH-AUTO-UPDATE-COMPLETE]`, updateResults);
-}
+  if (updatePromises.length > 0) {
+    const updateResults = await Promise.all(updatePromises);
+    console.log(`[BATCH-AUTO-UPDATE-COMPLETE]`, updateResults);
+  }
 
   return results;
 }
