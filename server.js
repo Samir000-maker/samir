@@ -5281,69 +5281,109 @@ app.post('/api/user-status/:userId', async (req, res) => {
 
 
 
-app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
-  const startTime = Date.now();
-  const { userId, slotId, type } = req.params;
+// app.get('/api/contrib-check/:userId/:slotId/:type', async (req, res) => {
+//   const startTime = Date.now();
+//   const { userId, slotId, type } = req.params;
 
-  if (!['posts', 'reels'].includes(type)) {
-    return res.status(400).json({ success: false, error: 'Invalid type (must be posts or reels)' });
-  }
+//   if (!['posts', 'reels'].includes(type)) {
+//     return res.status(400).json({ success: false, error: 'Invalid type (must be posts or reels)' });
+//   }
 
-  const collectionName = type === 'posts' ? 'contrib_posts' : 'contrib_reels';
-  const readNum = req.headers['x-read-number'] || '?';
+//   const collectionName = type === 'posts' ? 'contrib_posts' : 'contrib_reels';
+//   const readNum = req.headers['x-read-number'] || '?';
 
-  try {
-    console.log(`[post_algorithm] [READ-${readNum}-START] ${collectionName} lookup for userId=${userId} | slotId=${slotId}`);
+//   try {
+//     console.log(`[post_algorithm] [READ-${readNum}-START] ${collectionName} lookup for userId=${userId} | slotId=${slotId}`);
 
-    const contribDoc = await db.collection(collectionName).findOne(
-      { 
-        userId: userId,
-        slotId: slotId
-      },
-      { projection: { ids: 1, slotId: 1, userId: 1 } }
-    );
+//     const contribDoc = await db.collection(collectionName).findOne(
+//       { 
+//         userId: userId,
+//         slotId: slotId
+//       },
+//       { projection: { ids: 1, slotId: 1, userId: 1 } }
+//     );
 
-    const duration = Date.now() - startTime;
+//     const duration = Date.now() - startTime;
 
-    if (contribDoc && contribDoc.ids) {
-      const count = contribDoc.ids.length;
+//     if (contribDoc && contribDoc.ids) {
+//       const count = contribDoc.ids.length;
 
-      console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} userId=${userId} slotId=${slotId} | found ${count} viewed IDs | duration=${duration}ms`);
+//       console.log(`[post_algorithm] [READ-${readNum}-SUCCESS] ${collectionName} userId=${userId} slotId=${slotId} | found ${count} viewed IDs | duration=${duration}ms`);
 
-      return res.json({
-        success: true,
-        slotId: slotId,
-        userId: userId,
-        ids: contribDoc.ids,
-        count: count,
-        reads: 1,
-        duration
-      });
-    } else {
-      console.log(`[post_algorithm] [READ-${readNum}-NOT-FOUND] ${collectionName} no contributions for userId=${userId} slotId=${slotId}`);
+//       return res.json({
+//         success: true,
+//         slotId: slotId,
+//         userId: userId,
+//         ids: contribDoc.ids,
+//         count: count,
+//         reads: 1,
+//         duration
+//       });
+//     } else {
+//       console.log(`[post_algorithm] [READ-${readNum}-NOT-FOUND] ${collectionName} no contributions for userId=${userId} slotId=${slotId}`);
 
-      return res.json({
-        success: true,
-        slotId: slotId,
-        userId: userId,
-        ids: [],
-        count: 0,
-        reads: 1,
-        duration,
-        isNewSlot: true
-      });
+//       return res.json({
+//         success: true,
+//         slotId: slotId,
+//         userId: userId,
+//         ids: [],
+//         count: 0,
+//         reads: 1,
+//         duration,
+//         isNewSlot: true
+//       });
+//     }
+
+//   } catch (error) {
+//     console.error(`[post_algorithm] [READ-${readNum}-ERROR] ${error.message}`);
+//     return res.status(500).json({
+//       success: false,
+//       error: `Failed to read ${collectionName}: ${error.message}`,
+//       reads: 1,
+//       duration: Date.now() - startTime
+//     });
+//   }
+// });
+
+
+app.get('/api/contrib-check/:userId/:slotId/:contentType', async (req, res) => {
+    try {
+        const { userId, slotId, contentType } = req.params;
+        
+        const collection = contentType === 'reels' ? 'contrib_reels' : 'contrib_posts';
+        
+        const doc = await db.collection(collection).findOne(
+            { userId, slotId },
+            { projection: { ids: 1 } }
+        );
+        
+        // ✅ CRITICAL FIX: Return proper JSON even when slot doesn't exist
+        if (!doc || !doc.ids || doc.ids.length === 0) {
+            return res.json({
+                success: true,
+                count: 0,
+                ids: [],
+                slotExists: false
+            });
+        }
+        
+        // ✅ Slot exists with viewed IDs
+        return res.json({
+            success: true,
+            count: doc.ids.length,
+            ids: doc.ids,
+            slotExists: true
+        });
+        
+    } catch (error) {
+        console.error('[CONTRIB-CHECK-ERROR]', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
-
-  } catch (error) {
-    console.error(`[post_algorithm] [READ-${readNum}-ERROR] ${error.message}`);
-    return res.status(500).json({
-      success: false,
-      error: `Failed to read ${collectionName}: ${error.message}`,
-      reads: 1,
-      duration: Date.now() - startTime
-    });
-  }
 });
+
 
 
 
