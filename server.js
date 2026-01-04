@@ -1201,12 +1201,13 @@ module.exports = FollowingFeedService;
 
 
 
-async function getFollowingFeed(userId, contentType = 'reels') {
+// ===== OPTION 1: Allow both types in following feed =====
+
+async function getFollowingFeed(userId, contentType = 'mixed') { // Change default to 'mixed'
   const start = Date.now();
   console.log(`\n[FOLLOWING-FEED-START] userId=${userId} | type=${contentType}`);
 
   try {
-    // Step 1: Get followed users (PORT 5000)
     const followedUsers = await getFollowedUsers(userId);
     
     if (followedUsers.length === 0) {
@@ -1221,14 +1222,12 @@ async function getFollowingFeed(userId, contentType = 'reels') {
       };
     }
 
-    // Step 2: Get viewed following content (PORT 4000)
     const viewedIds = await getViewedFollowingContent(userId, contentType);
 
-    // Step 3: Fetch content from followed users (PORT 4000)
     const followingContent = await fetchFollowingContent(
       followedUsers,
       viewedIds,
-      contentType
+      contentType // Pass 'mixed' or specific type
     );
 
     const duration = Date.now() - start;
@@ -1254,6 +1253,79 @@ async function getFollowingFeed(userId, contentType = 'reels') {
         duration: Date.now() - start
       } 
     };
+  }
+}
+
+// Update fetchFollowingContent to handle 'mixed' type
+async function fetchFollowingContent(followedUserIds, viewedIds, contentType) {
+  try {
+    console.log(`[FOLLOWING-CONTENT-DEBUG] Fetching for ${followedUserIds.length} users | contentType=${contentType}`);
+    
+    const response = await axios.post(
+      `${PORT_4000_URL}/api/posts/batch-following`,
+      {
+        userIds: followedUserIds,
+        viewerId: null
+      },
+      { 
+        timeout: FOLLOWING_FEED_CONFIG.FOLLOWING_FETCH_TIMEOUT,
+        params: { 
+          limit: FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_CONTENT * 2
+        }
+      }
+    );
+
+    if (!response.data.success || !Array.isArray(response.data.content)) {
+      console.warn(`[FOLLOWING-CONTENT-FAIL] Invalid response format`);
+      return [];
+    }
+
+    console.log(`[FOLLOWING-CONTENT-DEBUG] PORT 4000 returned ${response.data.content.length} items`);
+
+    // ✅ FIXED: Handle 'mixed' type
+    const filtered = response.data.content
+      .filter(item => {
+        // Type check
+        let typeMatches = false;
+        if (contentType === 'mixed') {
+          typeMatches = true; // Accept both
+        } else if (contentType === 'reels') {
+          typeMatches = item.isReel === true;
+        } else if (contentType === 'posts') {
+          typeMatches = item.isReel === false || !item.isReel;
+        }
+        
+        const notViewed = !viewedIds.has(item.postId);
+        
+        if (!typeMatches) {
+          console.log(`[FOLLOWING-FILTER-DEBUG] Filtered out:`, {
+            postId: item.postId?.substring(0, 10),
+            isReel: item.isReel,
+            expectedType: contentType,
+            reason: 'type_mismatch'
+          });
+        }
+        
+        return typeMatches && notViewed;
+      })
+      .sort((a, b) => {
+        const retentionDiff = (b.retention || 0) - (a.retention || 0);
+        if (Math.abs(retentionDiff) > 1) return retentionDiff;
+        
+        const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+        if (likesDiff !== 0) return likesDiff;
+        
+        return (b.commentCount || 0) - (a.commentCount || 0);
+      })
+      .slice(0, FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_CONTENT);
+
+    console.log(`[FOLLOWING-CONTENT] Fetched ${response.data.content.length}, filtered to ${filtered.length}`);
+    
+    return filtered;
+
+  } catch (error) {
+    console.error(`[FOLLOWING-CONTENT-ERROR]`, error.message);
+    return [];
   }
 }
 
@@ -1303,54 +1375,7 @@ async function getViewedFollowingContent(userId, contentType) {
   return viewedIds;
 }
 
-async function fetchFollowingContent(followedUserIds, viewedIds, contentType) {
-  try {
-    const response = await axios.post(
-      `${PORT_4000_URL}/api/posts/batch-following`,
-      {
-        userIds: followedUserIds,
-        viewerId: null // We handle filtering ourselves
-      },
-      { 
-        timeout: FOLLOWING_FEED_CONFIG.FOLLOWING_FETCH_TIMEOUT,
-        params: { 
-          limit: FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_CONTENT * 2 // Over-fetch for filtering
-        }
-      }
-    );
 
-    if (!response.data.success || !Array.isArray(response.data.content)) {
-      console.warn(`[FOLLOWING-CONTENT-FAIL] Invalid response format`);
-      return [];
-    }
-
-    // Filter and rank
-    const filtered = response.data.content
-      .filter(item => {
-        const isCorrectType = contentType === 'reels' ? item.isReel : !item.isReel;
-        const notViewed = !viewedIds.has(item.postId);
-        return isCorrectType && notViewed;
-      })
-      .sort((a, b) => {
-        // Retention-first ranking (Instagram algorithm)
-        const retentionDiff = (b.retention || 0) - (a.retention || 0);
-        if (Math.abs(retentionDiff) > 1) return retentionDiff;
-        
-        const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
-        if (likesDiff !== 0) return likesDiff;
-        
-        return (b.commentCount || 0) - (a.commentCount || 0);
-      })
-      .slice(0, FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_CONTENT);
-
-    console.log(`[FOLLOWING-CONTENT] Fetched ${response.data.content.length}, filtered to ${filtered.length}`);
-    return filtered;
-
-  } catch (error) {
-    console.error(`[FOLLOWING-CONTENT-ERROR]`, error.message);
-    return [];
-  }
-}
 
 
 
@@ -4254,11 +4279,11 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     let followingMetadata = { source: 'disabled' };
     
     if (FOLLOWING_FEED_CONFIG.ENABLE_FOLLOWING_FEED) {
-      const followingResult = await getFollowingFeed(userId, 'reels');
-      followingContent = followingResult.content;
-      followingMetadata = followingResult.metadata;
-      
-      console.log(`[FOLLOWING-PHASE] Loaded ${followingContent.length} items in ${followingMetadata.duration}ms`);
+    const followingResult = await getFollowingFeed(userId, 'mixed'); 
+    followingContent = followingResult.content;
+    followingMetadata = followingResult.metadata;
+    
+    console.log(`[FOLLOWING-PHASE] Loaded ${followingContent.length} items in ${followingMetadata.duration}ms`);
     } else {
       console.log(`[FOLLOWING-PHASE] Disabled by config`);
     }
