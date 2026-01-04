@@ -56,13 +56,13 @@ const FOLLOWING_FEED_CONFIG = {
 
 
 const READ_LIMIT_CONFIG = {
-  MAX_SLOTS_PER_FEED: 6,           // Normal: read 3 slots
-  EMERGENCY_MAX_SLOTS: 5,          // Emergency: read up to 5 slots
-  MAX_CONTRIB_READS: 6,            // Max contrib document reads
-  MAX_FORWARD_CHECKS: 5,           // Max forward slot existence checks
-  MAX_BACKWARD_CHECKS: 6,          // Max backward slot checks
-  TOTAL_READ_BUDGET: 7,            // 1 (user_status) + 3 (slots) + 3 (contrib)
-  EMERGENCY_TOTAL_BUDGET: 11,      // Emergency budget
+  MAX_SLOTS_PER_FEED: 122,           // Normal: read 3 slots
+  EMERGENCY_MAX_SLOTS: 122,          // Emergency: read up to 5 slots
+  MAX_CONTRIB_READS: 122,            // Max contrib document reads
+  MAX_FORWARD_CHECKS: 122,           // Max forward slot existence checks
+  MAX_BACKWARD_CHECKS: 122,          // Max backward slot checks
+  TOTAL_READ_BUDGET: 123,            // 1 (user_status) + 3 (slots) + 3 (contrib)
+  EMERGENCY_TOTAL_BUDGET: 125,      // Emergency budget
   STRICT_ENFORCEMENT: false,       // Set true to throw errors on limit exceeded
   WARNING_THRESHOLD: 0.8           // Warn at 80% of limit
 };
@@ -76,9 +76,9 @@ console.log('[EXTERNAL-PORTS] 4000:', PORT_4000_URL, '| 5000:', PORT_5000_URL);
 
 
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
-const MAX_CONTENT_PER_SLOT = 3; // Maximum content items per document before creating new slot
-const DEFAULT_CONTENT_BATCH_SIZE = 10; // Default number of items to return per request
-const MIN_CONTENT_FOR_FEED = 10; // Minimum content required for feed requests
+const MAX_CONTENT_PER_SLOT = 100; // Maximum content items per document before creating new slot
+const DEFAULT_CONTENT_BATCH_SIZE = 200; // Default number of items to return per request
+const MIN_CONTENT_FOR_FEED = 200; // Minimum content required for feed requests
 // ============================================================================
 
 console.log('[CONFIG] System Configuration:');
