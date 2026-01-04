@@ -4261,6 +4261,8 @@ return res.status(500).json({ error: 'Internal server error', details: error.mes
 }
 });
 
+// ===== REPLACE: /api/feed/instagram-ranked endpoint (PORT 2000) =====
+
 app.post('/api/feed/instagram-ranked', async (req, res) => {
   const startTime = Date.now();
   const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
@@ -4274,27 +4276,26 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     console.log(`[FEED-REQUEST-START] userId=${userId} | limit=${limit}`);
     console.log(`${'='.repeat(80)}`);
 
-    // ===== PHASE 1: FOLLOWING FEED (NEW) =====
+    // ===== PHASE 1: FOLLOWING FEED =====
     let followingContent = [];
     let followingMetadata = { source: 'disabled' };
     
     if (FOLLOWING_FEED_CONFIG.ENABLE_FOLLOWING_FEED) {
-    const followingResult = await getFollowingFeed(userId, 'mixed'); 
-    followingContent = followingResult.content;
-    followingMetadata = followingResult.metadata;
-    
-    console.log(`[FOLLOWING-PHASE] Loaded ${followingContent.length} items in ${followingMetadata.duration}ms`);
+      const followingResult = await getFollowingFeed(userId, 'mixed');
+      followingContent = followingResult.content || [];
+      followingMetadata = followingResult.metadata;
+      
+      console.log(`[FOLLOWING-PHASE] Loaded ${followingContent.length} items in ${followingMetadata.duration}ms`);
     } else {
       console.log(`[FOLLOWING-PHASE] Disabled by config`);
     }
 
-    // ===== PHASE 2: GLOBAL FEED (EXISTING - UNCHANGED) =====
-    const globalContentNeeded = Math.max(
-      0, 
-      limit - followingContent.length
-    );
+    // ===== PHASE 2: GLOBAL FEED =====
+    // ✅ CRITICAL FIX: Always request full amount from global feed
+    // We'll merge and slice later to ensure we always have enough content
+    const globalContentNeeded = limit; // Always fetch full limit from global
 
-    console.log(`[GLOBAL-PHASE] Need ${globalContentNeeded} items from global feed`);
+    console.log(`[GLOBAL-PHASE] Requesting ${globalContentNeeded} items from global feed`);
 
     const [reelsResult, postsResult] = await Promise.all([
       dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(globalContentNeeded * 0.6)),
@@ -4315,10 +4316,11 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     console.log(`[GLOBAL-PHASE] Loaded ${globalContent.length} items`);
 
     // ===== PHASE 3: MERGE (Following above Global) =====
+    // ✅ FIXED: Following content first, then fill with global content
     const finalFeed = [
       ...followingContent,
-      ...globalContent.slice(0, globalContentNeeded)
-    ].slice(0, limit);
+      ...globalContent
+    ].slice(0, limit); // Slice AFTER merging to ensure we hit the limit
 
     const duration = Date.now() - startTime;
 
@@ -4326,7 +4328,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     console.log(`[FEED-REQUEST-COMPLETE]`);
     console.log(`  Total Items: ${finalFeed.length}`);
     console.log(`  Following: ${followingContent.length}`);
-    console.log(`  Global: ${Math.min(globalContent.length, globalContentNeeded)}`);
+    console.log(`  Global: ${Math.min(globalContent.length, limit - followingContent.length)}`);
     console.log(`  Duration: ${duration}ms`);
     console.log(`${'='.repeat(80)}\n`);
 
@@ -4337,7 +4339,105 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
       metadata: {
         totalReturned: finalFeed.length,
         followingCount: followingContent.length,
-        globalCount: Math.min(globalContent.length, globalContentNeeded),
+        globalCount: Math.min(globalContent.length, limit - followingContent.length),
+        following: followingMetadata,
+        global: {
+          reelsCount: reelsResult.content.length,
+          postsCount: postsResult.content.length,
+          slotsRead: {
+            reels: reelsResult.metadata?.slotsRead || [],
+            posts: postsResult.metadata?.slotsRead || []
+          }
+        },
+        duration
+      }
+    });
+
+  } catch (error) {
+    console.error(`[FEED-ERROR] ${error.message}`);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+app.post('/feed/instagram-ranked', async (req, res) => {
+  // Redirect to the correct API endpoint
+  console.log('[FEED-REDIRECT] Redirecting /feed/instagram-ranked -> /api/feed/instagram-ranked');
+  
+  // Re-use the same logic by forwarding the request internally
+  req.url = '/api/feed/instagram-ranked';
+  return app._router.handle(req, res);
+});
+
+// OR simply duplicate the handler (simpler):
+app.post('/feed/instagram-ranked', async (req, res) => {
+  const startTime = Date.now();
+  const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ success: false, error: 'userId required' });
+  }
+
+  try {
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`[FEED-REQUEST-START] userId=${userId} | limit=${limit} | endpoint=/feed/instagram-ranked`);
+    console.log(`${'='.repeat(80)}`);
+
+    // Same logic as /api/feed/instagram-ranked
+    let followingContent = [];
+    let followingMetadata = { source: 'disabled' };
+    
+    if (FOLLOWING_FEED_CONFIG.ENABLE_FOLLOWING_FEED) {
+      const followingResult = await getFollowingFeed(userId, 'mixed');
+      followingContent = followingResult.content || [];
+      followingMetadata = followingResult.metadata;
+      
+      console.log(`[FOLLOWING-PHASE] Loaded ${followingContent.length} items in ${followingMetadata.duration}ms`);
+    }
+
+    const globalContentNeeded = limit;
+    console.log(`[GLOBAL-PHASE] Requesting ${globalContentNeeded} items from global feed`);
+
+    const [reelsResult, postsResult] = await Promise.all([
+      dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(globalContentNeeded * 0.6)),
+      dbManager.getOptimizedFeedFixedReads(userId, 'posts', Math.ceil(globalContentNeeded * 0.4))
+    ]);
+
+    const globalContent = [...reelsResult.content, ...postsResult.content];
+    
+    globalContent.sort((a, b) => {
+      const retentionDiff = (b.retention || 0) - (a.retention || 0);
+      if (Math.abs(retentionDiff) > 1) return retentionDiff;
+      const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+      if (likesDiff !== 0) return likesDiff;
+      return (b.commentCount || 0) - (a.commentCount || 0);
+    });
+
+    console.log(`[GLOBAL-PHASE] Loaded ${globalContent.length} items`);
+
+    const finalFeed = [
+      ...followingContent,
+      ...globalContent
+    ].slice(0, limit);
+
+    const duration = Date.now() - startTime;
+
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`[FEED-REQUEST-COMPLETE]`);
+    console.log(`  Total Items: ${finalFeed.length}`);
+    console.log(`  Following: ${followingContent.length}`);
+    console.log(`  Global: ${Math.min(globalContent.length, limit - followingContent.length)}`);
+    console.log(`  Duration: ${duration}ms`);
+    console.log(`${'='.repeat(80)}\n`);
+
+    return res.json({
+      success: true,
+      content: finalFeed,
+      hasMore: globalContent.length >= globalContentNeeded,
+      metadata: {
+        totalReturned: finalFeed.length,
+        followingCount: followingContent.length,
+        globalCount: Math.min(globalContent.length, limit - followingContent.length),
         following: followingMetadata,
         global: {
           reelsCount: reelsResult.content.length,
