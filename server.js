@@ -50,7 +50,7 @@ const FOLLOWING_FEED_CONFIG = {
   MAX_FOLLOWING_USERS_PER_LOAD: 5, // Max distinct users to fetch from
   MAX_SLOT_READS_PER_USER: 2,      // Max slots to read per followed user
   MAX_VIEW_FILTER_READS: 3,        // Max contrib doc reads
-  FOLLOWING_FETCH_TIMEOUT: 500,    // ms - fail fast
+  FOLLOWING_FETCH_TIMEOUT: 10000,    // ms - fail fast
   ENABLE_FOLLOWING_FEED: true      // Feature flag
 };
 
