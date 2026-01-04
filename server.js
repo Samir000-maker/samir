@@ -2307,7 +2307,7 @@ console.log(`[MAX-INDEX-COMPUTED] ${collection} = ${maxIndex} | DB Reads: ${dbOp
 return maxIndex;
 }
 
-async allocateSlot(col, postData, maxAttempts = 3) {
+async allocateSlot(col, postData, maxAttempts = READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED) {
 const coll = this.db.collection(col);
 const listKey = col === 'reels' ? 'reelsList' : 'postList';
 const postId = postData.postId;
