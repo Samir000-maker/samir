@@ -43,6 +43,17 @@ const compression = require('compression');
 const { promisify } = require('util');
 
 
+// ===== FOLLOWING FEED CONFIGURATION =====
+const FOLLOWING_FEED_CONFIG = {
+  MIN_FOLLOWING_CONTENT: 3,        // Minimum followed content to show
+  MAX_FOLLOWING_CONTENT: 10,       // Maximum followed content per load
+  MAX_FOLLOWING_USERS_PER_LOAD: 5, // Max distinct users to fetch from
+  MAX_SLOT_READS_PER_USER: 2,      // Max slots to read per followed user
+  MAX_VIEW_FILTER_READS: 3,        // Max contrib doc reads
+  FOLLOWING_FETCH_TIMEOUT: 500,    // ms - fail fast
+  ENABLE_FOLLOWING_FEED: true      // Feature flag
+};
+
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
 const MAX_CONTENT_PER_SLOT = 3; // Maximum content items per document before creating new slot
 const DEFAULT_CONTENT_BATCH_SIZE = 10; // Default number of items to return per request
@@ -57,6 +68,9 @@ console.log(` MIN_CONTENT_FOR_FEED: ${MIN_CONTENT_FOR_FEED}`);
 const CACHE_TTL_SHORT = 15000; // 15 seconds
 const CACHE_TTL_MEDIUM = 60000; // 1 minute
 const CACHE_TTL_LONG = 300000; // 5 minutes
+
+
+
 
 
 setInterval(() => {
@@ -75,6 +89,17 @@ if (cleanedCount > 0) {
 console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entries | Active: ${processedRequests.size}`);
 }
 }, 60000);
+
+
+
+
+const FollowingFeedService = require('./followingFeedService');
+
+const followingFeedService = new FollowingFeedService(
+  FOLLOWING_FEED_CONFIG,
+  process.env.PORT_4000_URL || 'https://database-22io.onrender.com',
+  process.env.PORT_5000_URL || 'https://server1-ki1x.onrender.com'
+);
 
 
 
@@ -1161,6 +1186,154 @@ console.error('[UNIQUENESS-CHECK-ERROR]', error.message);
 }
 }
 }
+
+
+
+
+class FollowingFeedService {
+  constructor(config, port4000Url, port5000Url) {
+    this.config = config;
+    this.port4000 = port4000Url;
+    this.port5000 = port5000Url;
+  }
+
+  async getFollowingFeed(userId, contentType = 'reels') {
+    const start = Date.now();
+    console.log(`[FOLLOWING-FEED-START] userId=${userId} | type=${contentType}`);
+
+    try {
+      // Step 1: Get followed users (PORT 5000)
+      const followedUsers = await this._getFollowedUsers(userId);
+      
+      if (followedUsers.length === 0) {
+        console.log(`[FOLLOWING-FEED-SKIP] No followed users`);
+        return { content: [], metadata: { source: 'none', duration: Date.now() - start } };
+      }
+
+      // Step 2: Get viewed following content (PORT 4000)
+      const viewedIds = await this._getViewedFollowingContent(userId, contentType);
+
+      // Step 3: Fetch content from followed users (PORT 4000)
+      const followingContent = await this._fetchFollowingContent(
+        followedUsers,
+        viewedIds,
+        contentType
+      );
+
+      const duration = Date.now() - start;
+      console.log(`[FOLLOWING-FEED-COMPLETE] Returned ${followingContent.length} items | ${duration}ms`);
+
+      return {
+        content: followingContent,
+        metadata: {
+          source: 'following',
+          followedUsers: followedUsers.length,
+          viewedFiltered: viewedIds.size,
+          duration
+        }
+      };
+
+    } catch (error) {
+      console.error(`[FOLLOWING-FEED-ERROR]`, error.message);
+      return { content: [], metadata: { source: 'error', error: error.message } };
+    }
+  }
+
+  async _getFollowedUsers(userId) {
+    const timeout = this.config.FOLLOWING_FETCH_TIMEOUT;
+    
+    try {
+      const response = await axios.get(
+        `${this.port5000}/api/users/${userId}/following`,
+        { timeout }
+      );
+
+      if (response.data.success && Array.isArray(response.data.following)) {
+        return response.data.following.slice(0, this.config.MAX_FOLLOWING_USERS_PER_LOAD);
+      }
+      return [];
+    } catch (error) {
+      console.warn(`[FOLLOWING-FETCH-FAIL] ${error.message}`);
+      return [];
+    }
+  }
+
+  async _getViewedFollowingContent(userId, contentType) {
+    const viewedIds = new Set();
+    
+    try {
+      const response = await axios.get(
+        `${this.port4000}/api/following-views/user/${userId}`,
+        { timeout: this.config.FOLLOWING_FETCH_TIMEOUT }
+      );
+
+      if (response.data.success && Array.isArray(response.data.documents)) {
+        response.data.documents.forEach(doc => {
+          const arrayField = contentType === 'reels' ? 'reelsList' : 'PostList';
+          if (Array.isArray(doc[arrayField])) {
+            doc[arrayField].forEach(id => viewedIds.add(String(id)));
+          }
+        });
+      }
+    } catch (error) {
+      console.warn(`[VIEWED-FETCH-FAIL] ${error.message}`);
+    }
+
+    return viewedIds;
+  }
+
+  async _fetchFollowingContent(followedUserIds, viewedIds, contentType) {
+    try {
+      const response = await axios.post(
+        `${this.port4000}/api/posts/batch-following`,
+        {
+          userIds: followedUserIds,
+          viewerId: null // Don't use PORT 4000's filtering, we handle it
+        },
+        { 
+          timeout: this.config.FOLLOWING_FETCH_TIMEOUT,
+          params: { 
+            limit: this.config.MAX_FOLLOWING_CONTENT * 2 // Over-fetch for filtering
+          }
+        }
+      );
+
+      if (!response.data.success || !Array.isArray(response.data.content)) {
+        return [];
+      }
+
+      // Filter and rank
+      const filtered = response.data.content
+        .filter(item => {
+          const isCorrectType = contentType === 'reels' ? item.isReel : !item.isReel;
+          const notViewed = !viewedIds.has(item.postId);
+          return isCorrectType && notViewed;
+        })
+        .sort((a, b) => {
+          // Retention-first ranking (Instagram algorithm)
+          const retentionDiff = (b.retention || 0) - (a.retention || 0);
+          if (Math.abs(retentionDiff) > 1) return retentionDiff;
+          
+          const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+          if (likesDiff !== 0) return likesDiff;
+          
+          return (b.commentCount || 0) - (a.commentCount || 0);
+        })
+        .slice(0, this.config.MAX_FOLLOWING_CONTENT);
+
+      return filtered;
+
+    } catch (error) {
+      console.error(`[FOLLOWING-CONTENT-FETCH-ERROR]`, error.message);
+      return [];
+    }
+  }
+}
+
+module.exports = FollowingFeedService;
+
+
+
 
 
 
@@ -3455,28 +3628,39 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
 });
 
 app.post('/api/contributed-views/batch-optimized', async (req, res) => {
-  const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
   const startTime = Date.now();
+  const { userId, posts = [], reels = [] } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ success: false, error: 'userId required' });
+  }
 
   try {
-    const { userId, posts = [], reels = [] } = req.body;
+    // Existing PORT 2000 tracking (unchanged)
+    const results = await dbManager.batchPutContributedViewsOptimized(userId, posts, reels);
 
-    if (!userId) {
-      return res.status(400).json({
-        success: false,
-        error: 'userId required',
-        requestId
+    // ✅ NEW: Track in PORT 4000 for following feed
+    const followingViewIds = {
+      posts: posts.filter(p => p.isFollowingContent).map(p => p.postId),
+      reels: reels.filter(r => r.isFollowingContent).map(r => r.postId)
+    };
+
+    if (followingViewIds.posts.length > 0 || followingViewIds.reels.length > 0) {
+      // Fire-and-forget to PORT 4000
+      axios.post(
+        `${process.env.PORT_4000_URL}/api/following-views/mark`,
+        {
+          viewerId: userId,
+          postIds: followingViewIds.posts,
+          reelIds: followingViewIds.reels
+        },
+        { timeout: 1000 }
+      ).catch(err => {
+        console.warn(`[FOLLOWING-VIEW-TRACK-FAIL]`, err.message);
       });
     }
 
-    console.log(`[BATCH-START] userId=${userId} | ${posts.length}P + ${reels.length}R`);
-
-    // ✅ Use the updated method that auto-updates user_status
-    const results = await dbManager.batchPutContributedViewsOptimized(userId, posts, reels);
-
     const duration = Date.now() - startTime;
-
-    console.log(`[BATCH-COMPLETE] userId=${userId} | Duration: ${duration}ms | user_status auto-updated`);
 
     res.json({
       success: true,
@@ -3484,25 +3668,12 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
         posts: posts.length,
         reels: reels.length
       },
-      // ✅ user_status is automatically updated by autoUpdateUserStatusFromContrib
-      autoUpdated: {
-        reels: reels.length > 0,
-        posts: posts.length > 0
-      },
-      requestId,
       duration
     });
 
   } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`[BATCH-ERROR] requestId=${requestId} | duration=${duration}ms`, error);
-
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      requestId,
-      duration
-    });
+    console.error(`[BATCH-ERROR]`, error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -4019,27 +4190,44 @@ return res.status(500).json({ error: 'Internal server error', details: error.mes
 
 app.post('/api/feed/instagram-ranked', async (req, res) => {
   const startTime = Date.now();
-  const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, excludedPostIds = [], excludedReelIds = [] } = req.body;
+  const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE } = req.body;
 
   if (!userId) {
     return res.status(400).json({ success: false, error: 'userId required' });
   }
 
   try {
-    console.log(`\n========== [FEED-REQUEST-START] ==========`);
-    console.log(`User: ${userId} | Limit: ${limit} | Excluded: ${excludedPostIds.length}P + ${excludedReelIds.length}R`);
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`[FEED-REQUEST] userId=${userId} | limit=${limit}`);
+    console.log(`${'='.repeat(80)}`);
 
-    // ✅ Use the CORRECT algorithm function
+    // ===== NEW: PHASE 1 - FOLLOWING FEED =====
+    let followingContent = [];
+    let followingMetadata = {};
+    
+    if (FOLLOWING_FEED_CONFIG.ENABLE_FOLLOWING_FEED) {
+      const followingResult = await followingFeedService.getFollowingFeed(userId, 'reels');
+      followingContent = followingResult.content;
+      followingMetadata = followingResult.metadata;
+      
+      console.log(`[FOLLOWING-PHASE] Loaded ${followingContent.length} items in ${followingMetadata.duration}ms`);
+    }
+
+    // ===== EXISTING: PHASE 2 - GLOBAL FEED (UNCHANGED) =====
+    const globalContentNeeded = Math.max(
+      0, 
+      limit - followingContent.length
+    );
+
     const [reelsResult, postsResult] = await Promise.all([
-      dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(limit * 0.6)),
-      dbManager.getOptimizedFeedFixedReads(userId, 'posts', Math.ceil(limit * 0.4))
+      dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(globalContentNeeded * 0.6)),
+      dbManager.getOptimizedFeedFixedReads(userId, 'posts', Math.ceil(globalContentNeeded * 0.4))
     ]);
 
-    // Merge content
-    const mixedContent = [...reelsResult.content, ...postsResult.content];
+    const globalContent = [...reelsResult.content, ...postsResult.content];
     
-    // Sort by composite score
-    mixedContent.sort((a, b) => {
+    // Global content ranking (existing logic)
+    globalContent.sort((a, b) => {
       const retentionDiff = (b.retention || 0) - (a.retention || 0);
       if (Math.abs(retentionDiff) > 1) return retentionDiff;
       const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
@@ -4047,31 +4235,45 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
       return (b.commentCount || 0) - (a.commentCount || 0);
     });
 
+    console.log(`[GLOBAL-PHASE] Loaded ${globalContent.length} items`);
+
+    // ===== NEW: PHASE 3 - MERGE (Following above Global) =====
+    const finalFeed = [
+      ...followingContent,
+      ...globalContent.slice(0, globalContentNeeded)
+    ].slice(0, limit);
+
     const duration = Date.now() - startTime;
 
-    console.log(`\n========== [FEED-REQUEST-COMPLETE] ==========`);
-    console.log(`User: ${userId} | Returned: ${mixedContent.length} items | Time: ${duration}ms`);
-    console.log(`Slots Read: Reels=${reelsResult.metadata?.slotsRead?.length || 0}, Posts=${postsResult.metadata?.slotsRead?.length || 0}`);
-    console.log(`=============================================\n`);
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`[FEED-COMPLETE] Total: ${finalFeed.length} items | ${duration}ms`);
+    console.log(`  Following: ${followingContent.length}`);
+    console.log(`  Global: ${globalContent.length}`);
+    console.log(`${'='.repeat(80)}\n`);
 
     return res.json({
       success: true,
-      content: mixedContent.slice(0, limit),
-      hasMore: mixedContent.length >= limit,
+      content: finalFeed,
+      hasMore: globalContent.length >= globalContentNeeded,
       metadata: {
-        totalReturned: mixedContent.length,
-        reelsCount: reelsResult.content.length,
-        postsCount: postsResult.content.length,
-        slotsRead: {
-          reels: reelsResult.metadata?.slotsRead || [],
-          posts: postsResult.metadata?.slotsRead || []
+        totalReturned: finalFeed.length,
+        followingCount: followingContent.length,
+        globalCount: Math.min(globalContent.length, globalContentNeeded),
+        following: followingMetadata,
+        global: {
+          reelsCount: reelsResult.content.length,
+          postsCount: postsResult.content.length,
+          slotsRead: {
+            reels: reelsResult.metadata?.slotsRead || [],
+            posts: postsResult.metadata?.slotsRead || []
+          }
         },
         duration
       }
     });
 
   } catch (error) {
-    console.error(`[FEED-ERROR] ${error.message}`);
+    console.error(`[FEED-ERROR]`, error);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
