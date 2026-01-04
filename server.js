@@ -1893,84 +1893,108 @@ slotsToRead = [...new Set(case6Slots)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_
   // ====================================================================
   console.log(`\n[PHASE-5] MULTI-TIER CONTENT FILTERING`);
 
-let interestedContent = [];
-  let highEngagementContent = [];
-  let remainingContent = [];
-  let totalItemsBeforeFilter = 0;
-  let interestMatchCount = 0;
-  let noInterestIncludeCount = 0;
+console.log(`\n[PHASE-5] ADAPTIVE CONTENT FILTERING (Target: ${minContentRequired} items)`);
 
-  // ✅ TIER 1: Interest-based filtering
-  for (const { slotId, content } of slotContents) {
-    totalItemsBeforeFilter += content.length;
+let allContent = [];
+let totalItemsBeforeFilter = 0;
+
+// ✅ STEP 1: Collect ALL non-viewed content with engagement scores
+for (const { slotId, content } of slotContents) {
+  totalItemsBeforeFilter += content.length;
+  
+  for (const item of content) {
+    if (viewedIds.has(item.postId)) continue;
     
-    for (const item of content) {
-      if (viewedIds.has(item.postId)) continue;
-      
-      const hasCategory = item.category && typeof item.category === 'string' && item.category.trim() !== '';
-      const categoryMatches = hasCategory && userInterests.length > 0 && userInterests.includes(item.category);
-      
-      if (categoryMatches) {
-        interestedContent.push(item);
-        interestMatchCount++;
-      } else if (userInterests.length === 0 || !hasCategory) {
-        interestedContent.push(item);
-        noInterestIncludeCount++;
-      } else {
-        // ✅ Store non-matching content for later tiers
-        const retention = parseFloat(item.retention) || 0;
-        const likeCount = parseInt(item.likeCount) || 0;
-        
-        if (retention >= 60 || likeCount >= 100) {
-          highEngagementContent.push(item);
-        } else {
-          remainingContent.push(item);
-        }
-      }
+    const hasCategory = item.category && typeof item.category === 'string' && item.category.trim() !== '';
+    const categoryMatches = hasCategory && userInterests.length > 0 && userInterests.includes(item.category);
+    
+    // Calculate engagement score for ALL content
+    const retention = parseFloat(item.retention) || 0;
+    const likeCount = parseInt(item.likeCount) || 0;
+    const commentCount = parseInt(item.commentCount) || 0;
+    const viewCount = parseInt(item.viewCount) || 0;
+    
+    // Composite engagement score
+    const engagementScore = (retention * 0.4) + (likeCount * 0.3) + (commentCount * 0.2) + (viewCount * 0.1);
+    
+    allContent.push({
+      ...item,
+      _interestMatch: categoryMatches,
+      _hasInterests: userInterests.length > 0,
+      _engagementScore: engagementScore
+    });
+  }
+}
+
+console.log(`[PHASE-5-DEBUG] Total available: ${allContent.length} items (viewed excluded: ${viewedIds.size})`);
+
+// ✅ STEP 2: Sort by priority
+// Priority 1: Interest match + engagement
+// Priority 2: No interest set (include all) + engagement  
+// Priority 3: No interest match + engagement
+allContent.sort((a, b) => {
+  // If user has interests
+  if (a._hasInterests && b._hasInterests) {
+    // Both match interest - sort by engagement
+    if (a._interestMatch && b._interestMatch) {
+      return b._engagementScore - a._engagementScore;
     }
+    // Only A matches - A wins
+    if (a._interestMatch) return -1;
+    // Only B matches - B wins
+    if (b._interestMatch) return 1;
+    // Neither match - sort by engagement
+    return b._engagementScore - a._engagementScore;
   }
+  
+  // No interests set - sort purely by engagement
+  return b._engagementScore - a._engagementScore;
+});
 
-  console.log(`[TIER-1-INTEREST] Matched: ${interestedContent.length} items`);
+// ✅ STEP 3: Apply content criteria logic
+let selectedContent = [];
+let interestMatchCount = 0;
+let noInterestIncludeCount = 0;
+let engagementFillCount = 0;
 
-  // ✅ TIER 2: Fill with high-engagement content if needed
-  if (interestedContent.length < minContentRequired && highEngagementContent.length > 0) {
-    // Sort high-engagement content by engagement score
-    highEngagementContent.sort((a, b) => {
-      const retentionDiff = (parseFloat(b.retention) || 0) - (parseFloat(a.retention) || 0);
-      if (Math.abs(retentionDiff) > 1) return retentionDiff;
-      const likesDiff = (parseInt(b.likeCount) || 0) - (parseInt(a.likeCount) || 0);
-      if (likesDiff !== 0) return likesDiff;
-      return (parseInt(b.commentCount) || 0) - (parseInt(a.commentCount) || 0);
-    });
-
-    const needed = minContentRequired - interestedContent.length;
-    const fillFromEngagement = highEngagementContent.slice(0, needed);
-    
-    console.log(`[TIER-2-ENGAGEMENT] Need ${needed} more items | Available: ${highEngagementContent.length} | Taking: ${fillFromEngagement.length}`);
-    
-    interestedContent.push(...fillFromEngagement);
+if (userInterests.length > 0) {
+  // User has interests - try interest matching first
+  const interestMatched = allContent.filter(item => item._interestMatch);
+  interestMatchCount = interestMatched.length;
+  
+  console.log(`[TIER-1-INTEREST] Found ${interestMatchCount} interest-matched items`);
+  
+  if (interestMatchCount >= minContentRequired) {
+    // Enough interest-matched content
+    selectedContent = interestMatched;
+  } else {
+    // Not enough - add ALL content sorted by engagement
+    console.log(`[TIER-2-FALLBACK] Interest insufficient (${interestMatchCount}/${minContentRequired}), adding ALL available content sorted by engagement`);
+    selectedContent = allContent;
+    engagementFillCount = allContent.length - interestMatchCount;
   }
+} else {
+  // No interests set - include all
+  console.log(`[NO-INTERESTS] User has no interests, including ALL content sorted by engagement`);
+  selectedContent = allContent;
+  noInterestIncludeCount = allContent.length;
+}
 
-  // ✅ TIER 3: Fill with remaining content if still needed
-  if (interestedContent.length < minContentRequired && remainingContent.length > 0) {
-    // Sort remaining content by any available engagement metrics
-    remainingContent.sort((a, b) => {
-      const retentionDiff = (parseFloat(b.retention) || 0) - (parseFloat(a.retention) || 0);
-      if (Math.abs(retentionDiff) > 1) return retentionDiff;
-      const likesDiff = (parseInt(b.likeCount) || 0) - (parseInt(a.likeCount) || 0);
-      if (likesDiff !== 0) return likesDiff;
-      return (parseInt(b.commentCount) || 0) - (parseInt(a.commentCount) || 0);
-    });
+// Clean up internal fields
+selectedContent = selectedContent.map(item => {
+  const { _interestMatch, _hasInterests, _engagementScore, ...cleanItem } = item;
+  return cleanItem;
+});
 
-    const needed = minContentRequired - interestedContent.length;
-    const fillFromRemaining = remainingContent.slice(0, needed);
-    
-    console.log(`[TIER-3-REMAINING] Need ${needed} more items | Available: ${remainingContent.length} | Taking: ${fillFromRemaining.length}`);
-    
-    interestedContent.push(...fillFromRemaining);
-  }
+console.log(`[MULTI-TIER-RESULT] Interest: ${interestMatchCount} | No-interest: ${noInterestIncludeCount} | Engagement-fill: ${engagementFillCount} | Total: ${selectedContent.length} | Target: ${minContentRequired}`);
 
-  console.log(`[MULTI-TIER-RESULT] Interest: ${interestMatchCount} | No-interest: ${noInterestIncludeCount} | High-engagement added: ${Math.min(highEngagementContent.length, Math.max(0, minContentRequired - (interestMatchCount + noInterestIncludeCount)))} | Remaining added: ${interestedContent.length - interestMatchCount - noInterestIncludeCount - Math.min(highEngagementContent.length, Math.max(0, minContentRequired - (interestMatchCount + noInterestIncludeCount)))} | Total: ${interestedContent.length}`);
+if (selectedContent.length < minContentRequired) {
+  console.warn(`⚠️ [CONTENT-SHORTAGE] Could only collect ${selectedContent.length}/${minContentRequired} items from ${slotContents.length} slots (available after filtering: ${allContent.length})`);
+} else {
+  console.log(`✅ [CONTENT-FULFILLED] Collected ${selectedContent.length} items (target: ${minContentRequired})`);
+}
+
+const interestedContent = selectedContent; // Keep variable name for compatibility
 
   const duration = Date.now() - start;
   const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
