@@ -1194,6 +1194,13 @@ class FollowingFeedService {
     this.port5000 = port5000Url;
   }
 
+
+}
+
+module.exports = FollowingFeedService;
+
+
+
 async function getFollowingFeed(userId, contentType = 'reels') {
   const start = Date.now();
   console.log(`\n[FOLLOWING-FEED-START] userId=${userId} | type=${contentType}`);
@@ -1344,11 +1351,6 @@ async function fetchFollowingContent(followedUserIds, viewedIds, contentType) {
     return [];
   }
 }
-}
-
-module.exports = FollowingFeedService;
-
-
 
 
 
