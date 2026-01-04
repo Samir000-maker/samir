@@ -1887,11 +1887,124 @@ slotsToRead = [...new Set(case6Slots)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_
   // ====================================================================
   console.log(`\n[PHASE-5] INTEREST FILTERING`);
 
+  // let interestedContent = [];
+  // let totalItemsBeforeFilter = 0;
+  // let interestMatchCount = 0;
+  // let noInterestIncludeCount = 0;
+
+  // for (const { slotId, content } of slotContents) {
+  //   totalItemsBeforeFilter += content.length;
+    
+  //   for (const item of content) {
+  //     if (viewedIds.has(item.postId)) continue;
+      
+  //     const hasCategory = item.category && typeof item.category === 'string' && item.category.trim() !== '';
+  //     const categoryMatches = hasCategory && userInterests.length > 0 && userInterests.includes(item.category);
+      
+  //     if (categoryMatches) {
+  //       interestedContent.push(item);
+  //       interestMatchCount++;
+  //     } else if (userInterests.length === 0 || !hasCategory) {
+  //       interestedContent.push(item);
+  //       noInterestIncludeCount++;
+  //     }
+  //   }
+  // }
+
+  // console.log(`[INTEREST-FILTER-RESULT] Interest matches: ${interestMatchCount} | No-interest includes: ${noInterestIncludeCount} | Final: ${interestedContent.length}`);
+
+  // // ====================================================================
+  // // PHASE 6: ENGAGEMENT-BASED FILL
+  // // ====================================================================
+  // if (interestedContent.length < minContentRequired) {
+  //   const slot0Visits = userStatus?.[visitField] || 0;
+  //   const normalMatch = userStatus?.[normalField]?.match(/_(\d+)$/);
+  //   const normalIndex = normalMatch ? parseInt(normalMatch[1]) : -1;
+  //   const isAtSlot0 = normalIndex === 0;
+    
+  //   let engagementStrategy = 'HIGH';
+    
+  //   if (isAtSlot0) {
+  //     if (slot0Visits === 0) {
+  //       engagementStrategy = 'MEDIUM';
+  //     } else if (slot0Visits === 1) {
+  //       engagementStrategy = 'HIGH';
+  //     } else {
+  //       engagementStrategy = 'UNSEEN';
+  //     }
+  //   }
+    
+  //   console.log(`\n[PHASE-6] ENGAGEMENT FILL - Strategy: ${engagementStrategy} | Need ${minContentRequired - interestedContent.length} more items`);
+    
+  //   const existingIds = new Set(interestedContent.map(item => item.postId));
+  //   const remainderContent = [];
+
+  //   for (const { content } of slotContents) {
+  //     for (const item of content) {
+  //       if (!viewedIds.has(item.postId) && !existingIds.has(item.postId)) {
+  //         let shouldInclude = false;
+          
+  //         const retention = parseFloat(item.retention) || 0;
+  //         const likeCount = parseInt(item.likeCount) || 0;
+          
+  //         if (engagementStrategy === 'HIGH') {
+  //           shouldInclude = retention >= 70 || likeCount >= 50;
+  //         } else if (engagementStrategy === 'MEDIUM') {
+  //           shouldInclude = retention >= 40 || likeCount >= 20;
+  //         } else if (engagementStrategy === 'UNSEEN') {
+  //           shouldInclude = true;
+  //         }
+          
+  //         if (shouldInclude) {
+  //           remainderContent.push(item);
+  //         }
+  //       }
+  //     }
+  //   }
+
+  //   remainderContent.sort((a, b) => {
+  //     const retentionDiff = (parseFloat(b.retention) || 0) - (parseFloat(a.retention) || 0);
+  //     if (Math.abs(retentionDiff) > 1) return retentionDiff;
+  //     const likesDiff = (parseInt(b.likeCount) || 0) - (parseInt(a.likeCount) || 0);
+  //     if (likesDiff !== 0) return likesDiff;
+  //     return (parseInt(b.commentCount) || 0) - (parseInt(a.commentCount) || 0);
+  //   });
+
+  //   const needed = minContentRequired - interestedContent.length;
+  //   const fillContent = remainderContent.slice(0, needed);
+    
+  //   console.log(`[ENGAGEMENT-FILL-RESULT] Strategy: ${engagementStrategy} | Taking: ${fillContent.length}`);
+    
+  //   interestedContent.push(...fillContent);
+  // }
+
+  // // ====================================================================
+  // // PHASE 7: FINAL RANKING
+  // // ====================================================================
+  // console.log(`\n[PHASE-7] FINAL RANKING`);
+  
+  // interestedContent.sort((a, b) => {
+  //   const retentionDiff = (b.retention || 0) - (a.retention || 0);
+  //   if (Math.abs(retentionDiff) > 1) return retentionDiff;
+  //   const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+  //   if (likesDiff !== 0) return likesDiff;
+  //   return (b.commentCount || 0) - (a.commentCount || 0);
+  // });
+  
+  
+  // ====================================================================
+  // PHASE 5: MULTI-TIER CONTENT FILTERING (Interest → Engagement → Remaining)
+  // ====================================================================
+  console.log(`\n[PHASE-5] MULTI-TIER CONTENT FILTERING`);
+
   let interestedContent = [];
+  let highEngagementContent = [];
+  let remainingContent = [];
   let totalItemsBeforeFilter = 0;
   let interestMatchCount = 0;
   let noInterestIncludeCount = 0;
 
+  // ✅ TIER 1: Interest-based filtering
   for (const { slotId, content } of slotContents) {
     totalItemsBeforeFilter += content.length;
     
@@ -1907,62 +2020,26 @@ slotsToRead = [...new Set(case6Slots)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_
       } else if (userInterests.length === 0 || !hasCategory) {
         interestedContent.push(item);
         noInterestIncludeCount++;
+      } else {
+        // ✅ Store non-matching content for later tiers
+        const retention = parseFloat(item.retention) || 0;
+        const likeCount = parseInt(item.likeCount) || 0;
+        
+        if (retention >= 60 || likeCount >= 100) {
+          highEngagementContent.push(item);
+        } else {
+          remainingContent.push(item);
+        }
       }
     }
   }
 
-  console.log(`[INTEREST-FILTER-RESULT] Interest matches: ${interestMatchCount} | No-interest includes: ${noInterestIncludeCount} | Final: ${interestedContent.length}`);
+  console.log(`[TIER-1-INTEREST] Matched: ${interestedContent.length} items`);
 
-  // ====================================================================
-  // PHASE 6: ENGAGEMENT-BASED FILL
-  // ====================================================================
-  if (interestedContent.length < minContentRequired) {
-    const slot0Visits = userStatus?.[visitField] || 0;
-    const normalMatch = userStatus?.[normalField]?.match(/_(\d+)$/);
-    const normalIndex = normalMatch ? parseInt(normalMatch[1]) : -1;
-    const isAtSlot0 = normalIndex === 0;
-    
-    let engagementStrategy = 'HIGH';
-    
-    if (isAtSlot0) {
-      if (slot0Visits === 0) {
-        engagementStrategy = 'MEDIUM';
-      } else if (slot0Visits === 1) {
-        engagementStrategy = 'HIGH';
-      } else {
-        engagementStrategy = 'UNSEEN';
-      }
-    }
-    
-    console.log(`\n[PHASE-6] ENGAGEMENT FILL - Strategy: ${engagementStrategy} | Need ${minContentRequired - interestedContent.length} more items`);
-    
-    const existingIds = new Set(interestedContent.map(item => item.postId));
-    const remainderContent = [];
-
-    for (const { content } of slotContents) {
-      for (const item of content) {
-        if (!viewedIds.has(item.postId) && !existingIds.has(item.postId)) {
-          let shouldInclude = false;
-          
-          const retention = parseFloat(item.retention) || 0;
-          const likeCount = parseInt(item.likeCount) || 0;
-          
-          if (engagementStrategy === 'HIGH') {
-            shouldInclude = retention >= 70 || likeCount >= 50;
-          } else if (engagementStrategy === 'MEDIUM') {
-            shouldInclude = retention >= 40 || likeCount >= 20;
-          } else if (engagementStrategy === 'UNSEEN') {
-            shouldInclude = true;
-          }
-          
-          if (shouldInclude) {
-            remainderContent.push(item);
-          }
-        }
-      }
-    }
-
-    remainderContent.sort((a, b) => {
+  // ✅ TIER 2: Fill with high-engagement content if needed
+  if (interestedContent.length < minContentRequired && highEngagementContent.length > 0) {
+    // Sort high-engagement content by engagement score
+    highEngagementContent.sort((a, b) => {
       const retentionDiff = (parseFloat(b.retention) || 0) - (parseFloat(a.retention) || 0);
       if (Math.abs(retentionDiff) > 1) return retentionDiff;
       const likesDiff = (parseInt(b.likeCount) || 0) - (parseInt(a.likeCount) || 0);
@@ -1971,25 +2048,33 @@ slotsToRead = [...new Set(case6Slots)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_
     });
 
     const needed = minContentRequired - interestedContent.length;
-    const fillContent = remainderContent.slice(0, needed);
+    const fillFromEngagement = highEngagementContent.slice(0, needed);
     
-    console.log(`[ENGAGEMENT-FILL-RESULT] Strategy: ${engagementStrategy} | Taking: ${fillContent.length}`);
+    console.log(`[TIER-2-ENGAGEMENT] Need ${needed} more items | Available: ${highEngagementContent.length} | Taking: ${fillFromEngagement.length}`);
     
-    interestedContent.push(...fillContent);
+    interestedContent.push(...fillFromEngagement);
   }
 
-  // ====================================================================
-  // PHASE 7: FINAL RANKING
-  // ====================================================================
-  console.log(`\n[PHASE-7] FINAL RANKING`);
-  
-  interestedContent.sort((a, b) => {
-    const retentionDiff = (b.retention || 0) - (a.retention || 0);
-    if (Math.abs(retentionDiff) > 1) return retentionDiff;
-    const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
-    if (likesDiff !== 0) return likesDiff;
-    return (b.commentCount || 0) - (a.commentCount || 0);
-  });
+  // ✅ TIER 3: Fill with remaining content if still needed
+  if (interestedContent.length < minContentRequired && remainingContent.length > 0) {
+    // Sort remaining content by any available engagement metrics
+    remainingContent.sort((a, b) => {
+      const retentionDiff = (parseFloat(b.retention) || 0) - (parseFloat(a.retention) || 0);
+      if (Math.abs(retentionDiff) > 1) return retentionDiff;
+      const likesDiff = (parseInt(b.likeCount) || 0) - (parseInt(a.likeCount) || 0);
+      if (likesDiff !== 0) return likesDiff;
+      return (parseInt(b.commentCount) || 0) - (parseInt(a.commentCount) || 0);
+    });
+
+    const needed = minContentRequired - interestedContent.length;
+    const fillFromRemaining = remainingContent.slice(0, needed);
+    
+    console.log(`[TIER-3-REMAINING] Need ${needed} more items | Available: ${remainingContent.length} | Taking: ${fillFromRemaining.length}`);
+    
+    interestedContent.push(...fillFromRemaining);
+  }
+
+  console.log(`[MULTI-TIER-RESULT] Interest: ${interestMatchCount} | No-interest: ${noInterestIncludeCount} | High-engagement added: ${Math.min(highEngagementContent.length, Math.max(0, minContentRequired - (interestMatchCount + noInterestIncludeCount)))} | Remaining added: ${interestedContent.length - interestMatchCount - noInterestIncludeCount - Math.min(highEngagementContent.length, Math.max(0, minContentRequired - (interestMatchCount + noInterestIncludeCount)))} | Total: ${interestedContent.length}`);
 
   const duration = Date.now() - start;
   const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
