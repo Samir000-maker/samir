@@ -55,6 +55,19 @@ const FOLLOWING_FEED_CONFIG = {
 };
 
 
+const READ_LIMIT_CONFIG = {
+  MAX_SLOTS_PER_FEED: 6,           // Normal: read 3 slots
+  EMERGENCY_MAX_SLOTS: 5,          // Emergency: read up to 5 slots
+  MAX_CONTRIB_READS: 6,            // Max contrib document reads
+  MAX_FORWARD_CHECKS: 5,           // Max forward slot existence checks
+  MAX_BACKWARD_CHECKS: 6,          // Max backward slot checks
+  TOTAL_READ_BUDGET: 7,            // 1 (user_status) + 3 (slots) + 3 (contrib)
+  EMERGENCY_TOTAL_BUDGET: 11,      // Emergency budget
+  STRICT_ENFORCEMENT: false,       // Set true to throw errors on limit exceeded
+  WARNING_THRESHOLD: 0.8           // Warn at 80% of limit
+};
+
+
 const PORT_4000_URL = process.env.PORT_4000_URL || 'https://database-22io.onrender.com';
 const PORT_5000_URL = process.env.PORT_5000_URL || 'https://server1-ki1x.onrender.com';
 
@@ -1436,14 +1449,24 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
     const latestIndex = latestSlot.index;
     
     // ✅ FIXED: Build proper backward sequence [latest, latest-1, latest-2]
-    slotsToRead = [
-      `${prefix}_${latestIndex}`,
-      `${prefix}_${Math.max(latestIndex - 1, 0)}`,
-      `${prefix}_${Math.max(latestIndex - 2, 0)}`
-    ];
+    // slotsToRead = [
+    //   `${prefix}_${latestIndex}`,
+    //   `${prefix}_${Math.max(latestIndex - 1, 0)}`,
+    //   `${prefix}_${Math.max(latestIndex - 2, 0)}`
+    // ];
     
-    // ✅ Remove duplicates (in case latestIndex is 0 or 1)
-    slotsToRead = [...new Set(slotsToRead)];
+    // // ✅ Remove duplicates (in case latestIndex is 0 or 1)
+    // slotsToRead = [...new Set(slotsToRead)];
+    
+    
+    const freshUserSlots = [];
+for (let i = 0; i < READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED; i++) {
+  const slotIndex = Math.max(latestIndex - i, 0);
+  freshUserSlots.push(`${prefix}_${slotIndex}`);
+}
+slotsToRead = [...new Set(freshUserSlots)];
+
+console.log(`[FRESH-USER] Will read ${slotsToRead.length}/${READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED} slots`);
 
     newLatestSlot = slotsToRead[0];
     newNormalSlot = slotsToRead[slotsToRead.length - 1];
@@ -1498,8 +1521,8 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
       const forwardSlots = [globalForwardSlot];
       
       // Check up to 2 more forward slots
-      for (let i = latestIndex + 2; i <= latestIndex + 3; i++) {
-        if (forwardSlots.length >= 3) break;
+for (let i = latestIndex + 2; i <= latestIndex + READ_LIMIT_CONFIG.MAX_FORWARD_CHECKS; i++) {
+  if (forwardSlots.length >= READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED) break;
         
         const nextForwardSlot = `${prefix}_${i}`;
         const nextCheckStart = Date.now();
@@ -1526,11 +1549,11 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
       }
       
       // ✅ If we have less than 3 slots, fill backward from normalSlot
-      if (forwardSlots.length < 3) {
-        const backwardSlots = [];
-        let backwardIndex = normalIndex;
-        
-        while (backwardSlots.length + forwardSlots.length < 3 && backwardIndex >= 0) {
+if (forwardSlots.length < READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED) {
+  const backwardSlots = [];
+  let backwardIndex = normalIndex;
+  
+  while (backwardSlots.length + forwardSlots.length < READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED && backwardIndex >= 0) {
           const backwardSlot = `${prefix}_${backwardIndex}`;
           
           // ✅ Skip if already in forwardSlots
@@ -1568,7 +1591,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
       }
       
       // ✅ Remove duplicates and limit to 3
-      slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+      slotsToRead = [...new Set(slotsToRead)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED);
       
       newLatestSlot = forwardSlots[forwardSlots.length - 1];
       newNormalSlot = slotsToRead[slotsToRead.length - 1];
@@ -1590,7 +1613,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
         
         // Check multiple forward slots beyond current latest
         const forwardSlots = [];
-        for (let i = latestIndex + 1; i <= latestIndex + 5; i++) {
+        for (let i = latestIndex + 1; i <= latestIndex + READ_LIMIT_CONFIG.MAX_FORWARD_CHECKS; i++) {
           const checkSlot = `${prefix}_${i}`;
           const checkStart = Date.now();
           const exists = await this.db.collection(collection).findOne(
@@ -1615,10 +1638,10 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
         
         if (forwardSlots.length > 0) {
           slotsToRead = [
-            currentNormalSlot,
-            ...forwardSlots.slice(0, 2)
-          ];
-          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+  currentNormalSlot,
+  ...forwardSlots.slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED - 1)
+];
+slotsToRead = [...new Set(slotsToRead)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED);
           
           newLatestSlot = forwardSlots[forwardSlots.length - 1];
           newNormalSlot = currentNormalSlot;
@@ -1630,7 +1653,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
             currentLatestSlot,
             `${prefix}_${Math.max(latestIndex - 1, 0)}`
           ];
-          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+          slotsToRead = [...new Set(slotsToRead)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED);
           
           newLatestSlot = currentLatestSlot;
           newNormalSlot = currentNormalSlot;
@@ -1665,7 +1688,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
             forwardSlot,
             currentLatestSlot
           ];
-          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+          slotsToRead = [...new Set(slotsToRead)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED);
           
           newLatestSlot = forwardSlot;
           newNormalSlot = currentNormalSlot;
@@ -1675,7 +1698,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
             currentLatestSlot,
             `${prefix}_${Math.max(latestIndex - 1, 0)}`
           ];
-          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+          slotsToRead = [...new Set(slotsToRead)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED);
           
           newLatestSlot = currentLatestSlot;
           newNormalSlot = currentNormalSlot;
@@ -1705,12 +1728,18 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
         console.log(`[CASE-6-FORWARD-CHECK] ${forwardSlot} | Exists: ${!!forwardExists}`);
         
         if (forwardExists) {
-          slotsToRead = [
-            forwardSlot,
-            currentLatestSlot,
-            `${prefix}_${Math.max(latestIndex - 1, 0)}`
-          ];
-          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+          // slotsToRead = [
+          //   forwardSlot,
+          //   currentLatestSlot,
+          //   `${prefix}_${Math.max(latestIndex - 1, 0)}`
+          // ];
+          // slotsToRead = [...new Set(slotsToRead)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED);
+          
+          const case6Slots = [forwardSlot, currentLatestSlot];
+for (let i = 1; i <= READ_LIMIT_CONFIG.MAX_BACKWARD_CHECKS && case6Slots.length < READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED; i++) {
+  case6Slots.push(`${prefix}_${Math.max(latestIndex - i, 0)}`);
+}
+slotsToRead = [...new Set(case6Slots)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED);
           
           newLatestSlot = forwardSlot;
           newNormalSlot = `${prefix}_${Math.max(latestIndex - 1, 0)}`;
@@ -1720,7 +1749,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
             `${prefix}_${Math.max(latestIndex - 1, 0)}`,
             `${prefix}_${Math.max(latestIndex - 2, 0)}`
           ];
-          slotsToRead = [...new Set(slotsToRead)].slice(0, 3);
+          slotsToRead = [...new Set(slotsToRead)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED);
           
           newLatestSlot = currentLatestSlot;
           newNormalSlot = slotsToRead[slotsToRead.length - 1];
@@ -1739,7 +1768,7 @@ async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_C
       const backwardSlots = [];
       let currentIndex = normalIndex;
       
-      while (backwardSlots.length < 3 && currentIndex >= 0) {
+      while (backwardSlots.length < READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED && currentIndex >= 0) {
         const slotId = `${prefix}_${currentIndex}`;
         
         const slotExistsCheckStart = Date.now();
@@ -2672,7 +2701,7 @@ _id: firstDoc._id,
 hasReelsList: !!firstDoc.reelsList,
 reelsCount: firstDoc.reelsList ? firstDoc.reelsList.length : 0,
 sampleReelIds: firstDoc.reelsList ?
-firstDoc.reelsList.slice(0, 3).map(r => r.postId) : []
+firstDoc.reelsList.slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_FEED).map(r => r.postId) : []
 } : null
 };
 
