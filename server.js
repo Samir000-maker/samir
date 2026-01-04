@@ -1997,7 +1997,7 @@ slotsToRead = [...new Set(case6Slots)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_
   // ====================================================================
   console.log(`\n[PHASE-5] MULTI-TIER CONTENT FILTERING`);
 
-  let interestedContent = [];
+let interestedContent = [];
   let highEngagementContent = [];
   let remainingContent = [];
   let totalItemsBeforeFilter = 0;
