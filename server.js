@@ -1886,110 +1886,6 @@ slotsToRead = [...new Set(case6Slots)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_
   // PHASE 5: INTEREST-BASED FILTERING
   // ====================================================================
   console.log(`\n[PHASE-5] INTEREST FILTERING`);
-
-  // let interestedContent = [];
-  // let totalItemsBeforeFilter = 0;
-  // let interestMatchCount = 0;
-  // let noInterestIncludeCount = 0;
-
-  // for (const { slotId, content } of slotContents) {
-  //   totalItemsBeforeFilter += content.length;
-    
-  //   for (const item of content) {
-  //     if (viewedIds.has(item.postId)) continue;
-      
-  //     const hasCategory = item.category && typeof item.category === 'string' && item.category.trim() !== '';
-  //     const categoryMatches = hasCategory && userInterests.length > 0 && userInterests.includes(item.category);
-      
-  //     if (categoryMatches) {
-  //       interestedContent.push(item);
-  //       interestMatchCount++;
-  //     } else if (userInterests.length === 0 || !hasCategory) {
-  //       interestedContent.push(item);
-  //       noInterestIncludeCount++;
-  //     }
-  //   }
-  // }
-
-  // console.log(`[INTEREST-FILTER-RESULT] Interest matches: ${interestMatchCount} | No-interest includes: ${noInterestIncludeCount} | Final: ${interestedContent.length}`);
-
-  // // ====================================================================
-  // // PHASE 6: ENGAGEMENT-BASED FILL
-  // // ====================================================================
-  // if (interestedContent.length < minContentRequired) {
-  //   const slot0Visits = userStatus?.[visitField] || 0;
-  //   const normalMatch = userStatus?.[normalField]?.match(/_(\d+)$/);
-  //   const normalIndex = normalMatch ? parseInt(normalMatch[1]) : -1;
-  //   const isAtSlot0 = normalIndex === 0;
-    
-  //   let engagementStrategy = 'HIGH';
-    
-  //   if (isAtSlot0) {
-  //     if (slot0Visits === 0) {
-  //       engagementStrategy = 'MEDIUM';
-  //     } else if (slot0Visits === 1) {
-  //       engagementStrategy = 'HIGH';
-  //     } else {
-  //       engagementStrategy = 'UNSEEN';
-  //     }
-  //   }
-    
-  //   console.log(`\n[PHASE-6] ENGAGEMENT FILL - Strategy: ${engagementStrategy} | Need ${minContentRequired - interestedContent.length} more items`);
-    
-  //   const existingIds = new Set(interestedContent.map(item => item.postId));
-  //   const remainderContent = [];
-
-  //   for (const { content } of slotContents) {
-  //     for (const item of content) {
-  //       if (!viewedIds.has(item.postId) && !existingIds.has(item.postId)) {
-  //         let shouldInclude = false;
-          
-  //         const retention = parseFloat(item.retention) || 0;
-  //         const likeCount = parseInt(item.likeCount) || 0;
-          
-  //         if (engagementStrategy === 'HIGH') {
-  //           shouldInclude = retention >= 70 || likeCount >= 50;
-  //         } else if (engagementStrategy === 'MEDIUM') {
-  //           shouldInclude = retention >= 40 || likeCount >= 20;
-  //         } else if (engagementStrategy === 'UNSEEN') {
-  //           shouldInclude = true;
-  //         }
-          
-  //         if (shouldInclude) {
-  //           remainderContent.push(item);
-  //         }
-  //       }
-  //     }
-  //   }
-
-  //   remainderContent.sort((a, b) => {
-  //     const retentionDiff = (parseFloat(b.retention) || 0) - (parseFloat(a.retention) || 0);
-  //     if (Math.abs(retentionDiff) > 1) return retentionDiff;
-  //     const likesDiff = (parseInt(b.likeCount) || 0) - (parseInt(a.likeCount) || 0);
-  //     if (likesDiff !== 0) return likesDiff;
-  //     return (parseInt(b.commentCount) || 0) - (parseInt(a.commentCount) || 0);
-  //   });
-
-  //   const needed = minContentRequired - interestedContent.length;
-  //   const fillContent = remainderContent.slice(0, needed);
-    
-  //   console.log(`[ENGAGEMENT-FILL-RESULT] Strategy: ${engagementStrategy} | Taking: ${fillContent.length}`);
-    
-  //   interestedContent.push(...fillContent);
-  // }
-
-  // // ====================================================================
-  // // PHASE 7: FINAL RANKING
-  // // ====================================================================
-  // console.log(`\n[PHASE-7] FINAL RANKING`);
-  
-  // interestedContent.sort((a, b) => {
-  //   const retentionDiff = (b.retention || 0) - (a.retention || 0);
-  //   if (Math.abs(retentionDiff) > 1) return retentionDiff;
-  //   const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
-  //   if (likesDiff !== 0) return likesDiff;
-  //   return (b.commentCount || 0) - (a.commentCount || 0);
-  // });
   
   
   // ====================================================================
@@ -2087,21 +1983,21 @@ let interestedContent = [];
   console.log(`  Duration: ${duration}ms`);
   console.log(`${'='.repeat(80)}\n`);
 
-  return {
-    content: interestedContent.slice(0, minContentRequired * 2),
-    isNewUser,
-    hasNewContent: interestedContent.length > 0,
-    metadata: {
-      slotsChecked: documentsChecked.map(d => d.slot),
-      slotsWithContent: slotContents.map(s => s.slotId),
-      slotsRead: slotContents.map(s => s.slotId),
-      contribDocsChecked: contribDocsChecked.map(c => c.slotId),
-      interestFiltered: interestedContent.length,
-      totalReads: totalReads,
-      userInterests,
-      duration
-    }
-  };
+return {
+  content: interestedContent, // REMOVED .slice(0, minContentRequired * 2)
+  isNewUser,
+  hasNewContent: interestedContent.length > 0,
+  metadata: {
+    slotsChecked: documentsChecked.map(d => d.slot),
+    slotsWithContent: slotContents.map(s => s.slotId),
+    slotsRead: slotContents.map(s => s.slotId),
+    contribDocsChecked: contribDocsChecked.map(c => c.slotId),
+    interestFiltered: interestedContent.length,
+    totalReads: totalReads,
+    userInterests,
+    duration
+  }
+};
 }
 
 
@@ -4414,21 +4310,29 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     console.log(`Slots Read: Reels=${reelsResult.metadata?.slotsRead?.length || 0}, Posts=${postsResult.metadata?.slotsRead?.length || 0}`);
     console.log(`=============================================\n`);
 
-    return res.json({
-      success: true,
-      content: mixedContent.slice(0, limit),
-      hasMore: mixedContent.length >= limit,
-      metadata: {
-        totalReturned: mixedContent.length,
-        reelsCount: reelsResult.content.length,
-        postsCount: postsResult.content.length,
-        slotsRead: {
-          reels: reelsResult.metadata?.slotsRead || [],
-          posts: postsResult.metadata?.slotsRead || []
-        },
-        duration
-      }
-    });
+    // ✅ CRITICAL FIX: Return ALL content if less than MIN_CONTENT_FOR_FEED
+const contentToReturn = mixedContent.length < MIN_CONTENT_FOR_FEED 
+  ? mixedContent  // Return everything if below minimum
+  : mixedContent.slice(0, limit); // Only limit if we have enough
+
+return res.json({
+  success: true,
+  content: contentToReturn,
+  hasMore: mixedContent.length > limit,
+  metadata: {
+    totalReturned: contentToReturn.length,
+    totalAvailable: mixedContent.length,
+    reelsCount: reelsResult.content.length,
+    postsCount: postsResult.content.length,
+    targetMinimum: MIN_CONTENT_FOR_FEED,
+    requestedLimit: limit,
+    slotsRead: {
+      reels: reelsResult.metadata?.slotsRead || [],
+      posts: postsResult.metadata?.slotsRead || []
+    },
+    duration
+  }
+});
 
   } catch (error) {
     console.error(`[FEED-ERROR] ${error.message}`);
