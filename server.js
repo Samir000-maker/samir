@@ -54,6 +54,14 @@ const FOLLOWING_FEED_CONFIG = {
   ENABLE_FOLLOWING_FEED: true      // Feature flag
 };
 
+
+const PORT_4000_URL = process.env.PORT_4000_URL || 'https://database-22io.onrender.com';
+const PORT_5000_URL = process.env.PORT_5000_URL || 'https://server1-ki1x.onrender.com';
+
+console.log('[FOLLOWING-FEED-CONFIG]', FOLLOWING_FEED_CONFIG);
+console.log('[EXTERNAL-PORTS] 4000:', PORT_4000_URL, '| 5000:', PORT_5000_URL);
+
+
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
 const MAX_CONTENT_PER_SLOT = 3; // Maximum content items per document before creating new slot
 const DEFAULT_CONTENT_BATCH_SIZE = 10; // Default number of items to return per request
@@ -89,17 +97,6 @@ if (cleanedCount > 0) {
 console.log(`[PROCESSED-REQUESTS-CLEANUP] Removed ${cleanedCount} expired entries | Active: ${processedRequests.size}`);
 }
 }, 60000);
-
-
-
-
-const FollowingFeedService = require('./followingFeedService');
-
-const followingFeedService = new FollowingFeedService(
-  FOLLOWING_FEED_CONFIG,
-  process.env.PORT_4000_URL || 'https://database-22io.onrender.com',
-  process.env.PORT_5000_URL || 'https://server1-ki1x.onrender.com'
-);
 
 
 
@@ -1197,137 +1194,156 @@ class FollowingFeedService {
     this.port5000 = port5000Url;
   }
 
-  async getFollowingFeed(userId, contentType = 'reels') {
-    const start = Date.now();
-    console.log(`[FOLLOWING-FEED-START] userId=${userId} | type=${contentType}`);
+async function getFollowingFeed(userId, contentType = 'reels') {
+  const start = Date.now();
+  console.log(`\n[FOLLOWING-FEED-START] userId=${userId} | type=${contentType}`);
 
-    try {
-      // Step 1: Get followed users (PORT 5000)
-      const followedUsers = await this._getFollowedUsers(userId);
-      
-      if (followedUsers.length === 0) {
-        console.log(`[FOLLOWING-FEED-SKIP] No followed users`);
-        return { content: [], metadata: { source: 'none', duration: Date.now() - start } };
-      }
-
-      // Step 2: Get viewed following content (PORT 4000)
-      const viewedIds = await this._getViewedFollowingContent(userId, contentType);
-
-      // Step 3: Fetch content from followed users (PORT 4000)
-      const followingContent = await this._fetchFollowingContent(
-        followedUsers,
-        viewedIds,
-        contentType
-      );
-
-      const duration = Date.now() - start;
-      console.log(`[FOLLOWING-FEED-COMPLETE] Returned ${followingContent.length} items | ${duration}ms`);
-
-      return {
-        content: followingContent,
-        metadata: {
-          source: 'following',
-          followedUsers: followedUsers.length,
-          viewedFiltered: viewedIds.size,
-          duration
-        }
+  try {
+    // Step 1: Get followed users (PORT 5000)
+    const followedUsers = await getFollowedUsers(userId);
+    
+    if (followedUsers.length === 0) {
+      console.log(`[FOLLOWING-FEED-SKIP] No followed users`);
+      return { 
+        content: [], 
+        metadata: { 
+          source: 'none', 
+          followedUsers: 0,
+          duration: Date.now() - start 
+        } 
       };
-
-    } catch (error) {
-      console.error(`[FOLLOWING-FEED-ERROR]`, error.message);
-      return { content: [], metadata: { source: 'error', error: error.message } };
     }
-  }
 
-  async _getFollowedUsers(userId) {
-    const timeout = this.config.FOLLOWING_FETCH_TIMEOUT;
-    
-    try {
-      const response = await axios.get(
-        `${this.port5000}/api/users/${userId}/following`,
-        { timeout }
-      );
+    // Step 2: Get viewed following content (PORT 4000)
+    const viewedIds = await getViewedFollowingContent(userId, contentType);
 
-      if (response.data.success && Array.isArray(response.data.following)) {
-        return response.data.following.slice(0, this.config.MAX_FOLLOWING_USERS_PER_LOAD);
+    // Step 3: Fetch content from followed users (PORT 4000)
+    const followingContent = await fetchFollowingContent(
+      followedUsers,
+      viewedIds,
+      contentType
+    );
+
+    const duration = Date.now() - start;
+    console.log(`[FOLLOWING-FEED-COMPLETE] Returned ${followingContent.length} items | ${duration}ms\n`);
+
+    return {
+      content: followingContent,
+      metadata: {
+        source: 'following',
+        followedUsers: followedUsers.length,
+        viewedFiltered: viewedIds.size,
+        duration
       }
-      return [];
-    } catch (error) {
-      console.warn(`[FOLLOWING-FETCH-FAIL] ${error.message}`);
-      return [];
-    }
+    };
+
+  } catch (error) {
+    console.error(`[FOLLOWING-FEED-ERROR]`, error.message);
+    return { 
+      content: [], 
+      metadata: { 
+        source: 'error', 
+        error: error.message,
+        duration: Date.now() - start
+      } 
+    };
   }
+}
 
-  async _getViewedFollowingContent(userId, contentType) {
-    const viewedIds = new Set();
-    
-    try {
-      const response = await axios.get(
-        `${this.port4000}/api/following-views/user/${userId}`,
-        { timeout: this.config.FOLLOWING_FETCH_TIMEOUT }
-      );
+async function getFollowedUsers(userId) {
+  const timeout = FOLLOWING_FEED_CONFIG.FOLLOWING_FETCH_TIMEOUT;
+  
+  try {
+    const response = await axios.get(
+      `${PORT_5000_URL}/api/users/${userId}/following`,
+      { timeout }
+    );
 
-      if (response.data.success && Array.isArray(response.data.documents)) {
-        response.data.documents.forEach(doc => {
-          const arrayField = contentType === 'reels' ? 'reelsList' : 'PostList';
-          if (Array.isArray(doc[arrayField])) {
-            doc[arrayField].forEach(id => viewedIds.add(String(id)));
-          }
-        });
-      }
-    } catch (error) {
-      console.warn(`[VIEWED-FETCH-FAIL] ${error.message}`);
+    if (response.data.success && Array.isArray(response.data.following)) {
+      const followed = response.data.following.slice(0, FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_USERS_PER_LOAD);
+      console.log(`[FOLLOWING-USERS] userId=${userId} | Found ${followed.length} users`);
+      return followed;
     }
-
-    return viewedIds;
+    return [];
+  } catch (error) {
+    console.warn(`[FOLLOWING-USERS-FAIL] ${error.message}`);
+    return [];
   }
+}
 
-  async _fetchFollowingContent(followedUserIds, viewedIds, contentType) {
-    try {
-      const response = await axios.post(
-        `${this.port4000}/api/posts/batch-following`,
-        {
-          userIds: followedUserIds,
-          viewerId: null // Don't use PORT 4000's filtering, we handle it
-        },
-        { 
-          timeout: this.config.FOLLOWING_FETCH_TIMEOUT,
-          params: { 
-            limit: this.config.MAX_FOLLOWING_CONTENT * 2 // Over-fetch for filtering
-          }
+async function getViewedFollowingContent(userId, contentType) {
+  const viewedIds = new Set();
+  
+  try {
+    const response = await axios.get(
+      `${PORT_4000_URL}/api/following-views/user/${userId}`,
+      { timeout: FOLLOWING_FEED_CONFIG.FOLLOWING_FETCH_TIMEOUT }
+    );
+
+    if (response.data.success && Array.isArray(response.data.documents)) {
+      response.data.documents.forEach(doc => {
+        const arrayField = contentType === 'reels' ? 'reelsList' : 'PostList';
+        if (Array.isArray(doc[arrayField])) {
+          doc[arrayField].forEach(id => viewedIds.add(String(id)));
         }
-      );
+      });
+      console.log(`[VIEWED-FOLLOWING] userId=${userId} | Filtered ${viewedIds.size} ${contentType}`);
+    }
+  } catch (error) {
+    console.warn(`[VIEWED-FOLLOWING-FAIL] ${error.message}`);
+  }
 
-      if (!response.data.success || !Array.isArray(response.data.content)) {
-        return [];
+  return viewedIds;
+}
+
+async function fetchFollowingContent(followedUserIds, viewedIds, contentType) {
+  try {
+    const response = await axios.post(
+      `${PORT_4000_URL}/api/posts/batch-following`,
+      {
+        userIds: followedUserIds,
+        viewerId: null // We handle filtering ourselves
+      },
+      { 
+        timeout: FOLLOWING_FEED_CONFIG.FOLLOWING_FETCH_TIMEOUT,
+        params: { 
+          limit: FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_CONTENT * 2 // Over-fetch for filtering
+        }
       }
+    );
 
-      // Filter and rank
-      const filtered = response.data.content
-        .filter(item => {
-          const isCorrectType = contentType === 'reels' ? item.isReel : !item.isReel;
-          const notViewed = !viewedIds.has(item.postId);
-          return isCorrectType && notViewed;
-        })
-        .sort((a, b) => {
-          // Retention-first ranking (Instagram algorithm)
-          const retentionDiff = (b.retention || 0) - (a.retention || 0);
-          if (Math.abs(retentionDiff) > 1) return retentionDiff;
-          
-          const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
-          if (likesDiff !== 0) return likesDiff;
-          
-          return (b.commentCount || 0) - (a.commentCount || 0);
-        })
-        .slice(0, this.config.MAX_FOLLOWING_CONTENT);
-
-      return filtered;
-
-    } catch (error) {
-      console.error(`[FOLLOWING-CONTENT-FETCH-ERROR]`, error.message);
+    if (!response.data.success || !Array.isArray(response.data.content)) {
+      console.warn(`[FOLLOWING-CONTENT-FAIL] Invalid response format`);
       return [];
     }
+
+    // Filter and rank
+    const filtered = response.data.content
+      .filter(item => {
+        const isCorrectType = contentType === 'reels' ? item.isReel : !item.isReel;
+        const notViewed = !viewedIds.has(item.postId);
+        return isCorrectType && notViewed;
+      })
+      .sort((a, b) => {
+        // Retention-first ranking (Instagram algorithm)
+        const retentionDiff = (b.retention || 0) - (a.retention || 0);
+        if (Math.abs(retentionDiff) > 1) return retentionDiff;
+        
+        const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+        if (likesDiff !== 0) return likesDiff;
+        
+        return (b.commentCount || 0) - (a.commentCount || 0);
+      })
+      .slice(0, FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_CONTENT);
+
+    console.log(`[FOLLOWING-CONTENT] Fetched ${response.data.content.length}, filtered to ${filtered.length}`);
+    return filtered;
+
+  } catch (error) {
+    console.error(`[FOLLOWING-CONTENT-ERROR]`, error.message);
+    return [];
   }
+}
 }
 
 module.exports = FollowingFeedService;
@@ -3628,39 +3644,57 @@ app.get('/api/feed/:contentType/:userId', async (req, res) => {
 });
 
 app.post('/api/contributed-views/batch-optimized', async (req, res) => {
+  const requestId = req.body.requestId || req.headers['x-request-id'] || 'unknown';
   const startTime = Date.now();
-  const { userId, posts = [], reels = [] } = req.body;
-
-  if (!userId) {
-    return res.status(400).json({ success: false, error: 'userId required' });
-  }
 
   try {
-    // Existing PORT 2000 tracking (unchanged)
+    const { userId, posts = [], reels = [] } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: 'userId required',
+        requestId
+      });
+    }
+
+    console.log(`[BATCH-START] userId=${userId} | ${posts.length}P + ${reels.length}R`);
+
+    // ✅ Existing: Update contrib collections (unchanged)
     const results = await dbManager.batchPutContributedViewsOptimized(userId, posts, reels);
 
-    // ✅ NEW: Track in PORT 4000 for following feed
-    const followingViewIds = {
-      posts: posts.filter(p => p.isFollowingContent).map(p => p.postId),
-      reels: reels.filter(r => r.isFollowingContent).map(r => r.postId)
-    };
+    // ===== NEW: Track following content views in PORT 4000 =====
+    const followingPostIds = posts
+      .filter(p => p.isFollowingContent || p.sourceDocument?.includes('_'))
+      .map(p => typeof p === 'string' ? p : p.postId);
+    
+    const followingReelIds = reels
+      .filter(r => r.isFollowingContent || r.sourceDocument?.includes('_'))
+      .map(r => typeof r === 'string' ? r : r.postId);
 
-    if (followingViewIds.posts.length > 0 || followingViewIds.reels.length > 0) {
+    if (followingPostIds.length > 0 || followingReelIds.length > 0) {
+      console.log(`[FOLLOWING-VIEW-TRACK] ${followingPostIds.length}P + ${followingReelIds.length}R`);
+      
       // Fire-and-forget to PORT 4000
       axios.post(
-        `${process.env.PORT_4000_URL}/api/following-views/mark`,
+        `${PORT_4000_URL}/api/following-views`,
         {
-          viewerId: userId,
-          postIds: followingViewIds.posts,
-          reelIds: followingViewIds.reels
+          userId: userId,
+          documentName: `auto_${Date.now()}`,
+          postIds: followingPostIds,
+          reelIds: followingReelIds,
+          postCount: followingPostIds.length,
+          reelCount: followingReelIds.length
         },
         { timeout: 1000 }
       ).catch(err => {
-        console.warn(`[FOLLOWING-VIEW-TRACK-FAIL]`, err.message);
+        console.warn(`[FOLLOWING-VIEW-TRACK-FAIL] ${err.message}`);
       });
     }
 
     const duration = Date.now() - startTime;
+
+    console.log(`[BATCH-COMPLETE] userId=${userId} | Duration: ${duration}ms`);
 
     res.json({
       success: true,
@@ -3668,12 +3702,24 @@ app.post('/api/contributed-views/batch-optimized', async (req, res) => {
         posts: posts.length,
         reels: reels.length
       },
+      autoUpdated: {
+        reels: reels.length > 0,
+        posts: posts.length > 0
+      },
+      requestId,
       duration
     });
 
   } catch (error) {
-    console.error(`[BATCH-ERROR]`, error);
-    res.status(500).json({ success: false, error: error.message });
+    const duration = Date.now() - startTime;
+    console.error(`[BATCH-ERROR] requestId=${requestId} | duration=${duration}ms`, error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      requestId,
+      duration
+    });
   }
 });
 
@@ -4198,26 +4244,30 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
 
   try {
     console.log(`\n${'='.repeat(80)}`);
-    console.log(`[FEED-REQUEST] userId=${userId} | limit=${limit}`);
+    console.log(`[FEED-REQUEST-START] userId=${userId} | limit=${limit}`);
     console.log(`${'='.repeat(80)}`);
 
-    // ===== NEW: PHASE 1 - FOLLOWING FEED =====
+    // ===== PHASE 1: FOLLOWING FEED (NEW) =====
     let followingContent = [];
-    let followingMetadata = {};
+    let followingMetadata = { source: 'disabled' };
     
     if (FOLLOWING_FEED_CONFIG.ENABLE_FOLLOWING_FEED) {
-      const followingResult = await followingFeedService.getFollowingFeed(userId, 'reels');
+      const followingResult = await getFollowingFeed(userId, 'reels');
       followingContent = followingResult.content;
       followingMetadata = followingResult.metadata;
       
       console.log(`[FOLLOWING-PHASE] Loaded ${followingContent.length} items in ${followingMetadata.duration}ms`);
+    } else {
+      console.log(`[FOLLOWING-PHASE] Disabled by config`);
     }
 
-    // ===== EXISTING: PHASE 2 - GLOBAL FEED (UNCHANGED) =====
+    // ===== PHASE 2: GLOBAL FEED (EXISTING - UNCHANGED) =====
     const globalContentNeeded = Math.max(
       0, 
       limit - followingContent.length
     );
+
+    console.log(`[GLOBAL-PHASE] Need ${globalContentNeeded} items from global feed`);
 
     const [reelsResult, postsResult] = await Promise.all([
       dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(globalContentNeeded * 0.6)),
@@ -4226,7 +4276,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
 
     const globalContent = [...reelsResult.content, ...postsResult.content];
     
-    // Global content ranking (existing logic)
+    // Global content ranking (existing logic - unchanged)
     globalContent.sort((a, b) => {
       const retentionDiff = (b.retention || 0) - (a.retention || 0);
       if (Math.abs(retentionDiff) > 1) return retentionDiff;
@@ -4237,7 +4287,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
 
     console.log(`[GLOBAL-PHASE] Loaded ${globalContent.length} items`);
 
-    // ===== NEW: PHASE 3 - MERGE (Following above Global) =====
+    // ===== PHASE 3: MERGE (Following above Global) =====
     const finalFeed = [
       ...followingContent,
       ...globalContent.slice(0, globalContentNeeded)
@@ -4246,9 +4296,11 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     const duration = Date.now() - startTime;
 
     console.log(`\n${'='.repeat(80)}`);
-    console.log(`[FEED-COMPLETE] Total: ${finalFeed.length} items | ${duration}ms`);
+    console.log(`[FEED-REQUEST-COMPLETE]`);
+    console.log(`  Total Items: ${finalFeed.length}`);
     console.log(`  Following: ${followingContent.length}`);
-    console.log(`  Global: ${globalContent.length}`);
+    console.log(`  Global: ${Math.min(globalContent.length, globalContentNeeded)}`);
+    console.log(`  Duration: ${duration}ms`);
     console.log(`${'='.repeat(80)}\n`);
 
     return res.json({
@@ -4273,7 +4325,7 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     });
 
   } catch (error) {
-    console.error(`[FEED-ERROR]`, error);
+    console.error(`[FEED-ERROR] ${error.message}`);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
