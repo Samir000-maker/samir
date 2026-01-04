@@ -56,14 +56,14 @@ const FOLLOWING_FEED_CONFIG = {
 
 
 const READ_LIMIT_CONFIG = {
-  MAX_SLOTS_PER_FEED: 122,           // Normal: read 3 slots
-  EMERGENCY_MAX_SLOTS: 122,          // Emergency: read up to 5 slots
-  MAX_CONTRIB_READS: 122,            // Max contrib document reads
-  MAX_FORWARD_CHECKS: 122,           // Max forward slot existence checks
-  MAX_BACKWARD_CHECKS: 122,          // Max backward slot checks
-  TOTAL_READ_BUDGET: 123,            // 1 (user_status) + 3 (slots) + 3 (contrib)
-  EMERGENCY_TOTAL_BUDGET: 125,      // Emergency budget
-  STRICT_ENFORCEMENT: false,       // Set true to throw errors on limit exceeded
+  MAX_SLOTS_PER_FEED: 4,           // Normal: read 3 slots
+  EMERGENCY_MAX_SLOTS: 4,          // Emergency: read up to 5 slots
+  MAX_CONTRIB_READS: 4,            // Max contrib document reads
+  MAX_FORWARD_CHECKS: 4,           // Max forward slot existence checks
+  MAX_BACKWARD_CHECKS: 4,          // Max backward slot checks
+  TOTAL_READ_BUDGET: 7,            // 1 (user_status) + 3 (slots) + 3 (contrib)
+  EMERGENCY_TOTAL_BUDGET: 7,      // Emergency budget
+  STRICT_ENFORCEMENT: true,       // Set true to throw errors on limit exceeded
   WARNING_THRESHOLD: 0.8           // Warn at 80% of limit
 };
 
