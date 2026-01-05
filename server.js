@@ -1413,7 +1413,7 @@ class DatabaseManager {
 constructor(db) { this.db = db; }
 
 
-async getOptimizedFeedFixedReads(userId, contentType, minContentRequired = MIN_CONTENT_FOR_FEED) {
+async getOptimizedFeedFixedReads(userId, contentType,limit, excludedIds = [], minContentRequired = MIN_CONTENT_FOR_FEED) {
   const start = Date.now();
   const isReel = contentType === 'reels';
   const collection = isReel ? 'reels' : 'posts';
@@ -2038,6 +2038,21 @@ return {
     duration
   }
 };
+
+
+  const excludedSet = new Set(excludedIds);
+  const filteredContent = allContent.filter(item => !excludedSet.has(item.postId));
+  
+  return {
+    content: filteredContent.slice(0, limit),
+    metadata: {
+      slotsRead,
+      totalScanned: allContent.length,
+      filteredOut: allContent.length - filteredContent.length
+    }
+  };
+
+
 }
 
 
