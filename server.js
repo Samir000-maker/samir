@@ -1269,7 +1269,7 @@ async function getFollowingFeed(userId, contentType = 'mixed') { // Change defau
   }
 }
 
-// Update fetchFollowingContent to handle 'mixed' type
+
 async function fetchFollowingContent(followedUserIds, viewedIds, contentType) {
   try {
     console.log(`[FOLLOWING-CONTENT-DEBUG] Fetching for ${followedUserIds.length} users | contentType=${contentType}`);
@@ -1283,7 +1283,7 @@ async function fetchFollowingContent(followedUserIds, viewedIds, contentType) {
       { 
         timeout: FOLLOWING_FEED_CONFIG.FOLLOWING_FETCH_TIMEOUT,
         params: { 
-          limit: FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_CONTENT * 2
+          limit: followedUserIds.length * 10 // Over-fetch to ensure we have options
         }
       }
     );
@@ -1295,32 +1295,42 @@ async function fetchFollowingContent(followedUserIds, viewedIds, contentType) {
 
     console.log(`[FOLLOWING-CONTENT-DEBUG] PORT 4000 returned ${response.data.content.length} items`);
 
-    // ✅ FIXED: Handle 'mixed' type
-    const filtered = response.data.content
-      .filter(item => {
-        // Type check
-        let typeMatches = false;
-        if (contentType === 'mixed') {
-          typeMatches = true; // Accept both
-        } else if (contentType === 'reels') {
-          typeMatches = item.isReel === true;
-        } else if (contentType === 'posts') {
-          typeMatches = item.isReel === false || !item.isReel;
+    // ===== CRITICAL: Group by user, take 1 per user =====
+    const contentByUser = new Map();
+    
+    response.data.content.forEach(item => {
+      const userId = item.userId || item.followedUserId;
+      
+      // Type check
+      let typeMatches = false;
+      if (contentType === 'mixed') {
+        typeMatches = true;
+      } else if (contentType === 'reels') {
+        typeMatches = item.isReel === true;
+      } else if (contentType === 'posts') {
+        typeMatches = item.isReel === false || !item.isReel;
+      }
+      
+      const notViewed = !viewedIds.has(item.postId);
+      
+      if (!typeMatches || !notViewed || !userId) {
+        return; // Skip this item
+      }
+
+      // ✅ NEW: Only keep FIRST (highest retention) item per user
+      if (!contentByUser.has(userId)) {
+        contentByUser.set(userId, item);
+      } else {
+        // Compare retention - keep higher one
+        const existing = contentByUser.get(userId);
+        if ((item.retention || 0) > (existing.retention || 0)) {
+          contentByUser.set(userId, item);
         }
-        
-        const notViewed = !viewedIds.has(item.postId);
-        
-        if (!typeMatches) {
-          console.log(`[FOLLOWING-FILTER-DEBUG] Filtered out:`, {
-            postId: item.postId?.substring(0, 10),
-            isReel: item.isReel,
-            expectedType: contentType,
-            reason: 'type_mismatch'
-          });
-        }
-        
-        return typeMatches && notViewed;
-      })
+      }
+    });
+
+    // Convert to array and sort by retention
+    const diverseContent = Array.from(contentByUser.values())
       .sort((a, b) => {
         const retentionDiff = (b.retention || 0) - (a.retention || 0);
         if (Math.abs(retentionDiff) > 1) return retentionDiff;
@@ -1332,9 +1342,15 @@ async function fetchFollowingContent(followedUserIds, viewedIds, contentType) {
       })
       .slice(0, FOLLOWING_FEED_CONFIG.MAX_FOLLOWING_CONTENT);
 
-    console.log(`[FOLLOWING-CONTENT] Fetched ${response.data.content.length}, filtered to ${filtered.length}`);
+    console.log(`[FOLLOWING-CONTENT] Fetched ${response.data.content.length}, unique users: ${contentByUser.size}, final: ${diverseContent.length}`);
     
-    return filtered;
+    // Log user distribution
+    const userDistribution = diverseContent.map(item => 
+      (item.userId || item.followedUserId)?.substring(0, 8)
+    ).join(', ');
+    console.log(`[FOLLOWING-DIVERSITY] Users: [${userDistribution}]`);
+    
+    return diverseContent;
 
   } catch (error) {
     console.error(`[FOLLOWING-CONTENT-ERROR]`, error.message);
