@@ -3222,6 +3222,71 @@ res.status(500).json({ error: 'Failed to sync metrics' });
 });
 
 
+
+app.post('/api/sync/batch-metrics-from-4000', async (req, res) => {
+  try {
+    const { metrics } = req.body;
+
+    if (!metrics || typeof metrics !== 'object') {
+      return res.status(400).json({ error: 'metrics object required' });
+    }
+
+    console.log(`[BATCH-SYNC-RECEIVE] Processing ${Object.keys(metrics).length} items`);
+
+    const bulkOps = {
+      reels: [],
+      posts: []
+    };
+
+    for (const [postId, data] of Object.entries(metrics)) {
+      const { isReel, likeCount, commentCount, viewCount, retention } = data;
+      const collection = isReel ? 'reels' : 'posts';
+      const arrayField = isReel ? 'reelsList' : 'postList';
+
+      bulkOps[collection].push({
+        updateOne: {
+          filter: { [`${arrayField}.postId`]: postId },
+          update: {
+            $set: {
+              [`${arrayField}.$.likeCount`]: likeCount || 0,
+              [`${arrayField}.$.commentCount`]: commentCount || 0,
+              [`${arrayField}.$.viewCount`]: viewCount || 0,
+              [`${arrayField}.$.retention`]: retention || 0,
+              [`${arrayField}.$.lastSynced`]: new Date().toISOString()
+            }
+          }
+        }
+      });
+    }
+
+    let totalUpdated = 0;
+
+    // Execute bulk operations
+    for (const [collection, ops] of Object.entries(bulkOps)) {
+      if (ops.length > 0) {
+        try {
+          const result = await db.collection(collection).bulkWrite(ops, { ordered: false });
+          totalUpdated += result.modifiedCount;
+          console.log(`[BATCH-SYNC-${collection.toUpperCase()}] Modified: ${result.modifiedCount}/${ops.length}`);
+        } catch (error) {
+          console.error(`[BATCH-SYNC-${collection.toUpperCase()}-ERROR]`, error.message);
+        }
+      }
+    }
+
+    return res.json({
+      success: true,
+      updated: totalUpdated,
+      total: Object.keys(metrics).length
+    });
+
+  } catch (error) {
+    console.error('[BATCH-SYNC-RECEIVE-ERROR]', error.message);
+    return res.status(500).json({ error: 'Failed to sync metrics' });
+  }
+});
+
+
 // Personalized reels feed with interest-based ranking
 app.post('/api/feed/reels-personalized', async (req, res) => {
 try {
