@@ -3009,6 +3009,64 @@ return res.status(500).json({ error: 'Failed to check retention contribution' })
 });
 
 
+app.post('/api/sync/retention-metrics', async (req, res) => {
+  try {
+    const { postId, metrics, isReel, timestamp } = req.body;
+
+    if (!postId || !metrics) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'postId and metrics required' 
+      });
+    }
+
+    console.log(`[RETENTION-SYNC-RECEIVE] ${postId} | retention=${metrics.retention}% | isReel=${isReel}`);
+
+    const collection = isReel ? 'reels' : 'posts';
+    const arrayField = isReel ? 'reelsList' : 'postList';
+
+    // Update retention in user_slots collection
+    const updateResult = await db.collection('user_slots').updateOne(
+      { [`${arrayField}.postId`]: postId },
+      {
+        $set: {
+          [`${arrayField}.$.retention`]: metrics.retention || 0,
+          [`${arrayField}.$.viewCount`]: metrics.viewCount || 0,
+          [`${arrayField}.$.likeCount`]: metrics.likeCount || 0,
+          [`${arrayField}.$.commentCount`]: metrics.commentCount || 0,
+          [`${arrayField}.$.lastSynced`]: timestamp || new Date().toISOString()
+        }
+      }
+    );
+
+    if (updateResult.matchedCount === 0) {
+      console.warn(`[RETENTION-SYNC-NOT-FOUND] ${postId} not found in user_slots`);
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Post not found in user_slots' 
+      });
+    }
+
+    console.log(`[RETENTION-SYNC-SUCCESS] ${postId} updated in user_slots | matched=${updateResult.matchedCount}, modified=${updateResult.modifiedCount}`);
+
+    return res.json({
+      success: true,
+      message: 'Retention synced successfully',
+      postId,
+      matched: updateResult.matchedCount,
+      modified: updateResult.modifiedCount
+    });
+
+  } catch (error) {
+    console.error('[RETENTION-SYNC-ERROR]', error);
+    return res.status(500).json({ 
+      success: false, 
+      error: 'Failed to sync retention' 
+    });
+  }
+});
+
+
 
 // ✅ REPLACE: Read-only status (no manual updates)
 app.post('/api/user-status/exit-update/:userId', async (req, res) => {
