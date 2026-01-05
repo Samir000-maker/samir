@@ -1904,22 +1904,28 @@ slotsToRead = [...new Set(case6Slots)].slice(0, READ_LIMIT_CONFIG.MAX_SLOTS_PER_
   console.log(`\n[PHASE-5] INTEREST FILTERING`);
   
   
-  // ====================================================================
-  // PHASE 5: MULTI-TIER CONTENT FILTERING (Interest → Engagement → Remaining)
-  // ====================================================================
-  console.log(`\n[PHASE-5] MULTI-TIER CONTENT FILTERING`);
+// ===== PHASE 5: MULTI-TIER CONTENT FILTERING (Interest → Engagement → Remaining) =====
+console.log(`\n[PHASE-5] MULTI-TIER CONTENT FILTERING`);
 
 console.log(`\n[PHASE-5] ADAPTIVE CONTENT FILTERING (Target: ${minContentRequired} items)`);
 
 let allContent = [];
 let totalItemsBeforeFilter = 0;
+let viewedItemsSkipped = 0;  // ✅ ADD THIS
 
-// ✅ STEP 1: Collect ALL non-viewed content with engagement scores
+// ✅ STEP 1: Collect ALL content FIRST, then filter viewed separately
 for (const { slotId, content } of slotContents) {
   totalItemsBeforeFilter += content.length;
   
   for (const item of content) {
-    if (viewedIds.has(item.postId)) continue;
+    // ✅ CRITICAL FIX: Don't skip here - collect ALL items first
+    const isViewed = viewedIds.has(item.postId);
+    
+    if (isViewed) {
+      viewedItemsSkipped++;
+      console.log(`[FILTER-VIEWED] Skipping ${item.postId.substring(0, 8)} - already viewed`);
+      continue;  // ✅ Now we track why we're skipping
+    }
     
     const hasCategory = item.category && typeof item.category === 'string' && item.category.trim() !== '';
     const categoryMatches = hasCategory && userInterests.length > 0 && userInterests.includes(item.category);
