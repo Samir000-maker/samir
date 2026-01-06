@@ -185,100 +185,70 @@ const getOrCreateRequest = (key, requestFactory) => {
 
   
 
-// CRITICAL: Enhanced logging with collection scan detection
 function logDbOp(op, col, query = {}, result = null, time = 0, options = {}) {
-const ts = new Date().toISOString();
-let queryStr = '';
-let scanWarning = '';
-
-// Format query string
-if (op.toLowerCase() === 'aggregate' && query.pipeline) {
-if (typeof query.pipeline === 'string') {
-queryStr = query.pipeline;
-} else if (Array.isArray(query.pipeline)) {
-const stages = query.pipeline.slice(0, 2).map(stage => {
-const key = Object.keys(stage)[0];
-return `{${key}}`;
-}).join(' -> ');
-queryStr = `[${stages}${query.pipeline.length > 2 ? ' ...' : ''}]`;
-}
-} else {
-queryStr = JSON.stringify(query).length > 100
-? JSON.stringify(query).substring(0, 100) + '...'
-: JSON.stringify(query);
-}
-
-// CRITICAL: Detect collection scans (potential performance issues)
-let docsScanned = 0;
-let docsReturned = 0;
-let isCollectionScan = false;
-
-if (Array.isArray(result)) {
-docsReturned = result.length;
-docsScanned = options.docsExamined || result.length; // Will be passed from explain()
-
-// WARN: If query has no indexed fields, it's likely a collection scan
-if (!query._id && !Object.keys(query).some(k => k.includes('userId') || k.includes('postId'))) {
-isCollectionScan = true;
-scanWarning = '⚠️ POSSIBLE COLLECTION SCAN';
-}
-} else if (result?.matchedCount !== undefined) {
-docsScanned = result.matchedCount;
-docsReturned = result.modifiedCount || 0;
-} else if (result?.insertedId) {
-docsScanned = 1;
-docsReturned = 1;
-} else if (result !== null && typeof result === 'object') {
-docsScanned = 1;
-docsReturned = 1;
-}
-
-// Build result info with document details
-let resultInfo = '';
-if (docsReturned > 0 || docsScanned > 0) {
-resultInfo = ` | scanned: ${docsScanned} docs, returned: ${docsReturned} docs`;
-
-// Log document IDs for small result sets
-if (Array.isArray(result) && result.length <= 3 && result.length > 0) {
-const docIds = result.map(r => r._id || 'no-id').join(', ');
-resultInfo += ` | docs: [${docIds}]`;
-}
-}
-
-// CRITICAL: Log with enhanced details
-console.log(`[DB-${op.toUpperCase()}] ${ts} | ${col}${resultInfo} | query: ${queryStr} | ${time}ms${scanWarning}`);
-
-// **UPDATE COUNTERS AFTER LOGGING (not before)**
-const opLower = op.toLowerCase();
-if (['find', 'findone', 'count'].includes(opLower)) {
-dbOpCounters.reads += docsScanned || 1; // Count actual docs scanned
-dbOpCounters.queries++;
-}
-else if (opLower === 'aggregate') {
-dbOpCounters.reads += docsScanned || 1;
-dbOpCounters.aggregations++;
-}
-else if (['insertone', 'insertmany'].includes(opLower)) {
-dbOpCounters.writes += docsReturned || 1;
-dbOpCounters.inserts++;
-}
-else if (['updateone', 'updatemany', 'findoneandupdate', 'bulkwrite'].includes(opLower)) {
-dbOpCounters.writes += docsScanned || 1; // Writes = docs matched
-dbOpCounters.updates++;
-}
-else if (['deleteone', 'deletemany'].includes(opLower)) {
-dbOpCounters.writes += docsScanned || 1;
-dbOpCounters.deletes++;
-}
-
-// CRITICAL SCALE WARNING
-if (docsScanned > 100) {
-console.warn(`⚠️ [SCALE-WARNING] ${col}.${op} scanned ${docsScanned} documents - may cause issues at scale!`);
-}
-
-if (isCollectionScan && docsScanned > 10) {
-console.error(`🚨 [CRITICAL-SCAN] ${col}.${op} performed COLLECTION SCAN on ${docsScanned} docs - NEEDS INDEX!`);
-}
+  const ts = new Date().toISOString();
+  let docsScanned = 0;
+  let docsReturned = 0;
+  
+  // Calculate actual documents scanned and returned
+  if (Array.isArray(result)) {
+    docsReturned = result.length;
+    docsScanned = options.docsExamined || result.length;
+    
+    // Log exact document IDs being read
+    if (docsReturned > 0 && docsReturned <= 5) {
+      const docIds = result.map(r => r._id || 'no-id').join(', ');
+      console.log(`[samir_mongo_debug] DOCUMENTS READ | Collection: ${col} | Count: ${docsReturned} | IDs: [${docIds}]`);
+    } else if (docsReturned > 5) {
+      const docIds = result.slice(0, 5).map(r => r._id || 'no-id').join(', ');
+      console.log(`[samir_mongo_debug] DOCUMENTS READ | Collection: ${col} | Count: ${docsReturned} | Sample IDs: [${docIds}...]`);
+    }
+  } else if (result?.matchedCount !== undefined) {
+    docsScanned = result.matchedCount;
+    docsReturned = result.modifiedCount || 0;
+  } else if (result?.insertedId) {
+    docsScanned = 1;
+    docsReturned = 1;
+  } else if (result !== null && typeof result === 'object') {
+    docsScanned = 1;
+    docsReturned = 1;
+    
+    // Log exact document ID
+    if (result._id) {
+      console.log(`[samir_mongo_debug] DOCUMENTS READ | Collection: ${col} | Count: 1 | ID: ${result._id}`);
+    }
+  }
+  
+  // Update counters
+  const opLower = op.toLowerCase();
+  if (['find', 'findone', 'count'].includes(opLower)) {
+    dbOpCounters.reads += docsScanned || 1;
+    dbOpCounters.queries++;
+  } else if (opLower === 'aggregate') {
+    dbOpCounters.reads += docsScanned || 1;
+    dbOpCounters.aggregations++;
+  } else if (['insertone', 'insertmany'].includes(opLower)) {
+    dbOpCounters.writes += docsReturned || 1;
+    dbOpCounters.inserts++;
+  } else if (['updateone', 'updatemany', 'findoneandupdate', 'bulkwrite'].includes(opLower)) {
+    dbOpCounters.writes += docsScanned || 1;
+    dbOpCounters.updates++;
+  } else if (['deleteone', 'deletemany'].includes(opLower)) {
+    dbOpCounters.writes += docsScanned || 1;
+    dbOpCounters.deletes++;
+  }
+  
+  // Detect collection scans
+  const hasIndexableQuery = query._id || Object.keys(query).some(k => 
+    k.includes('userId') || k.includes('postId') || k.includes('slotId')
+  );
+  
+  if (!hasIndexableQuery && docsScanned > 10) {
+    console.warn(`[samir_mongo_debug] ⚠️ POSSIBLE FULL COLLECTION SCAN | Collection: ${col} | Operation: ${op} | Documents Scanned: ${docsScanned}`);
+  }
+  
+  // Log operation summary
+  console.log(`[DB-${op.toUpperCase()}] ${ts} | ${col} | scanned: ${docsScanned} docs, returned: ${docsReturned} docs | ${time}ms`);
 }
 
 // Cache helpers
@@ -341,6 +311,92 @@ app.use('/api', rateLimit({ windowMs: 1000, max: 1000, standardHeaders: true, le
 
 app.use(express.json());
 
+
+
+
+// ===== NODE.JS SERVER PERFORMANCE MONITORING =====
+const serverMetrics = {
+  totalRequests: 0,
+  getRequests: 0,
+  postRequests: 0,
+  endpointCounts: {},
+  startTime: Date.now()
+};
+
+// Replace your existing request metrics middleware with this enhanced version
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  
+  // Track request
+  serverMetrics.totalRequests++;
+  
+  if (req.method === 'GET') {
+    serverMetrics.getRequests++;
+  } else if (req.method === 'POST') {
+    serverMetrics.postRequests++;
+  }
+  
+  const endpoint = `${req.method} ${req.originalUrl.split('?')[0]}`;
+  serverMetrics.endpointCounts[endpoint] = (serverMetrics.endpointCounts[endpoint] || 0) + 1;
+  
+  console.log(`[samir_server_debug] REQUEST | Method: ${req.method} | Endpoint: ${req.originalUrl} | Total Requests: ${serverMetrics.totalRequests}`);
+  
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    console.log(`[samir_server_debug] RESPONSE | Method: ${req.method} | Endpoint: ${req.originalUrl} | Status: ${res.statusCode} | Duration: ${duration}ms`);
+  });
+  
+  next();
+});
+
+// Print server summary every 30 seconds
+setInterval(() => {
+  const uptime = Math.floor((Date.now() - serverMetrics.startTime) / 1000);
+  const memUsage = process.memoryUsage();
+  const cpuUsage = process.cpuUsage();
+  
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`[samir_server_debug] NODE.JS SERVER SUMMARY`);
+  console.log(`${'='.repeat(80)}`);
+  
+  console.log(`\n[samir_server_debug] REQUEST METRICS:`);
+  console.log(`[samir_server_debug]   Total Requests: ${serverMetrics.totalRequests}`);
+  console.log(`[samir_server_debug]   GET Requests: ${serverMetrics.getRequests}`);
+  console.log(`[samir_server_debug]   POST Requests: ${serverMetrics.postRequests}`);
+  console.log(`[samir_server_debug]   Requests/Second: ${(serverMetrics.totalRequests / uptime).toFixed(2)}`);
+  
+  console.log(`\n[samir_server_debug] TOP ENDPOINTS:`);
+  const sortedEndpoints = Object.entries(serverMetrics.endpointCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10);
+  
+  sortedEndpoints.forEach(([endpoint, count]) => {
+    console.log(`[samir_server_debug]   ${endpoint}: ${count} requests`);
+  });
+  
+  console.log(`\n[samir_server_debug] SERVER RESOURCES:`);
+  console.log(`[samir_server_debug]   CPU User Time: ${(cpuUsage.user / 1000000).toFixed(2)}s`);
+  console.log(`[samir_server_debug]   CPU System Time: ${(cpuUsage.system / 1000000).toFixed(2)}s`);
+  console.log(`[samir_server_debug]   RAM Heap Used: ${(memUsage.heapUsed / 1024 / 1024).toFixed(2)} MB`);
+  console.log(`[samir_server_debug]   RAM Heap Total: ${(memUsage.heapTotal / 1024 / 1024).toFixed(2)} MB`);
+  console.log(`[samir_server_debug]   RAM External: ${(memUsage.external / 1024 / 1024).toFixed(2)} MB`);
+  console.log(`[samir_server_debug]   Uptime: ${Math.floor(uptime / 60)} minutes`);
+  
+  // System pressure indicator
+  const heapUsagePercent = (memUsage.heapUsed / memUsage.heapTotal) * 100;
+  
+  if (heapUsagePercent > 85) {
+    console.warn(`[samir_server_debug]   ⚠️ System Pressure: CRITICAL - Heap usage at ${heapUsagePercent.toFixed(1)}% - Upgrade server instance NOW`);
+  } else if (heapUsagePercent > 70) {
+    console.warn(`[samir_server_debug]   ⚠️ System Pressure: HIGH - Heap usage at ${heapUsagePercent.toFixed(1)}% - Consider upgrading server instance`);
+  } else if (heapUsagePercent > 50) {
+    console.log(`[samir_server_debug]   System Pressure: MODERATE - Heap usage at ${heapUsagePercent.toFixed(1)}% - Monitor closely`);
+  } else {
+    console.log(`[samir_server_debug]   ✅ System Pressure: LOW - Heap usage at ${heapUsagePercent.toFixed(1)}% - System healthy`);
+  }
+  
+  console.log(`${'='.repeat(80)}\n`);
+}, 10000);
 
 
 app.use(compression({
@@ -593,6 +649,147 @@ async function initMongo() {
 
   console.log('[MONGO-INIT] ✅ Initialization complete');
 }
+
+
+// ===== MONGODB PERFORMANCE MONITORING =====
+let mongoMetrics = {
+  reads: {},
+  writes: {},
+  fullScans: new Set(),
+  totalReads: 0,
+  totalWrites: 0
+};
+
+// Monitor MongoDB command events
+client.on('commandStarted', (event) => {
+  const { commandName, command, databaseName } = event;
+  const collectionName = command[commandName] || command.collection;
+  
+  if (!collectionName) return;
+  
+  // Track read operations
+  if (['find', 'findOne', 'aggregate', 'count', 'distinct'].includes(commandName)) {
+    if (!mongoMetrics.reads[collectionName]) {
+      mongoMetrics.reads[collectionName] = 0;
+    }
+    mongoMetrics.reads[collectionName]++;
+    mongoMetrics.totalReads++;
+    
+    console.log(`[samir_mongo_debug] READ | Collection: ${collectionName} | Operation: ${commandName} | Filter: ${JSON.stringify(command.filter || command.pipeline?.[0] || {}).substring(0, 100)}`);
+  }
+  
+  // Track write operations
+  if (['insert', 'insertOne', 'insertMany', 'update', 'updateOne', 'updateMany', 'delete', 'deleteOne', 'deleteMany', 'bulkWrite'].includes(commandName)) {
+    if (!mongoMetrics.writes[collectionName]) {
+      mongoMetrics.writes[collectionName] = 0;
+    }
+    mongoMetrics.writes[collectionName]++;
+    mongoMetrics.totalWrites++;
+    
+    console.log(`[samir_mongo_debug] WRITE | Collection: ${collectionName} | Operation: ${commandName}`);
+  }
+});
+
+client.on('commandSucceeded', async (event) => {
+  const { commandName, reply, databaseName } = event;
+  
+  // Detect full collection scans
+  if (commandName === 'find' || commandName === 'aggregate') {
+    try {
+      const collectionName = event.command[commandName] || event.command.collection;
+      
+      // Check if executionStats are available in reply
+      if (reply.cursor && reply.cursor.firstBatch) {
+        const docsReturned = reply.cursor.firstBatch.length;
+        
+        // Log actual documents being read
+        if (docsReturned > 0) {
+          const docIds = reply.cursor.firstBatch
+            .slice(0, 5)
+            .map(doc => doc._id)
+            .join(', ');
+          
+          console.log(`[samir_mongo_debug] DOCUMENTS READ | Collection: ${collectionName} | Count: ${docsReturned} | Sample IDs: [${docIds}${docsReturned > 5 ? '...' : ''}]`);
+        }
+        
+        // Detect full scan (when no filter or index is used)
+        const hasFilter = event.command.filter && Object.keys(event.command.filter).length > 0;
+        const hasSort = event.command.sort && Object.keys(event.command.sort).length > 0;
+        
+        if (!hasFilter && !hasSort && docsReturned > 10) {
+          mongoMetrics.fullScans.add(collectionName);
+          console.warn(`[samir_mongo_debug] ⚠️ FULL COLLECTION SCAN DETECTED | Collection: ${collectionName} | Documents: ${docsReturned}`);
+        } else {
+          console.log(`[samir_mongo_debug] ✅ no full collection scan to [${collectionName}]`);
+        }
+      }
+    } catch (err) {
+      // Silent fail - don't break the app
+    }
+  }
+});
+
+// Print MongoDB summary every 30 seconds
+setInterval(() => {
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`[samir_mongo_debug] MONGODB SUMMARY`);
+  console.log(`${'='.repeat(80)}`);
+  
+  console.log(`\n[samir_mongo_debug] READ OPERATIONS:`);
+  for (const [collection, count] of Object.entries(mongoMetrics.reads)) {
+    console.log(`[samir_mongo_debug]   ${collection}: ${count} reads`);
+  }
+  
+  console.log(`\n[samir_mongo_debug] WRITE OPERATIONS:`);
+  for (const [collection, count] of Object.entries(mongoMetrics.writes)) {
+    console.log(`[samir_mongo_debug]   ${collection}: ${count} writes`);
+  }
+  
+  console.log(`\n[samir_mongo_debug] total reads: ${mongoMetrics.totalReads}`);
+  console.log(`[samir_mongo_debug] total writes: ${mongoMetrics.totalWrites}`);
+  
+  if (mongoMetrics.fullScans.size > 0) {
+    console.warn(`[samir_mongo_debug] ⚠️ full collection scan happens to [${Array.from(mongoMetrics.fullScans).join(', ')}]`);
+  } else {
+    console.log(`[samir_mongo_debug] ✅ no full collection scan to any collections`);
+  }
+  
+  // MongoDB resource usage (requires admin access)
+  try {
+    db.admin().serverStatus().then(status => {
+      const memUsageMB = (status.mem?.resident || 0);
+      const connections = status.connections?.current || 0;
+      
+      console.log(`\n[samir_mongo_debug] MONGODB RESOURCES:`);
+      console.log(`[samir_mongo_debug]   RAM Usage: ${memUsageMB} MB`);
+      console.log(`[samir_mongo_debug]   Active Connections: ${connections}`);
+      
+      // System pressure indicator
+      if (mongoMetrics.totalReads > 1000 || mongoMetrics.totalWrites > 500) {
+        console.warn(`[samir_mongo_debug]   ⚠️ System Pressure: HIGH - Consider scaling MongoDB`);
+      } else if (mongoMetrics.totalReads > 500 || mongoMetrics.totalWrites > 200) {
+        console.log(`[samir_mongo_debug]   System Pressure: MODERATE - Monitor closely`);
+      } else {
+        console.log(`[samir_mongo_debug]   System Pressure: LOW - System healthy`);
+      }
+    }).catch(() => {
+      console.log(`[samir_mongo_debug]   Resource monitoring unavailable (requires admin access)`);
+    });
+  } catch (err) {
+    console.log(`[samir_mongo_debug]   Resource monitoring unavailable`);
+  }
+  
+  console.log(`${'='.repeat(80)}\n`);
+  
+  // Reset metrics for next interval
+  mongoMetrics = {
+    reads: {},
+    writes: {},
+    fullScans: new Set(),
+    totalReads: 0,
+    totalWrites: 0
+  };
+}, 10000);
 
 
 async function createContribIndexes() {
@@ -2704,13 +2901,24 @@ const getOrSetCache = async (key, fetchFunction, ttl = 30000) => {
 
 
 async function start() {
-console.log('[SERVER-START] Initializing...');
-await initMongo();
-await initializeSlots(); // ← ADD THIS LINE
-await ensurePostIdUniqueness();
-await initRedis();
-dbManager = new DatabaseManager(db);
-console.log('[SERVER-START] Ready');
+  console.log('[SERVER-START] Initializing...');
+  await initMongo();
+  await initializeSlots();
+  await ensurePostIdUniqueness();
+  await initRedis();
+  dbManager = new DatabaseManager(db);
+  console.log('[SERVER-START] Ready');
+  
+  // ===== MONITORING STARTUP SUMMARY =====
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`[samir_server_debug] MONITORING SYSTEM INITIALIZED`);
+  console.log(`[samir_mongo_debug] MONITORING SYSTEM INITIALIZED`);
+  console.log(`${'='.repeat(80)}`);
+  console.log(`[samir_server_debug] Server metrics will be logged every 30 seconds`);
+  console.log(`[samir_mongo_debug] MongoDB metrics will be logged every 30 seconds`);
+  console.log(`[samir_server_debug] Real-time request logs: ENABLED`);
+  console.log(`[samir_mongo_debug] Real-time query logs: ENABLED`);
+  console.log(`${'='.repeat(80)}\n`);
 }
 
 start().catch(err => { console.error('[SERVER-START-ERROR]', err); process.exit(1); });
