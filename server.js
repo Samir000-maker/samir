@@ -580,6 +580,87 @@ async function initMongo() {
     // ✅ NEW: 2024 MongoDB driver features
     serverMonitoringMode: 'stream',     // Faster health checks
   });
+  
+  
+    const mongoMetrics = {
+    reads: {},
+    writes: {},
+    fullScans: new Set(),
+    totalReads: 0,
+    totalWrites: 0
+  };
+
+  // Monitor MongoDB command events
+  client.on('commandStarted', (event) => {
+    const { commandName, command } = event;
+    const collectionName = command[commandName] || command.collection;
+    
+    if (!collectionName) return;
+    
+    // Track read operations
+    if (['find', 'findOne', 'aggregate', 'count', 'distinct'].includes(commandName)) {
+      if (!mongoMetrics.reads[collectionName]) {
+        mongoMetrics.reads[collectionName] = 0;
+      }
+      mongoMetrics.reads[collectionName]++;
+      mongoMetrics.totalReads++;
+      
+      const filterStr = JSON.stringify(command.filter || command.pipeline?.[0] || {}).substring(0, 100);
+      console.log(`[samir_mongo_debug] READ | Collection: ${collectionName} | Operation: ${commandName} | Filter: ${filterStr}`);
+    }
+    
+    // Track write operations
+    if (['insert', 'insertOne', 'insertMany', 'update', 'updateOne', 'updateMany', 'delete', 'deleteOne', 'deleteMany', 'bulkWrite'].includes(commandName)) {
+      if (!mongoMetrics.writes[collectionName]) {
+        mongoMetrics.writes[collectionName] = 0;
+      }
+      mongoMetrics.writes[collectionName]++;
+      mongoMetrics.totalWrites++;
+      
+      console.log(`[samir_mongo_debug] WRITE | Collection: ${collectionName} | Operation: ${commandName}`);
+    }
+  });
+
+  client.on('commandSucceeded', (event) => {
+    const { commandName, reply } = event;
+    
+    // Detect full collection scans and log documents
+    if (commandName === 'find' || commandName === 'aggregate') {
+      try {
+        const collectionName = event.command[commandName] || event.command.collection;
+        
+        if (reply.cursor && reply.cursor.firstBatch) {
+          const docsReturned = reply.cursor.firstBatch.length;
+          
+          // Log actual documents being read
+          if (docsReturned > 0) {
+            const docIds = reply.cursor.firstBatch
+              .slice(0, 5)
+              .map(doc => doc._id)
+              .join(', ');
+            
+            console.log(`[samir_mongo_debug] DOCUMENTS READ | Collection: ${collectionName} | Count: ${docsReturned} | Sample IDs: [${docIds}${docsReturned > 5 ? '...' : ''}]`);
+          }
+          
+          // Detect full scan
+          const hasFilter = event.command.filter && Object.keys(event.command.filter).length > 0;
+          const hasSort = event.command.sort && Object.keys(event.command.sort).length > 0;
+          
+          if (!hasFilter && !hasSort && docsReturned > 10) {
+            mongoMetrics.fullScans.add(collectionName);
+            console.warn(`[samir_mongo_debug] ⚠️ FULL COLLECTION SCAN DETECTED | Collection: ${collectionName} | Documents: ${docsReturned}`);
+          } else if (docsReturned > 0) {
+            console.log(`[samir_mongo_debug] ✅ no full collection scan to [${collectionName}]`);
+          }
+        }
+      } catch (err) {
+        // Silent fail
+      }
+    }
+  });
+
+  // Store metrics globally for summary
+  global.mongoMetrics = mongoMetrics;
 
   console.log(`[MONGO-INIT] Compression: ${compressors.join(', ')}`);
   console.log('[MONGO-INIT] Connecting with production-optimized settings...');
@@ -2903,13 +2984,85 @@ const getOrSetCache = async (key, fetchFunction, ttl = 30000) => {
 async function start() {
   console.log('[SERVER-START] Initializing...');
   await initMongo();
+  
+  // ===== START MONGODB SUMMARY LOGGING (ADD THIS AFTER initMongo) =====
+  setInterval(() => {
+    if (!global.mongoMetrics) return;
+    
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`[samir_mongo_debug] MONGODB SUMMARY`);
+    console.log(`${'='.repeat(80)}`);
+    
+    console.log(`\n[samir_mongo_debug] READ OPERATIONS:`);
+    if (Object.keys(global.mongoMetrics.reads).length === 0) {
+      console.log(`[samir_mongo_debug]   No read operations in this period`);
+    } else {
+      for (const [collection, count] of Object.entries(global.mongoMetrics.reads)) {
+        console.log(`[samir_mongo_debug]   ${collection}: ${count} reads`);
+      }
+    }
+    
+    console.log(`\n[samir_mongo_debug] WRITE OPERATIONS:`);
+    if (Object.keys(global.mongoMetrics.writes).length === 0) {
+      console.log(`[samir_mongo_debug]   No write operations in this period`);
+    } else {
+      for (const [collection, count] of Object.entries(global.mongoMetrics.writes)) {
+        console.log(`[samir_mongo_debug]   ${collection}: ${count} writes`);
+      }
+    }
+    
+    console.log(`\n[samir_mongo_debug] total reads: ${global.mongoMetrics.totalReads}`);
+    console.log(`[samir_mongo_debug] total writes: ${global.mongoMetrics.totalWrites}`);
+    
+    if (global.mongoMetrics.fullScans.size > 0) {
+      console.warn(`[samir_mongo_debug] ⚠️ full collection scan happens to [${Array.from(global.mongoMetrics.fullScans).join(', ')}]`);
+    } else {
+      console.log(`[samir_mongo_debug] ✅ no full collection scan to any collections`);
+    }
+    
+    // MongoDB resource usage
+    try {
+      db.admin().serverStatus().then(status => {
+        const memUsageMB = (status.mem?.resident || 0);
+        const connections = status.connections?.current || 0;
+        
+        console.log(`\n[samir_mongo_debug] MONGODB RESOURCES:`);
+        console.log(`[samir_mongo_debug]   RAM Usage: ${memUsageMB} MB`);
+        console.log(`[samir_mongo_debug]   Active Connections: ${connections}`);
+        
+        const { totalReads, totalWrites } = global.mongoMetrics;
+        if (totalReads > 1000 || totalWrites > 500) {
+          console.warn(`[samir_mongo_debug]   ⚠️ System Pressure: HIGH - Consider scaling MongoDB`);
+        } else if (totalReads > 500 || totalWrites > 200) {
+          console.log(`[samir_mongo_debug]   System Pressure: MODERATE - Monitor closely`);
+        } else {
+          console.log(`[samir_mongo_debug]   ✅ System Pressure: LOW - System healthy`);
+        }
+      }).catch(() => {
+        console.log(`[samir_mongo_debug]   Resource monitoring unavailable (requires admin access)`);
+      });
+    } catch (err) {
+      console.log(`[samir_mongo_debug]   Resource monitoring unavailable`);
+    }
+    
+    console.log(`${'='.repeat(80)}\n`);
+    
+    // Reset metrics
+    global.mongoMetrics.reads = {};
+    global.mongoMetrics.writes = {};
+    global.mongoMetrics.fullScans = new Set();
+    global.mongoMetrics.totalReads = 0;
+    global.mongoMetrics.totalWrites = 0;
+  }, 30000);
+  // ===== END MONGODB SUMMARY LOGGING =====
+  
   await initializeSlots();
   await ensurePostIdUniqueness();
   await initRedis();
   dbManager = new DatabaseManager(db);
   console.log('[SERVER-START] Ready');
   
-  // ===== MONITORING STARTUP SUMMARY =====
+  // Add startup summary
   console.log(`\n${'='.repeat(80)}`);
   console.log(`[samir_server_debug] MONITORING SYSTEM INITIALIZED`);
   console.log(`[samir_mongo_debug] MONITORING SYSTEM INITIALIZED`);
