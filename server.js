@@ -56,13 +56,13 @@ const FOLLOWING_FEED_CONFIG = {
 
 
 const READ_LIMIT_CONFIG = {
-  MAX_SLOTS_PER_FEED: 4,           // Normal: read 3 slots
-  EMERGENCY_MAX_SLOTS: 4,          // Emergency: read up to 5 slots
-  MAX_CONTRIB_READS: 4,            // Max contrib document reads
-  MAX_FORWARD_CHECKS: 4,           // Max forward slot existence checks
-  MAX_BACKWARD_CHECKS: 4,          // Max backward slot checks
-  TOTAL_READ_BUDGET: 7,            // 1 (user_status) + 3 (slots) + 3 (contrib)
-  EMERGENCY_TOTAL_BUDGET: 7,      // Emergency budget
+  MAX_SLOTS_PER_FEED: 3,           // Normal: read 3 slots
+  EMERGENCY_MAX_SLOTS: 3,          // Emergency: read up to 5 slots
+  MAX_CONTRIB_READS: 3,            // Max contrib document reads
+  MAX_FORWARD_CHECKS: 3,           // Max forward slot existence checks
+  MAX_BACKWARD_CHECKS: 3,          // Max backward slot checks
+  TOTAL_READ_BUDGET: 5,            // 1 (user_status) + 3 (slots) + 3 (contrib)
+  EMERGENCY_TOTAL_BUDGET: 5,      // Emergency budget
   STRICT_ENFORCEMENT: true,       // Set true to throw errors on limit exceeded
   WARNING_THRESHOLD: 0.8           // Warn at 80% of limit
 };
@@ -76,9 +76,9 @@ console.log('[EXTERNAL-PORTS] 4000:', PORT_4000_URL, '| 5000:', PORT_5000_URL);
 
 
 // ===== CONFIGURATION VARIABLES - MODIFY THESE TO CHANGE SYSTEM BEHAVIOR =====
-const MAX_CONTENT_PER_SLOT = 100; // Maximum content items per document before creating new slot
-const DEFAULT_CONTENT_BATCH_SIZE = 200; // Default number of items to return per request
-const MIN_CONTENT_FOR_FEED = 200; // Minimum content required for feed requests
+const MAX_CONTENT_PER_SLOT = 2; // Maximum content items per document before creating new slot
+const DEFAULT_CONTENT_BATCH_SIZE = 10; // Default number of items to return per request
+const MIN_CONTENT_FOR_FEED = 10; // Minimum content required for feed requests
 // ============================================================================
 
 console.log('[CONFIG] System Configuration:');
@@ -730,6 +730,147 @@ async function initMongo() {
 
   console.log('[MONGO-INIT] ✅ Initialization complete');
 }
+
+
+// ===== MONGODB PERFORMANCE MONITORING =====
+let mongoMetrics = {
+  reads: {},
+  writes: {},
+  fullScans: new Set(),
+  totalReads: 0,
+  totalWrites: 0
+};
+
+// Monitor MongoDB command events
+client.on('commandStarted', (event) => {
+  const { commandName, command, databaseName } = event;
+  const collectionName = command[commandName] || command.collection;
+  
+  if (!collectionName) return;
+  
+  // Track read operations
+  if (['find', 'findOne', 'aggregate', 'count', 'distinct'].includes(commandName)) {
+    if (!mongoMetrics.reads[collectionName]) {
+      mongoMetrics.reads[collectionName] = 0;
+    }
+    mongoMetrics.reads[collectionName]++;
+    mongoMetrics.totalReads++;
+    
+    console.log(`[samir_mongo_debug] READ | Collection: ${collectionName} | Operation: ${commandName} | Filter: ${JSON.stringify(command.filter || command.pipeline?.[0] || {}).substring(0, 100)}`);
+  }
+  
+  // Track write operations
+  if (['insert', 'insertOne', 'insertMany', 'update', 'updateOne', 'updateMany', 'delete', 'deleteOne', 'deleteMany', 'bulkWrite'].includes(commandName)) {
+    if (!mongoMetrics.writes[collectionName]) {
+      mongoMetrics.writes[collectionName] = 0;
+    }
+    mongoMetrics.writes[collectionName]++;
+    mongoMetrics.totalWrites++;
+    
+    console.log(`[samir_mongo_debug] WRITE | Collection: ${collectionName} | Operation: ${commandName}`);
+  }
+});
+
+client.on('commandSucceeded', async (event) => {
+  const { commandName, reply, databaseName } = event;
+  
+  // Detect full collection scans
+  if (commandName === 'find' || commandName === 'aggregate') {
+    try {
+      const collectionName = event.command[commandName] || event.command.collection;
+      
+      // Check if executionStats are available in reply
+      if (reply.cursor && reply.cursor.firstBatch) {
+        const docsReturned = reply.cursor.firstBatch.length;
+        
+        // Log actual documents being read
+        if (docsReturned > 0) {
+          const docIds = reply.cursor.firstBatch
+            .slice(0, 5)
+            .map(doc => doc._id)
+            .join(', ');
+          
+          console.log(`[samir_mongo_debug] DOCUMENTS READ | Collection: ${collectionName} | Count: ${docsReturned} | Sample IDs: [${docIds}${docsReturned > 5 ? '...' : ''}]`);
+        }
+        
+        // Detect full scan (when no filter or index is used)
+        const hasFilter = event.command.filter && Object.keys(event.command.filter).length > 0;
+        const hasSort = event.command.sort && Object.keys(event.command.sort).length > 0;
+        
+        if (!hasFilter && !hasSort && docsReturned > 10) {
+          mongoMetrics.fullScans.add(collectionName);
+          console.warn(`[samir_mongo_debug] ⚠️ FULL COLLECTION SCAN DETECTED | Collection: ${collectionName} | Documents: ${docsReturned}`);
+        } else {
+          console.log(`[samir_mongo_debug] ✅ no full collection scan to [${collectionName}]`);
+        }
+      }
+    } catch (err) {
+      // Silent fail - don't break the app
+    }
+  }
+});
+
+// Print MongoDB summary every 30 seconds
+setInterval(() => {
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`[samir_mongo_debug] MONGODB SUMMARY`);
+  console.log(`${'='.repeat(80)}`);
+  
+  console.log(`\n[samir_mongo_debug] READ OPERATIONS:`);
+  for (const [collection, count] of Object.entries(mongoMetrics.reads)) {
+    console.log(`[samir_mongo_debug]   ${collection}: ${count} reads`);
+  }
+  
+  console.log(`\n[samir_mongo_debug] WRITE OPERATIONS:`);
+  for (const [collection, count] of Object.entries(mongoMetrics.writes)) {
+    console.log(`[samir_mongo_debug]   ${collection}: ${count} writes`);
+  }
+  
+  console.log(`\n[samir_mongo_debug] total reads: ${mongoMetrics.totalReads}`);
+  console.log(`[samir_mongo_debug] total writes: ${mongoMetrics.totalWrites}`);
+  
+  if (mongoMetrics.fullScans.size > 0) {
+    console.warn(`[samir_mongo_debug] ⚠️ full collection scan happens to [${Array.from(mongoMetrics.fullScans).join(', ')}]`);
+  } else {
+    console.log(`[samir_mongo_debug] ✅ no full collection scan to any collections`);
+  }
+  
+  // MongoDB resource usage (requires admin access)
+  try {
+    db.admin().serverStatus().then(status => {
+      const memUsageMB = (status.mem?.resident || 0);
+      const connections = status.connections?.current || 0;
+      
+      console.log(`\n[samir_mongo_debug] MONGODB RESOURCES:`);
+      console.log(`[samir_mongo_debug]   RAM Usage: ${memUsageMB} MB`);
+      console.log(`[samir_mongo_debug]   Active Connections: ${connections}`);
+      
+      // System pressure indicator
+      if (mongoMetrics.totalReads > 1000 || mongoMetrics.totalWrites > 500) {
+        console.warn(`[samir_mongo_debug]   ⚠️ System Pressure: HIGH - Consider scaling MongoDB`);
+      } else if (mongoMetrics.totalReads > 500 || mongoMetrics.totalWrites > 200) {
+        console.log(`[samir_mongo_debug]   System Pressure: MODERATE - Monitor closely`);
+      } else {
+        console.log(`[samir_mongo_debug]   System Pressure: LOW - System healthy`);
+      }
+    }).catch(() => {
+      console.log(`[samir_mongo_debug]   Resource monitoring unavailable (requires admin access)`);
+    });
+  } catch (err) {
+    console.log(`[samir_mongo_debug]   Resource monitoring unavailable`);
+  }
+  
+  console.log(`${'='.repeat(80)}\n`);
+  
+  // Reset metrics for next interval
+  mongoMetrics = {
+    reads: {},
+    writes: {},
+    fullScans: new Set(),
+    totalReads: 0,
+    totalWrites: 0
+  };
+}, 10000);
 
 
 async function createContribIndexes() {
