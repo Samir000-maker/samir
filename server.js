@@ -2153,12 +2153,12 @@ if (selectedContent.length < minContentRequired) {
   console.log(`✅ [CONTENT-FULFILLED] Collected ${selectedContent.length} items (target: ${minContentRequired})`);
 }
 
-const interestedContent = selectedContent; // Keep variable name for compatibility
+ const interestedContent = selectedContent; // Keep variable name for compatibility
 
   const duration = Date.now() - start;
   const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
 
-  // ✅ FIX: APPLY EXCLUSIONS *BEFORE* RETURNING
+  // ✅ APPLY EXCLUSIONS *BEFORE* RETURNING
   console.log(`\n[PHASE-6] APPLYING CLIENT EXCLUSIONS`);
   const excludedSet = new Set(excludedIds);
   const beforeExclusion = interestedContent.length;
@@ -2185,7 +2185,7 @@ const interestedContent = selectedContent; // Keep variable name for compatibili
   console.log(`${'='.repeat(80)}\n`);
 
   return {
-    content: finalContent.slice(0, limit), // ✅ Apply limit here
+    content: finalContent.slice(0, limit),
     isNewUser,
     hasNewContent: finalContent.length > 0,
     metadata: {
@@ -2194,30 +2194,14 @@ const interestedContent = selectedContent; // Keep variable name for compatibili
       slotsRead: slotContents.map(s => s.slotId),
       contribDocsChecked: contribDocsChecked.map(c => c.slotId),
       interestFiltered: interestedContent.length,
-      excludedByClient: excludedCount, // ✅ ADD THIS
-      totalReturned: Math.min(finalContent.length, limit), // ✅ ADD THIS
+      excludedByClient: excludedCount,
+      totalReturned: Math.min(finalContent.length, limit),
       totalReads: totalReads,
       userInterests,
       duration
     }
   };
-}
-
-
-  const excludedSet = new Set(excludedIds);
-  const filteredContent = allContent.filter(item => !excludedSet.has(item.postId));
-  
-  return {
-    content: filteredContent.slice(0, limit),
-    metadata: {
-      slotsRead,
-      totalScanned: allContent.length,
-      filteredOut: allContent.length - filteredContent.length
-    }
-  };
-
-
-}
+} // ✅ END OF FUNCTION - NO MORE CODE AFTER THIS
 
 
 
