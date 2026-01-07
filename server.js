@@ -4677,6 +4677,75 @@ return res.status(500).json({ error: 'Internal server error', details: error.mes
 
 // ===== REPLACE: /api/feed/instagram-ranked endpoint (PORT 2000) =====
 
+// app.post('/api/feed/instagram-ranked', async (req, res) => {
+//   const startTime = Date.now();
+//   const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, excludedPostIds = [], excludedReelIds = [] } = req.body;
+
+//   if (!userId) {
+//     return res.status(400).json({ success: false, error: 'userId required' });
+//   }
+
+//   try {
+//     console.log(`\n========== [FEED-REQUEST-START] ==========`);
+//     console.log(`User: ${userId} | Limit: ${limit} | Excluded: ${excludedPostIds.length}P + ${excludedReelIds.length}R`);
+
+//     // ✅ Use the CORRECT algorithm function
+//     const [reelsResult, postsResult] = await Promise.all([
+//       dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(limit * 0.6)),
+//       dbManager.getOptimizedFeedFixedReads(userId, 'posts', Math.ceil(limit * 0.4))
+//     ]);
+
+//     // Merge content
+//     const mixedContent = [...reelsResult.content, ...postsResult.content];
+    
+//     // Sort by composite score
+//     mixedContent.sort((a, b) => {
+//       const retentionDiff = (b.retention || 0) - (a.retention || 0);
+//       if (Math.abs(retentionDiff) > 1) return retentionDiff;
+//       const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+//       if (likesDiff !== 0) return likesDiff;
+//       return (b.commentCount || 0) - (a.commentCount || 0);
+//     });
+
+//     const duration = Date.now() - startTime;
+
+//     console.log(`\n========== [FEED-REQUEST-COMPLETE] ==========`);
+//     console.log(`User: ${userId} | Returned: ${mixedContent.length} items | Time: ${duration}ms`);
+//     console.log(`Slots Read: Reels=${reelsResult.metadata?.slotsRead?.length || 0}, Posts=${postsResult.metadata?.slotsRead?.length || 0}`);
+//     console.log(`=============================================\n`);
+
+//     // ✅ CRITICAL FIX: Return ALL content if less than MIN_CONTENT_FOR_FEED
+// const contentToReturn = mixedContent.length < MIN_CONTENT_FOR_FEED 
+//   ? mixedContent  // Return everything if below minimum
+//   : mixedContent.slice(0, limit); // Only limit if we have enough
+
+// return res.json({
+//   success: true,
+//   content: contentToReturn,
+//   hasMore: mixedContent.length > limit,
+//   metadata: {
+//     totalReturned: contentToReturn.length,
+//     totalAvailable: mixedContent.length,
+//     reelsCount: reelsResult.content.length,
+//     postsCount: postsResult.content.length,
+//     targetMinimum: MIN_CONTENT_FOR_FEED,
+//     requestedLimit: limit,
+//     slotsRead: {
+//       reels: reelsResult.metadata?.slotsRead || [],
+//       posts: postsResult.metadata?.slotsRead || []
+//     },
+//     duration
+//   }
+// });
+
+//   } catch (error) {
+//     console.error(`[FEED-ERROR] ${error.message}`);
+//     return res.status(500).json({ success: false, error: error.message });
+//   }
+// });
+
+
+
 app.post('/api/feed/instagram-ranked', async (req, res) => {
   const startTime = Date.now();
   const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, excludedPostIds = [], excludedReelIds = [] } = req.body;
@@ -4714,35 +4783,31 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     console.log(`Slots Read: Reels=${reelsResult.metadata?.slotsRead?.length || 0}, Posts=${postsResult.metadata?.slotsRead?.length || 0}`);
     console.log(`=============================================\n`);
 
-    // ✅ CRITICAL FIX: Return ALL content if less than MIN_CONTENT_FOR_FEED
-const contentToReturn = mixedContent.length < MIN_CONTENT_FOR_FEED 
-  ? mixedContent  // Return everything if below minimum
-  : mixedContent.slice(0, limit); // Only limit if we have enough
-
-return res.json({
-  success: true,
-  content: contentToReturn,
-  hasMore: mixedContent.length > limit,
-  metadata: {
-    totalReturned: contentToReturn.length,
-    totalAvailable: mixedContent.length,
-    reelsCount: reelsResult.content.length,
-    postsCount: postsResult.content.length,
-    targetMinimum: MIN_CONTENT_FOR_FEED,
-    requestedLimit: limit,
-    slotsRead: {
-      reels: reelsResult.metadata?.slotsRead || [],
-      posts: postsResult.metadata?.slotsRead || []
-    },
-    duration
-  }
-});
+    return res.json({
+      success: true,
+      content: mixedContent.slice(0, limit),
+      hasMore: mixedContent.length >= limit,
+      metadata: {
+        totalReturned: mixedContent.length,
+        reelsCount: reelsResult.content.length,
+        postsCount: postsResult.content.length,
+        slotsRead: {
+          reels: reelsResult.metadata?.slotsRead || [],
+          posts: postsResult.metadata?.slotsRead || []
+        },
+        duration
+      }
+    });
 
   } catch (error) {
     console.error(`[FEED-ERROR] ${error.message}`);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
+
+
+
+
 
 
 
