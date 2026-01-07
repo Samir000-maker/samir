@@ -2168,7 +2168,7 @@ if (leakedItems.length > 0) {
 
 const finalContent = interestedContent; // ✅ No additional filtering needed
   
-const duration = Date.now() - start;
+// const duration = Date.now() - start;
 const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
 
 console.log(`\n${'='.repeat(80)}`);
