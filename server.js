@@ -2158,29 +2158,50 @@ const interestedContent = selectedContent; // Keep variable name for compatibili
   const duration = Date.now() - start;
   const totalReads = 1 + documentsChecked.length + contribDocsChecked.length;
 
+  // ✅ FIX: APPLY EXCLUSIONS *BEFORE* RETURNING
+  console.log(`\n[PHASE-6] APPLYING CLIENT EXCLUSIONS`);
+  const excludedSet = new Set(excludedIds);
+  const beforeExclusion = interestedContent.length;
+  
+  const finalContent = interestedContent.filter(item => {
+    const isExcluded = excludedSet.has(item.postId);
+    if (isExcluded) {
+      console.log(`[CLIENT-EXCLUDE] Removing ${item.postId.substring(0, 8)} - in exclusion list`);
+    }
+    return !isExcluded;
+  });
+  
+  const excludedCount = beforeExclusion - finalContent.length;
+  console.log(`[PHASE-6-COMPLETE] Excluded ${excludedCount} items | Remaining: ${finalContent.length}`);
+
   console.log(`\n${'='.repeat(80)}`);
   console.log(`[FEED-COMPLETE]`);
-  console.log(`  Content Returned: ${interestedContent.length} items`);
+  console.log(`  Content Before Exclusion: ${beforeExclusion} items`);
+  console.log(`  Content After Exclusion: ${finalContent.length} items`);
+  console.log(`  Excluded by Client: ${excludedCount} items`);
   console.log(`  Total Reads: ${totalReads}`);
   console.log(`  Slots Read: [${slotContents.map(s => s.slotId).join(', ')}]`);
   console.log(`  Duration: ${duration}ms`);
   console.log(`${'='.repeat(80)}\n`);
 
-return {
-  content: interestedContent, // REMOVED .slice(0, minContentRequired * 2)
-  isNewUser,
-  hasNewContent: interestedContent.length > 0,
-  metadata: {
-    slotsChecked: documentsChecked.map(d => d.slot),
-    slotsWithContent: slotContents.map(s => s.slotId),
-    slotsRead: slotContents.map(s => s.slotId),
-    contribDocsChecked: contribDocsChecked.map(c => c.slotId),
-    interestFiltered: interestedContent.length,
-    totalReads: totalReads,
-    userInterests,
-    duration
-  }
-};
+  return {
+    content: finalContent.slice(0, limit), // ✅ Apply limit here
+    isNewUser,
+    hasNewContent: finalContent.length > 0,
+    metadata: {
+      slotsChecked: documentsChecked.map(d => d.slot),
+      slotsWithContent: slotContents.map(s => s.slotId),
+      slotsRead: slotContents.map(s => s.slotId),
+      contribDocsChecked: contribDocsChecked.map(c => c.slotId),
+      interestFiltered: interestedContent.length,
+      excludedByClient: excludedCount, // ✅ ADD THIS
+      totalReturned: Math.min(finalContent.length, limit), // ✅ ADD THIS
+      totalReads: totalReads,
+      userInterests,
+      duration
+    }
+  };
+}
 
 
   const excludedSet = new Set(excludedIds);
@@ -4677,10 +4698,77 @@ return res.status(500).json({ error: 'Internal server error', details: error.mes
 
 // ===== REPLACE: /api/feed/instagram-ranked endpoint (PORT 2000) =====
 
+// app.post('/api/feed/instagram-ranked', async (req, res) => {
+//   const startTime = Date.now();
+//   const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, excludedPostIds = [], excludedReelIds = [] } = req.body;
+
+//   if (!userId) {
+//     return res.status(400).json({ success: false, error: 'userId required' });
+//   }
+
+//   try {
+//     console.log(`\n========== [FEED-REQUEST-START] ==========`);
+//     console.log(`User: ${userId} | Limit: ${limit} | Excluded: ${excludedPostIds.length}P + ${excludedReelIds.length}R`);
+
+//     // ✅ Use the CORRECT algorithm function
+//     const [reelsResult, postsResult] = await Promise.all([
+//       dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(limit * 0.6)),
+//       dbManager.getOptimizedFeedFixedReads(userId, 'posts', Math.ceil(limit * 0.4))
+//     ]);
+
+//     // Merge content
+//     const mixedContent = [...reelsResult.content, ...postsResult.content];
+    
+//     // Sort by composite score
+//     mixedContent.sort((a, b) => {
+//       const retentionDiff = (b.retention || 0) - (a.retention || 0);
+//       if (Math.abs(retentionDiff) > 1) return retentionDiff;
+//       const likesDiff = (b.likeCount || 0) - (a.likeCount || 0);
+//       if (likesDiff !== 0) return likesDiff;
+//       return (b.commentCount || 0) - (a.commentCount || 0);
+//     });
+
+//     const duration = Date.now() - startTime;
+
+//     console.log(`\n========== [FEED-REQUEST-COMPLETE] ==========`);
+//     console.log(`User: ${userId} | Returned: ${mixedContent.length} items | Time: ${duration}ms`);
+//     console.log(`Slots Read: Reels=${reelsResult.metadata?.slotsRead?.length || 0}, Posts=${postsResult.metadata?.slotsRead?.length || 0}`);
+//     console.log(`=============================================\n`);
+
+//     // ✅ CRITICAL FIX: Return ALL content if less than MIN_CONTENT_FOR_FEED
+// const contentToReturn = mixedContent.length < MIN_CONTENT_FOR_FEED 
+//   ? mixedContent  // Return everything if below minimum
+//   : mixedContent.slice(0, limit); // Only limit if we have enough
+
+// return res.json({
+//   success: true,
+//   content: contentToReturn,
+//   hasMore: mixedContent.length > limit,
+//   metadata: {
+//     totalReturned: contentToReturn.length,
+//     totalAvailable: mixedContent.length,
+//     reelsCount: reelsResult.content.length,
+//     postsCount: postsResult.content.length,
+//     targetMinimum: MIN_CONTENT_FOR_FEED,
+//     requestedLimit: limit,
+//     slotsRead: {
+//       reels: reelsResult.metadata?.slotsRead || [],
+//       posts: postsResult.metadata?.slotsRead || []
+//     },
+//     duration
+//   }
+// });
+
+//   } catch (error) {
+//     console.error(`[FEED-ERROR] ${error.message}`);
+//     return res.status(500).json({ success: false, error: error.message });
+//   }
+// });
+
 app.post('/api/feed/instagram-ranked', async (req, res) => {
   const startTime = Date.now();
   const { userId, limit = DEFAULT_CONTENT_BATCH_SIZE, excludedPostIds = [], excludedReelIds = [] } = req.body;
-
+  
   if (!userId) {
     return res.status(400).json({ success: false, error: 'userId required' });
   }
@@ -4688,15 +4776,42 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
   try {
     console.log(`\n========== [FEED-REQUEST-START] ==========`);
     console.log(`User: ${userId} | Limit: ${limit} | Excluded: ${excludedPostIds.length}P + ${excludedReelIds.length}R`);
+    
+    // ✅ LOG THE ACTUAL EXCLUDED IDs (first 5)
+    if (excludedPostIds.length > 0) {
+      console.log(`[EXCLUDED-POSTS-SAMPLE] ${excludedPostIds.slice(0, 5).join(', ')}`);
+    }
+    if (excludedReelIds.length > 0) {
+      console.log(`[EXCLUDED-REELS-SAMPLE] ${excludedReelIds.slice(0, 5).join(', ')}`);
+    }
 
-    // ✅ Use the CORRECT algorithm function
+    // ✅ PASS EXCLUSIONS TO DATABASE FUNCTIONS
     const [reelsResult, postsResult] = await Promise.all([
-      dbManager.getOptimizedFeedFixedReads(userId, 'reels', Math.ceil(limit * 0.6)),
-      dbManager.getOptimizedFeedFixedReads(userId, 'posts', Math.ceil(limit * 0.4))
+      dbManager.getOptimizedFeedFixedReads(
+        userId, 
+        'reels', 
+        Math.ceil(limit * 0.6),
+        excludedReelIds  // ✅ ADD THIS
+      ),
+      dbManager.getOptimizedFeedFixedReads(
+        userId, 
+        'posts', 
+        Math.ceil(limit * 0.4),
+        excludedPostIds  // ✅ ADD THIS
+      )
     ]);
-
+    
     // Merge content
-    const mixedContent = [...reelsResult.content, ...postsResult.content];
+    let mixedContent = [...reelsResult.content, ...postsResult.content];
+    
+    // ✅ CLIENT-SIDE FILTER (in case DB filter missed something)
+    const excludedSet = new Set([...excludedPostIds, ...excludedReelIds]);
+    const beforeFilter = mixedContent.length;
+    mixedContent = mixedContent.filter(item => !excludedSet.has(item.postId));
+    
+    if (beforeFilter !== mixedContent.length) {
+      console.log(`[CLIENT-FILTER] ⚠️ Removed ${beforeFilter - mixedContent.length} duplicates that DB missed`);
+    }
     
     // Sort by composite score
     mixedContent.sort((a, b) => {
@@ -4708,36 +4823,35 @@ app.post('/api/feed/instagram-ranked', async (req, res) => {
     });
 
     const duration = Date.now() - startTime;
-
     console.log(`\n========== [FEED-REQUEST-COMPLETE] ==========`);
     console.log(`User: ${userId} | Returned: ${mixedContent.length} items | Time: ${duration}ms`);
     console.log(`Slots Read: Reels=${reelsResult.metadata?.slotsRead?.length || 0}, Posts=${postsResult.metadata?.slotsRead?.length || 0}`);
     console.log(`=============================================\n`);
 
-    // ✅ CRITICAL FIX: Return ALL content if less than MIN_CONTENT_FOR_FEED
-const contentToReturn = mixedContent.length < MIN_CONTENT_FOR_FEED 
-  ? mixedContent  // Return everything if below minimum
-  : mixedContent.slice(0, limit); // Only limit if we have enough
+    const contentToReturn = mixedContent.length < MIN_CONTENT_FOR_FEED 
+      ? mixedContent
+      : mixedContent.slice(0, limit);
 
-return res.json({
-  success: true,
-  content: contentToReturn,
-  hasMore: mixedContent.length > limit,
-  metadata: {
-    totalReturned: contentToReturn.length,
-    totalAvailable: mixedContent.length,
-    reelsCount: reelsResult.content.length,
-    postsCount: postsResult.content.length,
-    targetMinimum: MIN_CONTENT_FOR_FEED,
-    requestedLimit: limit,
-    slotsRead: {
-      reels: reelsResult.metadata?.slotsRead || [],
-      posts: postsResult.metadata?.slotsRead || []
-    },
-    duration
-  }
-});
-
+    return res.json({
+      success: true,
+      content: contentToReturn,
+      hasMore: mixedContent.length > limit,
+      metadata: {
+        totalReturned: contentToReturn.length,
+        totalAvailable: mixedContent.length,
+        reelsCount: reelsResult.content.length,
+        postsCount: postsResult.content.length,
+        excludedCount: excludedPostIds.length + excludedReelIds.length, // ✅ ADD THIS
+        clientFilteredCount: beforeFilter - mixedContent.length, // ✅ ADD THIS
+        targetMinimum: MIN_CONTENT_FOR_FEED,
+        requestedLimit: limit,
+        slotsRead: {
+          reels: reelsResult.metadata?.slotsRead || [],
+          posts: postsResult.metadata?.slotsRead || []
+        },
+        duration
+      }
+    });
   } catch (error) {
     console.error(`[FEED-ERROR] ${error.message}`);
     return res.status(500).json({ success: false, error: error.message });
